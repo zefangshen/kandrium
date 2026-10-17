@@ -1,0 +1,6 @@
+/target
+Kandrium.app
+Kandrium_*.dmg
+Planly.app/
+.cargo-packager/
+.trae/

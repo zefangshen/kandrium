@@ -1,0 +1,22 @@
+{
+  "productName": "Kandrium",
+  "name": "kandrium-app",
+  "identifier": "app.kandrium.desktop",
+  "version": "0.1.0",
+  "description": "Kandrium Kanban desktop app",
+  "category": "Productivity",
+  "beforePackagingCommand": "cargo build --release -p kandrium-app",
+  "binaries": [{ "path": "target/release/kandrium-app", "main": true }],
+  "icons": [
+    "crates/app/packaging/16x16.png",
+    "crates/app/packaging/32x32.png",
+    "crates/app/packaging/128x128.png",
+    "crates/app/packaging/256x256.png",
+    "crates/app/packaging/512x512.png",
+    "crates/app/packaging/icon@2x.png"
+  ],
+  "formats": ["app", "dmg"],
+  "macos": {
+    "minimumSystemVersion": "10.15"
+  }
+}
