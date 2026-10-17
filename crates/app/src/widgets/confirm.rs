@@ -9,6 +9,8 @@ use crate::theme;
 pub struct ConfirmRequest {
     pub title: String,
     pub message: String,
+    /// Label of the destructive action button ("Delete", "Archive all", ...).
+    pub confirm_label: String,
     /// What to do on confirm — opaque to this widget.
     pub action: ConfirmAction,
 }
@@ -43,7 +45,7 @@ pub fn show(ctx: &Context, request: &ConfirmRequest, modal_id: &str) -> ConfirmO
         ui.label(&request.message);
         ui.add_space(12.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if theme::danger_pill_button(ui, "Delete").clicked() {
+            if theme::danger_pill_button(ui, &request.confirm_label).clicked() {
                 confirmed = true;
             }
             if theme::pill_button(ui, "Cancel", false).clicked() {

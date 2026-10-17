@@ -128,24 +128,12 @@ pub fn get_all_board(db: &Connection) -> Result<AllBoard> {
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    // Running max position per status, seeded from every persisted row.
-    let mut max_pos: [i64; 3] = [-1; 3];
-    {
-        let mut stmt = db.prepare(
-            "SELECT status, COALESCE(MAX(position), -1) FROM all_card_order GROUP BY status",
-        )?;
-        let max_rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        for (status, m) in max_rows {
-            if let Some(key) = CardStatus::from_key(&status) {
-                max_pos[key.index()] = m;
-            }
-        }
-    }
-
-    let mut inserts: Vec<(String, CardStatus, i64)> = Vec::new();
-    let mut updates: Vec<(String, CardStatus, i64)> = Vec::new();
+    // Which cards need an order row written: no row yet (initial backfill), or
+    // a stored status that no longer matches the card's home column (the card
+    // was moved on its real board). Positions are assigned later, inside the
+    // write transaction.
+    let mut inserts: Vec<(String, CardStatus)> = Vec::new();
+    let mut updates: Vec<(String, CardStatus)> = Vec::new();
     // Effective bucket + position for this load.
     let mut placement: HashMap<String, (CardStatus, i64)> = HashMap::new();
 
@@ -155,35 +143,53 @@ pub fn get_all_board(db: &Connection) -> Result<AllBoard> {
         };
 
         if r.order_status.is_none() || r.order_position.is_none() {
-            max_pos[derived.index()] += 1;
-            let position = max_pos[derived.index()];
-            inserts.push((r.id.clone(), derived, position));
-            placement.insert(r.id.clone(), (derived, position));
+            inserts.push((r.id.clone(), derived));
         } else if r.order_status.as_deref().map(CardStatus::from_key) != Some(Some(derived)) {
-            // Home column status changed outside the All board → append to the
-            // new bucket.
-            max_pos[derived.index()] += 1;
-            let position = max_pos[derived.index()];
-            updates.push((r.id.clone(), derived, position));
-            placement.insert(r.id.clone(), (derived, position));
+            updates.push((r.id.clone(), derived));
         } else if let Some(position) = r.order_position {
             placement.insert(r.id.clone(), (derived, position));
         }
     }
 
     if !inserts.is_empty() || !updates.is_empty() {
-        let tx = db.unchecked_transaction()?;
+        // IMMEDIATE: the write lock is taken up front, so the running max read
+        // below can't observe a snapshot from before a concurrent backfill in
+        // the other process (app vs MCP) — both sides then assign disjoint
+        // positions instead of computing the same ones.
+        let tx =
+            rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)?;
         {
+            // Running max position per status, seeded from every persisted row.
+            let mut max_pos: [i64; 3] = [-1; 3];
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT status, COALESCE(MAX(position), -1) FROM all_card_order GROUP BY status",
+                )?;
+                let max_rows = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (status, m) in max_rows {
+                    if let Some(key) = CardStatus::from_key(&status) {
+                        max_pos[key.index()] = m;
+                    }
+                }
+            }
             let mut ins = tx.prepare(
                 "INSERT INTO all_card_order (card_id, status, position) VALUES (?, ?, ?)",
             )?;
-            for (id, status, position) in &inserts {
+            for (id, status) in &inserts {
+                max_pos[status.index()] += 1;
+                let position = max_pos[status.index()];
                 ins.execute(rusqlite::params![id, status.as_str(), position])?;
+                placement.insert(id.clone(), (*status, position));
             }
             let mut upd =
                 tx.prepare("UPDATE all_card_order SET status = ?, position = ? WHERE card_id = ?")?;
-            for (id, status, position) in &updates {
+            for (id, status) in &updates {
+                max_pos[status.index()] += 1;
+                let position = max_pos[status.index()];
                 upd.execute(rusqlite::params![status.as_str(), position, id])?;
+                placement.insert(id.clone(), (*status, position));
             }
         }
         tx.commit()?;
@@ -218,14 +224,15 @@ pub fn get_all_board(db: &Connection) -> Result<AllBoard> {
         bucket.sort_by_key(|c| positions.get(&c.card.id).copied().unwrap_or(i64::MAX));
     }
 
-    let mut iter = buckets.into_iter();
+    // Map buckets to columns by status index (not a positional zip), so the
+    // pairing can't panic or silently misalign if the two arrays ever diverge.
     let columns = CARD_STATUSES
         .iter()
         .map(|s| AllBoardColumn {
             id: format!("{ALL_COLUMN_PREFIX}{}", s.key.as_str()),
             title: s.title.to_string(),
             status: s.key,
-            cards: std::mem::take(&mut iter.next().unwrap()),
+            cards: std::mem::take(&mut buckets[s.key.index()]),
         })
         .collect();
 

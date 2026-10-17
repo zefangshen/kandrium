@@ -10,15 +10,14 @@ use crate::models::*;
 /// Create a new column on a board. Errors if title is empty.
 pub fn create_column(db: &Connection, board_id: &str, title: &str) -> Result<Column> {
     let title = require_title(title)?;
-    let max_pos: i64 = db.query_row(
-        "SELECT COALESCE(MAX(position), -1) FROM columns WHERE board_id = ?",
-        [board_id],
-        |r| r.get(0),
-    )?;
+    // Single INSERT...SELECT: the next position is computed inside the same
+    // statement, so concurrent writers (app + MCP share one DB) can't race a
+    // separate MAX(position) read and persist duplicate positions.
     let id = uid();
     db.execute(
-        "INSERT INTO columns (id, board_id, title, position) VALUES (?, ?, ?, ?)",
-        rusqlite::params![id, board_id, title, max_pos + 1],
+        "INSERT INTO columns (id, board_id, title, position) \
+         SELECT ?, ?, ?, COALESCE(MAX(position), -1) + 1 FROM columns WHERE board_id = ?",
+        rusqlite::params![id, board_id, title, board_id],
     )?;
     Ok(Column {
         id,

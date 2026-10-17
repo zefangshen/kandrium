@@ -15,15 +15,13 @@ pub fn create_card(db: &Connection, col_id: &str, data: &CreateCardBody) -> Resu
     let due_date = data.due_date.clone().unwrap_or_default();
     let labels = data.labels.clone().unwrap_or_default();
 
-    let max_pos: i64 = db.query_row(
-        "SELECT COALESCE(MAX(position), -1) FROM cards WHERE column_id = ?",
-        [col_id],
-        |r| r.get(0),
-    )?;
+    // Single INSERT...SELECT: the next position is computed inside the same
+    // statement, so concurrent writers (app + MCP share one DB) can't race a
+    // separate MAX(position) read and persist duplicate positions.
     let id = uid();
     db.execute(
         "INSERT INTO cards (id, column_id, title, description, due_date, labels, position) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+         SELECT ?, ?, ?, ?, ?, ?, COALESCE(MAX(position), -1) + 1 FROM cards WHERE column_id = ?",
         rusqlite::params![
             id,
             col_id,
@@ -31,7 +29,7 @@ pub fn create_card(db: &Connection, col_id: &str, data: &CreateCardBody) -> Resu
             description,
             due_date,
             to_labels_json(&labels)?,
-            max_pos + 1
+            col_id
         ],
     )?;
     Ok(Card {
@@ -219,7 +217,6 @@ pub fn move_card_to_board(
             if matched.is_empty() { "none" } else { &matched }
         )));
     };
-    let _ = src_col_id; // source column id kept for parity with TS naming
 
     move_card(db, card_id, &target_col, None)
 }
@@ -240,9 +237,6 @@ pub fn move_all_card(
     before_card_id: Option<&str>,
 ) -> Result<OkResult> {
     let card = get_full_card(db, card_id)?.ok_or_else(|| KandriumError::new("Card not found"))?;
-    if CardStatus::from_key(to_status.as_str()).is_none() {
-        return Err(KandriumError::new("Unknown status"));
-    }
 
     let home_col_title: Option<String> = db
         .query_row(

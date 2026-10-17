@@ -80,6 +80,9 @@ pub struct KandriumApp {
     watcher_rx: mpsc::Receiver<()>,
     /// Set when an external change was seen (drives the "Synced" hint).
     synced_at: Option<Instant>,
+    /// External change arrived mid-drag and was deferred; applied on the first
+    /// frame after the drag ends (whether the drop landed or was cancelled).
+    pending_sync: bool,
 
     saved: SavedState,
     view: View,
@@ -138,6 +141,7 @@ impl KandriumApp {
             db,
             watcher_rx: rx,
             synced_at: None,
+            pending_sync: false,
             saved,
             view: View::Board,
             boards: Vec::new(),
@@ -345,7 +349,7 @@ impl KandriumApp {
             confirm::ConfirmAction::ArchiveAll(col_id) => {
                 let mut count: Option<ArchiveAllResult> = None;
                 self.run("Archive all failed", |db| {
-                    count = kandrium_core::archive_all_cards(db, &col_id).ok();
+                    count = Some(kandrium_core::archive_all_cards(db, &col_id)?);
                     Ok(())
                 });
                 if let Some(res) = count {
@@ -570,6 +574,7 @@ impl KandriumApp {
                 title: "Delete archived card".to_string(),
                 message: "Permanently delete this archived card? This cannot be undone."
                     .to_string(),
+                confirm_label: "Delete".to_string(),
                 action: confirm::ConfirmAction::DeleteCard(id),
             });
         }
@@ -598,6 +603,7 @@ impl KandriumApp {
                 message:
                     "Archive all cards in this column? They can be restored from the Archived view."
                         .to_string(),
+                confirm_label: "Archive all".to_string(),
                 action: confirm::ConfirmAction::ArchiveAll(col_id),
             });
         }
@@ -605,6 +611,7 @@ impl KandriumApp {
             self.confirm = Some(confirm::ConfirmRequest {
                 title: "Delete column".to_string(),
                 message: "Delete this column and all its cards?".to_string(),
+                confirm_label: "Delete".to_string(),
                 action: confirm::ConfirmAction::DeleteColumn(col_id),
             });
         }
@@ -617,6 +624,7 @@ impl KandriumApp {
             self.confirm = Some(confirm::ConfirmRequest {
                 title: "Delete card".to_string(),
                 message: "Delete this card permanently?".to_string(),
+                confirm_label: "Delete".to_string(),
                 action: confirm::ConfirmAction::DeleteCard(card_id),
             });
         }
@@ -681,6 +689,7 @@ impl KandriumApp {
                 title: "Archive all cards".to_string(),
                 message: "Archive all cards in Done? They can be restored from the Archived view."
                     .to_string(),
+                confirm_label: "Archive all".to_string(),
                 action: confirm::ConfirmAction::ArchiveAll(col_id),
             });
         }
@@ -693,6 +702,7 @@ impl KandriumApp {
             self.confirm = Some(confirm::ConfirmRequest {
                 title: "Delete card".to_string(),
                 message: "Delete this card permanently?".to_string(),
+                confirm_label: "Delete".to_string(),
                 action: confirm::ConfirmAction::DeleteCard(card_id),
             });
         }
@@ -849,6 +859,7 @@ impl KandriumApp {
                         self.confirm = Some(confirm::ConfirmRequest {
                             title: "Delete card".to_string(),
                             message: "Delete this card permanently?".to_string(),
+                            confirm_label: "Delete".to_string(),
                             action: confirm::ConfirmAction::DeleteCard(card_id.clone()),
                         });
                     }
@@ -896,11 +907,23 @@ impl eframe::App for KandriumApp {
             }
         }
 
-        if self.watcher_rx.try_recv().is_ok() && self.drag.is_none() {
+        if self.watcher_rx.try_recv().is_ok() {
+            if self.drag.is_none() {
+                self.reload_silent();
+                self.synced_at = Some(Instant::now());
+            } else {
+                // Mid-drag: a reload would yank the board out from under the
+                // gesture. Defer instead of dropping the event — a cancelled
+                // drag never reaches the drop handler's reload.
+                self.pending_sync = true;
+            }
+        }
+        // The drag ended (drop landed or cancelled): apply any deferred sync.
+        if self.pending_sync && self.drag.is_none() {
+            self.pending_sync = false;
             self.reload_silent();
             self.synced_at = Some(Instant::now());
         }
-        // While dragging: skip; the drop handler reloads anyway.
 
         // Expire transient non-error banners.
         if let Some(s) = &self.status

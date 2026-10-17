@@ -433,6 +433,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     service.waiting().await?;
     Ok(())
 }
-
-// Silence unused warnings for items the macro pipeline references indirectly.
-const _: () = ();

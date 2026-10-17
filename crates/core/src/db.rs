@@ -95,6 +95,19 @@ pub fn migrate_legacy_db() -> Result<Option<PathBuf>> {
     })();
 
     std::fs::remove_dir_all(&scratch).ok();
+    if result.is_err() {
+        // VACUUM INTO writes the target incrementally and leaves the partial
+        // file behind on failure. Remove it (and any WAL sidecars) so the next
+        // boot doesn't mistake the half-written file for a completed migration
+        // and initialize an empty schema over it.
+        for path in [
+            target.clone(),
+            target.with_extension("db-wal"),
+            target.with_extension("db-shm"),
+        ] {
+            std::fs::remove_file(path).ok();
+        }
+    }
     result?;
     Ok(Some(legacy))
 }
