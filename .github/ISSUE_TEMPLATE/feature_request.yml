@@ -1,0 +1,30 @@
+name: Feature request
+description: Suggest a new capability or improvement
+labels: [enhancement, status:triage]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What are you trying to do, and what gets in the way?
+      placeholder: I want to capture tasks from the terminal without opening the app...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: area
+    attributes:
+      label: Relevant area
+      options:
+        - label: Desktop app (egui UI)
+        - label: MCP server / AI-agent workflows
+        - label: Data layer / schema
+        - label: CLI (if built)
+        - label: Packaging / distribution
