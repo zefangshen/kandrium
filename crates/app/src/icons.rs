@@ -16,6 +16,7 @@ static ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/icons/chevron-down.svg"),
     ),
     ("ellipsis", include_bytes!("../assets/icons/ellipsis.svg")),
+    ("folder", include_bytes!("../assets/icons/folder.svg")),
     ("moon", include_bytes!("../assets/icons/moon.svg")),
     ("pencil", include_bytes!("../assets/icons/pencil.svg")),
     ("plus", include_bytes!("../assets/icons/plus.svg")),
@@ -27,6 +28,14 @@ static ICONS: &[(&str, &[u8])] = &[
     ("save", include_bytes!("../assets/icons/save.svg")),
     ("search", include_bytes!("../assets/icons/search.svg")),
     ("square", include_bytes!("../assets/icons/square.svg")),
+    (
+        "square-kanban",
+        include_bytes!("../assets/icons/square-kanban.svg"),
+    ),
+    (
+        "sticky-note",
+        include_bytes!("../assets/icons/sticky-note.svg"),
+    ),
     ("sun", include_bytes!("../assets/icons/sun.svg")),
     ("trash-2", include_bytes!("../assets/icons/trash-2.svg")),
     ("x", include_bytes!("../assets/icons/x.svg")),

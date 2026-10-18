@@ -439,16 +439,26 @@ pub fn dialog_frame(ctx: &Context) -> egui::Frame {
 }
 
 /// Board tab: text with accent underline when active, hover wash otherwise.
-pub fn tab_button(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
+/// Used for the 13 px board-tab row (Small/small-strong at 24 px); the
+/// top-level section row is a [`segmented_control`] instead. Text styles
+/// come from the `text_styles` table (see `apply_visuals`).
+pub fn tab_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    active: bool,
+    inactive_style: TextStyle,
+    active_style: TextStyle,
+    height: f32,
+) -> egui::Response {
     let t = Tokens::get(ui.ctx());
-    let text_style = if active { strong() } else { TextStyle::Button };
-    let color = if active { t.text } else { t.text_muted };
+    let text_style = if active { active_style } else { inactive_style };
+    let color = if active { t.accent_text } else { t.text_muted };
     let galley = ui
         .painter()
         .layout_no_wrap(label.to_string(), font_id(ui, text_style), color);
 
-    let width = galley.size().x + 24.0;
-    let height = 30.0;
+    let hpad = if height < 30.0 { 8.0 } else { 12.0 };
+    let width = galley.size().x + hpad * 2.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::click());
     let press = Press::track(ui, &resp);
 
@@ -467,10 +477,12 @@ pub fn tab_button(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Respons
 
     if active {
         let y = rect.bottom() - 2.0;
+        // Underline extends 2 px past the text on each side.
+        let inset = hpad - 2.0;
         ui.painter().rect_filled(
             Rect::from_min_max(
-                egui::pos2(rect.left() + 10.0, y - 2.0),
-                egui::pos2(rect.right() - 10.0, y),
+                egui::pos2(rect.left() + inset, y - 2.0),
+                egui::pos2(rect.right() - inset, y),
             ),
             1.0,
             t.accent,
@@ -478,6 +490,104 @@ pub fn tab_button(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Respons
     }
 
     resp
+}
+
+/// A segment of a [`segmented_control`].
+pub struct Segment<'a> {
+    pub label: &'a str,
+    pub icon: &'a str,
+}
+
+/// macOS-style segmented control: rounded inset container; the selected
+/// segment gets a soft accent fill with accent-colored icon + label.
+/// Returns the clicked segment index, if any.
+pub fn segmented_control(
+    ui: &mut egui::Ui,
+    segments: &[Segment<'_>],
+    selected: usize,
+) -> Option<usize> {
+    let t = Tokens::get(ui.ctx());
+    const SEG_H: f32 = 26.0;
+    const ICON: f32 = 14.0;
+    const GAP: f32 = 6.0;
+    const HPAD: f32 = 12.0;
+
+    // Resolve galleys up front: semibold when selected, regular otherwise.
+    // The text color is baked into the galley; keep it alongside for the
+    // painter's fallback-color argument.
+    let galleys: Vec<_> = segments
+        .iter()
+        .enumerate()
+        .map(|(i, seg)| {
+            let style = if i == selected {
+                small_strong()
+            } else {
+                TextStyle::Small
+            };
+            let color = if i == selected {
+                t.accent_text
+            } else {
+                t.text_muted
+            };
+            let galley =
+                ui.painter()
+                    .layout_no_wrap(seg.label.to_string(), font_id(ui, style), color);
+            (galley, color)
+        })
+        .collect();
+
+    let frame = egui::Frame::new()
+        .fill(t.pasteboard)
+        .stroke(Stroke::new(1.0, t.border))
+        .corner_radius(CornerRadius::same(t.radius))
+        .inner_margin(Margin::same(2));
+
+    let mut clicked = None;
+    frame.show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            for (i, seg) in segments.iter().enumerate() {
+                let (galley, color) = &galleys[i];
+                let width = HPAD + ICON + GAP + galley.size().x + HPAD;
+                let (rect, resp) =
+                    ui.allocate_exact_size(Vec2::new(width, SEG_H), egui::Sense::click());
+                let press = Press::track(ui, &resp);
+
+                if i == selected {
+                    ui.painter()
+                        .rect_filled(rect, CornerRadius::same(t.radius), t.accent_soft);
+                } else {
+                    press.wash(ui, rect, CornerRadius::same(t.radius), false);
+                }
+
+                // Centered icon + label, shifted 1px down while pressed.
+                let content_w = ICON + GAP + galley.size().x;
+                let mut x = rect.center().x - content_w * 0.5;
+                let y_off = press.offset().y;
+                let icon_rect = Rect::from_center_size(
+                    egui::pos2(x + ICON * 0.5, rect.center().y + y_off),
+                    Vec2::splat(ICON),
+                );
+                let icon_color = if i == selected {
+                    t.accent_text
+                } else {
+                    t.text_faint
+                };
+                crate::icons::paint(ui, icon_rect, seg.icon, ICON, icon_color);
+                x += ICON + GAP;
+                ui.painter().galley(
+                    egui::pos2(x, rect.center().y - galley.size().y * 0.5 + y_off),
+                    galley.clone(),
+                    *color,
+                );
+
+                if hand(resp).clicked() {
+                    clicked = Some(i);
+                }
+            }
+        });
+    });
+    clicked
 }
 
 /// Rounded search field with a magnifying-glass icon prefix and an accent

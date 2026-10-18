@@ -22,6 +22,11 @@ use crate::widgets::{card_modal, confirm};
 
 const STATUS_TRANSIENT: Duration = Duration::from_secs(2);
 
+/// Horizontal side margin of the toolbar panel. `header()` extends the
+/// board-tabs hairline by this amount on each side so the divider spans
+/// the full window width past the panel's content rect.
+const TOOLBAR_H_MARGIN: i8 = 10;
+
 // ---------------------------------------------------------------------------
 // Data model
 // ---------------------------------------------------------------------------
@@ -31,6 +36,16 @@ const STATUS_TRANSIENT: Duration = Duration::from_secs(2);
 enum View {
     Board,
     Archived,
+}
+
+/// Top-level app section (header row 1). Only Tasks has content today;
+/// Notes and Documents are blank placeholders.
+#[derive(Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+enum Section {
+    #[default]
+    Tasks,
+    Notes,
+    Documents,
 }
 
 /// The currently loaded board (real or virtual).
@@ -60,6 +75,8 @@ struct EditSession {
 struct SavedState {
     active_board_id: String,
     dark_mode: bool,
+    #[serde(default)]
+    section: Section,
 }
 
 impl Default for SavedState {
@@ -67,6 +84,7 @@ impl Default for SavedState {
         SavedState {
             active_board_id: kandrium_core::ALL_BOARD_ID.to_string(),
             dark_mode: true,
+            section: Section::default(),
         }
     }
 }
@@ -366,68 +384,148 @@ impl KandriumApp {
     // -- header -------------------------------------------------------------
 
     fn header(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            // Tabs: virtual All board first, then real boards.
-            let tabs: Vec<(String, String)> =
-                std::iter::once((kandrium_core::ALL_BOARD_ID.to_string(), "All".to_string()))
+        let t = theme::Tokens::get(ui.ctx());
+        ui.vertical(|ui| {
+            // Row 1: top-level sections + global controls.
+            ui.horizontal(|ui| {
+                const SECTIONS: [Section; 3] = [Section::Tasks, Section::Notes, Section::Documents];
+                let segments = [
+                    theme::Segment {
+                        label: "Tasks",
+                        icon: "square-kanban",
+                    },
+                    theme::Segment {
+                        label: "Notes",
+                        icon: "sticky-note",
+                    },
+                    theme::Segment {
+                        label: "Documents",
+                        icon: "folder",
+                    },
+                ];
+                let selected = SECTIONS
+                    .iter()
+                    .position(|s| *s == self.saved.section)
+                    .unwrap_or(0);
+                if let Some(idx) = theme::segmented_control(ui, &segments, selected) {
+                    self.switch_section(SECTIONS[idx], ui.ctx());
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Theme toggle
+                    let icon = if self.saved.dark_mode { "sun" } else { "moon" };
+                    if theme::icon_button(ui, icon, 28.0, false, "Toggle theme").clicked() {
+                        self.saved.dark_mode = !self.saved.dark_mode;
+                        theme::apply_visuals(ui.ctx(), self.saved.dark_mode);
+                    }
+
+                    // Manual refresh
+                    if theme::icon_button(ui, "rotate-cw", 28.0, false, "Refresh").clicked() {
+                        self.refresh();
+                    }
+
+                    // Synced hint
+                    if let Some(t) = &self.synced_at
+                        && t.elapsed() < STATUS_TRANSIENT
+                    {
+                        let r = ui.horizontal(|ui| {
+                            let (icon_rect, _) = ui
+                                .allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                            crate::icons::paint(
+                                ui,
+                                icon_rect,
+                                "check",
+                                12.0,
+                                ui.visuals().weak_text_color(),
+                            );
+                            ui.label(
+                                egui::RichText::new("Synced")
+                                    .small()
+                                    .color(ui.visuals().weak_text_color()),
+                            );
+                        });
+                        let _ = r;
+                    }
+                });
+            });
+
+            // Row 2: board tabs (Tasks section only), smaller than row 1.
+            if self.saved.section == Section::Tasks {
+                ui.add_space(2.0);
+                // Hairline between the section row and the board tabs,
+                // spanning the full toolbar width (content rect plus
+                // `TOOLBAR_H_MARGIN` on each side).
+                let y = ui.cursor().top() + 0.5;
+                let r = ui.max_rect();
+                let bleed = f32::from(TOOLBAR_H_MARGIN);
+                ui.painter().hline(
+                    r.left() - bleed..=r.right() + bleed,
+                    y,
+                    egui::Stroke::new(1.0, t.divider),
+                );
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    // Tabs: virtual All board first, then real boards.
+                    let tabs: Vec<(String, String)> = std::iter::once((
+                        kandrium_core::ALL_BOARD_ID.to_string(),
+                        "All".to_string(),
+                    ))
                     .chain(self.boards.iter().map(|b| (b.id.clone(), b.title.clone())))
                     .collect();
 
-            for (id, title) in &tabs {
-                let active = self.view == View::Board && *id == self.saved.active_board_id;
-                if theme::tab_button(ui, title, active).clicked() {
-                    self.switch_board(id.clone(), ui.ctx());
-                }
-            }
-
-            // Archived view toggle
-            if theme::tab_button(ui, "Archived", self.view == View::Archived).clicked() {
-                self.view = View::Archived;
-                self.clear_inline_editors();
-                self.drag = None;
-                self.settle_gap = None;
-                self.source_gap = None;
-                anim::CardRig::clear_drag(ui.ctx());
-                self.refresh();
-            }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Theme toggle
-                let icon = if self.saved.dark_mode { "sun" } else { "moon" };
-                if theme::icon_button(ui, icon, 28.0, false, "Toggle theme").clicked() {
-                    self.saved.dark_mode = !self.saved.dark_mode;
-                    theme::apply_visuals(ui.ctx(), self.saved.dark_mode);
-                }
-
-                // Manual refresh
-                if theme::icon_button(ui, "rotate-cw", 28.0, false, "Refresh").clicked() {
-                    self.refresh();
-                }
-
-                // Synced hint
-                if let Some(t) = &self.synced_at
-                    && t.elapsed() < STATUS_TRANSIENT
-                {
-                    let r = ui.horizontal(|ui| {
-                        let (icon_rect, _) =
-                            ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                        crate::icons::paint(
+                    for (id, title) in &tabs {
+                        let active = self.view == View::Board && *id == self.saved.active_board_id;
+                        if theme::tab_button(
                             ui,
-                            icon_rect,
-                            "check",
-                            12.0,
-                            ui.visuals().weak_text_color(),
-                        );
-                        ui.label(
-                            egui::RichText::new("Synced")
-                                .small()
-                                .color(ui.visuals().weak_text_color()),
-                        );
-                    });
-                    let _ = r;
-                }
-            });
+                            title,
+                            active,
+                            egui::TextStyle::Small,
+                            theme::small_strong(),
+                            24.0,
+                        )
+                        .clicked()
+                        {
+                            self.switch_board(id.clone(), ui.ctx());
+                        }
+                    }
+
+                    // Archived view toggle
+                    if theme::tab_button(
+                        ui,
+                        "Archived",
+                        self.view == View::Archived,
+                        egui::TextStyle::Small,
+                        theme::small_strong(),
+                        24.0,
+                    )
+                    .clicked()
+                    {
+                        self.view = View::Archived;
+                        self.clear_inline_editors();
+                        self.drag = None;
+                        self.settle_gap = None;
+                        self.source_gap = None;
+                        anim::CardRig::clear_drag(ui.ctx());
+                        self.refresh();
+                    }
+                });
+            }
         });
+    }
+
+    fn switch_section(&mut self, section: Section, ctx: &egui::Context) {
+        if self.saved.section == section {
+            return;
+        }
+        self.saved.section = section;
+        self.clear_inline_editors();
+        self.drag = None;
+        self.settle_gap = None;
+        self.source_gap = None;
+        // Close modals belonging to the kanban UI being hidden.
+        self.editing = None;
+        self.confirm = None;
+        anim::CardRig::clear_drag(ctx);
     }
 
     fn switch_board(&mut self, id: String, ctx: &egui::Context) {
@@ -457,6 +555,11 @@ impl KandriumApp {
     // -- content ------------------------------------------------------------
 
     fn content(&mut self, ui: &mut egui::Ui) {
+        // Notes / Documents are blank placeholders for now.
+        if self.saved.section != Section::Tasks {
+            return;
+        }
+
         if self.view == View::Archived {
             self.content_archived(ui);
             return;
@@ -944,20 +1047,20 @@ impl eframe::App for KandriumApp {
         let ctx = ui.ctx().clone();
         let t = theme::Tokens::get(&ctx);
 
-        // Toolbar: titlebar fill with a hairline divider at the bottom edge.
+        // Toolbar: titlebar fill; `header()` paints the hairline under the
+        // section row.
         egui::Panel::top("kandrium-toolbar")
             .frame(
                 egui::Frame::new()
                     .fill(t.titlebar)
-                    .inner_margin(egui::Margin::symmetric(10, 6))
-                    .stroke(egui::Stroke::new(1.0, t.divider)),
+                    .inner_margin(egui::Margin::symmetric(TOOLBAR_H_MARGIN, 8)),
             )
             .show(ui, |ui| {
                 self.header(ui);
             });
 
         // Main content on the pasteboard background, inset from the
-        // toolbar divider and the window edges.
+        // toolbar and the window edges.
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
