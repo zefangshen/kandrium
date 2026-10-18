@@ -16,7 +16,7 @@ use kandrium_core::{
 use crate::anim;
 use crate::dnd::{self, ColKey, Drag, DropZone};
 use crate::theme;
-use crate::views::{all_board, archive, board};
+use crate::views::{all_board, archive, board, notes};
 use crate::watcher;
 use crate::widgets::{card_modal, confirm};
 
@@ -26,6 +26,17 @@ const STATUS_TRANSIENT: Duration = Duration::from_secs(2);
 /// board-tabs hairline by this amount on each side so the divider spans
 /// the full window width past the panel's content rect.
 const TOOLBAR_H_MARGIN: i8 = 10;
+
+/// Fallback vertical center (px from the window top) of the macOS
+/// traffic-light buttons, used until `traffic_light_metrics()` measures the
+/// live window. Measured: 14 px buttons 9 px from the window top.
+const TRAFFIC_LIGHT_CENTER_Y: f32 = 16.0;
+
+/// Fallback x (window coordinates) where title-bar content starts: the
+/// standard traffic lights end at x = 69 (zoom-button right edge) and the
+/// app name starts a 14 px gap after. Replaced by the measured
+/// `traffic_light_metrics()` value once the window is up.
+const TRAFFIC_LIGHT_INSET: f32 = 83.0;
 
 // ---------------------------------------------------------------------------
 // Data model
@@ -77,6 +88,11 @@ struct SavedState {
     dark_mode: bool,
     #[serde(default)]
     section: Section,
+    /// Open note tabs (root-relative paths) + active tab index.
+    #[serde(default)]
+    notes_open: Vec<String>,
+    #[serde(default)]
+    notes_active: Option<usize>,
 }
 
 impl Default for SavedState {
@@ -85,6 +101,8 @@ impl Default for SavedState {
             active_board_id: kandrium_core::ALL_BOARD_ID.to_string(),
             dark_mode: true,
             section: Section::default(),
+            notes_open: Vec::new(),
+            notes_active: None,
         }
     }
 }
@@ -112,6 +130,9 @@ pub struct KandriumApp {
     // Archive view
     archive_state: archive::ArchiveState,
     archived: Option<Vec<ArchivedCard>>,
+
+    // Notes section
+    notes_state: notes::NotesState,
 
     // Drag and drop
     drag: Option<Drag>,
@@ -171,6 +192,7 @@ impl KandriumApp {
             }),
             archive_state: archive::ArchiveState::default(),
             archived: None,
+            notes_state: notes::NotesState::new(),
             drag: None,
             zones: Vec::new(),
             settle_gap: None,
@@ -188,6 +210,10 @@ impl KandriumApp {
         // without this the first frame paints with `board: None` and the app
         // never leaves the "Loading..." state.
         app.reload_silent();
+        // Restore last session's note tabs (vanished files are dropped).
+        let notes_open = app.saved.notes_open.clone();
+        let notes_active = app.saved.notes_active;
+        app.notes_state.open_relative(&notes_open, notes_active);
         app
     }
 
@@ -378,6 +404,15 @@ impl KandriumApp {
                     );
                 }
             }
+            confirm::ConfirmAction::DeleteNotePath(path) => {
+                match kandrium_core::notes::delete_path(&path, self.notes_state.root()) {
+                    Ok(()) => {
+                        self.notes_state.on_deleted(&path);
+                        self.set_status("Deleted", false);
+                    }
+                    Err(e) => self.set_status(format!("Delete failed: {}", e.0), true),
+                }
+            }
         }
     }
 
@@ -386,7 +421,78 @@ impl KandriumApp {
     fn header(&mut self, ui: &mut egui::Ui) {
         let t = theme::Tokens::get(ui.ctx());
         ui.vertical(|ui| {
-            // Row 1: top-level sections + global controls.
+            // Row 0: macOS title-bar band. The window uses a fullsize
+            // content view (`main.rs`), so this row is painted over the OS
+            // title-bar strip. The traffic-light geometry is measured from
+            // the live NSWindow (`traffic_light_metrics()`), so the app name
+            // and the window controls (theme toggle, refresh, transient sync
+            // hint) sit on the same center line as the buttons; standard
+            // 28 px title-bar metrics apply until the measurement lands.
+            let (center_y, title_x) = crate::traffic_light_metrics()
+                .unwrap_or((TRAFFIC_LIGHT_CENTER_Y, TRAFFIC_LIGHT_INSET));
+            let band_h = (2.0 * center_y).round().max(22.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), band_h),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.add_space(title_x - ui.cursor().left());
+                    ui.label(egui::RichText::new("Kandrium").text_style(theme::strong()));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Theme toggle
+                        let icon = if self.saved.dark_mode { "sun" } else { "moon" };
+                        if theme::icon_button(ui, icon, band_h, false, "Toggle theme").clicked() {
+                            self.saved.dark_mode = !self.saved.dark_mode;
+                            theme::apply_visuals(ui.ctx(), self.saved.dark_mode);
+                        }
+
+                        // Manual refresh
+                        if theme::icon_button(ui, "rotate-cw", band_h, false, "Refresh").clicked() {
+                            self.refresh();
+                        }
+
+                        // Synced hint
+                        if let Some(t) = &self.synced_at
+                            && t.elapsed() < STATUS_TRANSIENT
+                        {
+                            let r = ui.horizontal(|ui| {
+                                let (icon_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(12.0, 12.0),
+                                    egui::Sense::hover(),
+                                );
+                                crate::icons::paint(
+                                    ui,
+                                    icon_rect,
+                                    "check",
+                                    12.0,
+                                    ui.visuals().weak_text_color(),
+                                );
+                                ui.label(
+                                    egui::RichText::new("Synced")
+                                        .small()
+                                        .color(ui.visuals().weak_text_color()),
+                                );
+                            });
+                            let _ = r;
+                        }
+                    });
+                },
+            );
+
+            // Hairline between the title-bar band and the section row,
+            // always visible, spanning the full toolbar width (content rect
+            // plus `TOOLBAR_H_MARGIN` on each side).
+            ui.add_space(2.0);
+            let y = ui.cursor().top() + 0.5;
+            let r = ui.max_rect();
+            let bleed = f32::from(TOOLBAR_H_MARGIN);
+            ui.painter().hline(
+                r.left() - bleed..=r.right() + bleed,
+                y,
+                egui::Stroke::new(1.0, t.divider),
+            );
+            ui.add_space(5.0);
+
+            // Row 1: top-level sections.
             ui.horizontal(|ui| {
                 const SECTIONS: [Section; 3] = [Section::Tasks, Section::Notes, Section::Documents];
                 let segments = [
@@ -410,43 +516,6 @@ impl KandriumApp {
                 if let Some(idx) = theme::segmented_control(ui, &segments, selected) {
                     self.switch_section(SECTIONS[idx], ui.ctx());
                 }
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Theme toggle
-                    let icon = if self.saved.dark_mode { "sun" } else { "moon" };
-                    if theme::icon_button(ui, icon, 28.0, false, "Toggle theme").clicked() {
-                        self.saved.dark_mode = !self.saved.dark_mode;
-                        theme::apply_visuals(ui.ctx(), self.saved.dark_mode);
-                    }
-
-                    // Manual refresh
-                    if theme::icon_button(ui, "rotate-cw", 28.0, false, "Refresh").clicked() {
-                        self.refresh();
-                    }
-
-                    // Synced hint
-                    if let Some(t) = &self.synced_at
-                        && t.elapsed() < STATUS_TRANSIENT
-                    {
-                        let r = ui.horizontal(|ui| {
-                            let (icon_rect, _) = ui
-                                .allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                            crate::icons::paint(
-                                ui,
-                                icon_rect,
-                                "check",
-                                12.0,
-                                ui.visuals().weak_text_color(),
-                            );
-                            ui.label(
-                                egui::RichText::new("Synced")
-                                    .small()
-                                    .color(ui.visuals().weak_text_color()),
-                            );
-                        });
-                        let _ = r;
-                    }
-                });
             });
 
             // Row 2: board tabs (Tasks section only), smaller than row 1.
@@ -517,6 +586,10 @@ impl KandriumApp {
         if self.saved.section == section {
             return;
         }
+        // Leaving Notes: flush dirty tabs so nothing is lost.
+        if self.saved.section == Section::Notes {
+            self.notes_state.flush_all();
+        }
         self.saved.section = section;
         self.clear_inline_editors();
         self.drag = None;
@@ -555,9 +628,43 @@ impl KandriumApp {
     // -- content ------------------------------------------------------------
 
     fn content(&mut self, ui: &mut egui::Ui) {
-        // Notes / Documents are blank placeholders for now.
-        if self.saved.section != Section::Tasks {
-            return;
+        // Notes and Documents live outside the kanban UI entirely.
+        match self.saved.section {
+            Section::Notes => {
+                let dark = self.saved.dark_mode;
+                let actions = notes::show(ui, &mut self.notes_state, dark);
+                if let Some(path) = actions.request_delete {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "this item".to_string());
+                    // Folder deletes are recursive (core uses remove_dir_all),
+                    // so the copy must say more than the single-file variant.
+                    let (title, message) = if path.is_dir() {
+                        (
+                            "Delete folder",
+                            format!(
+                                "Permanently delete \"{name}\" and every note inside it? \
+                                 This cannot be undone."
+                            ),
+                        )
+                    } else {
+                        (
+                            "Delete note",
+                            format!("Permanently delete \"{name}\"? This cannot be undone."),
+                        )
+                    };
+                    self.confirm = Some(confirm::ConfirmRequest {
+                        title: title.to_string(),
+                        message,
+                        confirm_label: "Delete".to_string(),
+                        action: confirm::ConfirmAction::DeleteNotePath(path),
+                    });
+                }
+                return;
+            }
+            Section::Documents => return,
+            Section::Tasks => {}
         }
 
         if self.view == View::Archived {
@@ -1041,6 +1148,12 @@ impl eframe::App for KandriumApp {
         {
             self.synced_at = None;
         }
+
+        // Notes auto-save: flush tabs whose debounce elapsed. egui repaints
+        // on demand, so keep scheduling frames while anything stays dirty.
+        if self.saved.section == Section::Notes && self.notes_state.tick_autosave() {
+            _ctx.request_repaint_after(Duration::from_millis(100));
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1048,12 +1161,19 @@ impl eframe::App for KandriumApp {
         let t = theme::Tokens::get(&ctx);
 
         // Toolbar: titlebar fill; `header()` paints the hairline under the
-        // section row.
+        // section row. No top margin: the first header row is the macOS
+        // title-bar band, which must start at the window edge to line up
+        // with the traffic-light buttons.
         egui::Panel::top("kandrium-toolbar")
             .frame(
                 egui::Frame::new()
                     .fill(t.titlebar)
-                    .inner_margin(egui::Margin::symmetric(TOOLBAR_H_MARGIN, 8)),
+                    .inner_margin(egui::Margin {
+                        left: TOOLBAR_H_MARGIN,
+                        right: TOOLBAR_H_MARGIN,
+                        top: 0,
+                        bottom: 8,
+                    }),
             )
             .show(ui, |ui| {
                 self.header(ui);
@@ -1082,6 +1202,10 @@ impl eframe::App for KandriumApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        // Flush notes and remember the tab session for next launch.
+        self.notes_state.flush_all();
+        self.saved.notes_open = self.notes_state.rel_paths();
+        self.saved.notes_active = self.notes_state.active_index();
         eframe::set_value(storage, eframe::APP_KEY, &self.saved);
     }
 }
@@ -1119,5 +1243,74 @@ fn open_db_or_die() -> Arc<Mutex<Connection>> {
             );
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The title-bar band layout must center its content on the traffic
+    /// lights' measured center line, with the title starting at the measured
+    /// `title_x`. Headless regression for the macOS fullsize-content-view
+    /// title bar (traffic lights at center_y=16 on current macOS).
+    #[test]
+    fn title_band_centers_content_on_traffic_light_line() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply_visuals(&ctx, false);
+
+        // Measured on current macOS: lights centered 16 px from the window
+        // top (buttons 14 px tall, 9 px from the top), title starting 14 px
+        // right of the zoom button (right edge x=69).
+        let center_y = 16.0_f32;
+        let title_x = 83.0_f32;
+        let band_h = (2.0 * center_y).round().max(22.0);
+
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ctx| {
+            // Toolbar content rect: panel side margin, top at the window edge.
+            let content = egui::Rect::from_min_size(
+                egui::pos2(f32::from(TOOLBAR_H_MARGIN), 0.0),
+                egui::vec2(600.0, 300.0),
+            );
+            let mut ui = egui::Ui::new(
+                ctx.clone(),
+                egui::Id::new("band"),
+                egui::UiBuilder::new().max_rect(content),
+            );
+            ui.vertical(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), band_h),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.add_space(title_x - ui.cursor().left());
+                        ui.label(egui::RichText::new("Kandrium").text_style(theme::strong()));
+                    },
+                );
+            });
+        });
+
+        let mut title_rect = None;
+        for clipped in &out.shapes {
+            if let egui::Shape::Text(text) = &clipped.shape
+                && text.galley.text() == "Kandrium"
+            {
+                title_rect = Some(egui::Rect::from_min_size(text.pos, text.galley.size()));
+            }
+        }
+        out.textures_delta.clear();
+
+        let r = title_rect.expect("Kandrium label should be painted in the band");
+        assert!(
+            (r.center().y - center_y).abs() <= 1.0,
+            "title center y {} should match traffic-light center {center_y} \
+             (band height {band_h}, rect {r:?})",
+            r.center().y
+        );
+        assert!(
+            (r.left() - title_x).abs() <= 1.0,
+            "title left {} should start at measured title_x {title_x}",
+            r.left()
+        );
     }
 }

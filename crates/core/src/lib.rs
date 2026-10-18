@@ -9,6 +9,7 @@ pub mod db;
 pub mod error;
 pub mod import;
 pub mod models;
+pub mod notes;
 pub mod seed;
 pub mod services;
 

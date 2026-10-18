@@ -152,6 +152,8 @@ reduced-motion support.
 
 - `KANDRIUM_DB` overrides the DB path; default `<data_dir>/kandrium/kandrium.db`.
 - `KANDRIUM_OLD_DB` overrides the legacy Electron source for `kandrium-import`.
+- `KANDRIUM_NOTES` overrides the notes root; default
+  `<data_dir>/kandrium/notes/` (plain `.md` files, no DB involvement).
 - Auto-migration from `<data_dir>/planly-rs/planly.db` runs once at app and MCP
   boot (staged `VACUUM INTO`, never writes the source). A `KANDRIUM_DB`
   override opts out of auto-migration.

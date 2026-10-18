@@ -21,6 +21,9 @@ pub enum ConfirmAction {
     DeleteCard(String),
     /// Column id (may be a virtual `all:<status>` bucket id).
     ArchiveAll(String),
+    /// Notes page: file or folder to delete (absolute path under the notes
+    /// root).
+    DeleteNotePath(std::path::PathBuf),
 }
 
 /// What happened this frame.
