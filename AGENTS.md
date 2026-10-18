@@ -64,16 +64,28 @@ Before finishing a change: run `cargo fmt`, `cargo clippy --workspace`, and
 
 A GUI launched from a sandboxed agent shell can read the default DB but every
 SQLite write fails with `SQLITE_READONLY` (`~/Library/Application Support` is
-not writable by the sandboxed process). Launch detached instead:
+not writable by the sandboxed process). `dangerouslyDisableSandbox` does not
+bypass this. Launch through the dev bundle wrapper instead:
 
 ```sh
-open -n target/debug/kandrium-app
+open -n target/Kandrium-dev.app
 ```
 
+`target/Kandrium-dev.app` is a minimal `.app` bundle whose executable is a
+symlink to `target/debug/kandrium-app`, so every rebuild is picked up on the
+next launch. LaunchServices starts it as a real bundle app, fully outside the
+agent sandbox (DB writes work) and with no Terminal window hosting it —
+`open -n` on the bare binary re-parents under Terminal.app, and closing that
+window kills the app. Restart after a rebuild with
+`killall kandrium-app; open -n target/Kandrium-dev.app`. The bundle lives in
+the cleanable `target/`; if missing, recreate it: `Contents/MacOS/kandrium-app`
+as a symlink to `../../../debug/kandrium-app` plus a bare `Contents/Info.plist`
+(APPL, bundle id `app.kandrium.desktop.dev`, `CFBundleExecutable`
+`kandrium-app`).
+
 For testing with a writable database, set `KANDRIUM_DB` to a path under the
-workspace or `/tmp`. `dangerouslyDisableSandbox` does not bypass this. Visual
-verification may be impossible from the agent shell (screen capture blocked) —
-ask the user to confirm UI changes.
+workspace or `/tmp`. Visual verification may be impossible from the agent
+shell (screen capture blocked) — ask the user to confirm UI changes.
 
 ## egui conventions (hard-won — read before touching UI code)
 
