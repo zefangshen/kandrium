@@ -24,6 +24,9 @@ pub enum ConfirmAction {
     /// Notes page: file or folder to delete (absolute path under the notes
     /// root).
     DeleteNotePath(std::path::PathBuf),
+    /// Documents page: file or folder to delete (absolute path under the
+    /// documents root).
+    DeleteDocPath(std::path::PathBuf),
 }
 
 /// What happened this frame.

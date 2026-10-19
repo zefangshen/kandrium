@@ -8,6 +8,10 @@ edition = "2024"
 license = "Apache-2.0"
 license-file = "LICENSE"
 
+[workspace.dependencies]
+# PDF rasterization for the Documents section.
+hayro = "0.7.1"
+
 [profile.release]
 lto = "thin"
 strip = true

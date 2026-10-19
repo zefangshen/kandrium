@@ -16,7 +16,7 @@ use kandrium_core::{
 use crate::anim;
 use crate::dnd::{self, ColKey, Drag, DropZone};
 use crate::theme;
-use crate::views::{all_board, archive, board, notes};
+use crate::views::{all_board, archive, board, documents, notes};
 use crate::watcher;
 use crate::widgets::{card_modal, confirm};
 
@@ -93,6 +93,11 @@ struct SavedState {
     notes_open: Vec<String>,
     #[serde(default)]
     notes_active: Option<usize>,
+    /// Open document tabs (root-relative paths) + active tab index.
+    #[serde(default)]
+    docs_open: Vec<String>,
+    #[serde(default)]
+    docs_active: Option<usize>,
 }
 
 impl Default for SavedState {
@@ -103,6 +108,8 @@ impl Default for SavedState {
             section: Section::default(),
             notes_open: Vec::new(),
             notes_active: None,
+            docs_open: Vec::new(),
+            docs_active: None,
         }
     }
 }
@@ -133,6 +140,9 @@ pub struct KandriumApp {
 
     // Notes section
     notes_state: notes::NotesState,
+
+    // Documents section
+    documents_state: documents::DocumentsState,
 
     // Drag and drop
     drag: Option<Drag>,
@@ -193,6 +203,7 @@ impl KandriumApp {
             archive_state: archive::ArchiveState::default(),
             archived: None,
             notes_state: notes::NotesState::new(),
+            documents_state: documents::DocumentsState::new(),
             drag: None,
             zones: Vec::new(),
             settle_gap: None,
@@ -214,6 +225,10 @@ impl KandriumApp {
         let notes_open = app.saved.notes_open.clone();
         let notes_active = app.saved.notes_active;
         app.notes_state.open_relative(&notes_open, notes_active);
+        // Same for the Documents section.
+        let docs_open = app.saved.docs_open.clone();
+        let docs_active = app.saved.docs_active;
+        app.documents_state.open_relative(&docs_open, docs_active);
         app
     }
 
@@ -413,6 +428,15 @@ impl KandriumApp {
                     Err(e) => self.set_status(format!("Delete failed: {}", e.0), true),
                 }
             }
+            confirm::ConfirmAction::DeleteDocPath(path) => {
+                match kandrium_core::documents::delete_path(&path, self.documents_state.root()) {
+                    Ok(()) => {
+                        self.documents_state.on_deleted(&path);
+                        self.set_status("Deleted", false);
+                    }
+                    Err(e) => self.set_status(format!("Delete failed: {}", e.0), true),
+                }
+            }
         }
     }
 
@@ -586,9 +610,12 @@ impl KandriumApp {
         if self.saved.section == section {
             return;
         }
-        // Leaving Notes: flush dirty tabs so nothing is lost.
+        // Leaving Notes/Documents: flush dirty tabs so nothing is lost.
         if self.saved.section == Section::Notes {
             self.notes_state.flush_all();
+        }
+        if self.saved.section == Section::Documents {
+            self.documents_state.flush_all();
         }
         self.saved.section = section;
         self.clear_inline_editors();
@@ -663,7 +690,40 @@ impl KandriumApp {
                 }
                 return;
             }
-            Section::Documents => return,
+            Section::Documents => {
+                let dark = self.saved.dark_mode;
+                let actions = documents::show(ui, &mut self.documents_state, dark);
+                if let Some(path) = actions.request_delete {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "this item".to_string());
+                    let (title, message) = if path.is_dir() {
+                        (
+                            "Delete folder",
+                            format!(
+                                "Permanently delete \"{name}\" and every PDF inside it? \
+                                 This cannot be undone."
+                            ),
+                        )
+                    } else {
+                        (
+                            "Delete PDF",
+                            format!(
+                                "Permanently delete \"{name}\" and its annotations? \
+                                 This cannot be undone."
+                            ),
+                        )
+                    };
+                    self.confirm = Some(confirm::ConfirmRequest {
+                        title: title.to_string(),
+                        message,
+                        confirm_label: "Delete".to_string(),
+                        action: confirm::ConfirmAction::DeleteDocPath(path),
+                    });
+                }
+                return;
+            }
             Section::Tasks => {}
         }
 
@@ -1149,9 +1209,13 @@ impl eframe::App for KandriumApp {
             self.synced_at = None;
         }
 
-        // Notes auto-save: flush tabs whose debounce elapsed. egui repaints
-        // on demand, so keep scheduling frames while anything stays dirty.
+        // Notes/Documents auto-save: flush tabs whose debounce elapsed. egui
+        // repaints on demand, so keep scheduling frames while anything stays
+        // dirty.
         if self.saved.section == Section::Notes && self.notes_state.tick_autosave() {
+            _ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        if self.saved.section == Section::Documents && self.documents_state.tick_autosave() {
             _ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
@@ -1202,10 +1266,14 @@ impl eframe::App for KandriumApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        // Flush notes and remember the tab session for next launch.
+        // Flush notes + documents and remember the tab sessions for next
+        // launch.
         self.notes_state.flush_all();
         self.saved.notes_open = self.notes_state.rel_paths();
         self.saved.notes_active = self.notes_state.active_index();
+        self.documents_state.flush_all();
+        self.saved.docs_open = self.documents_state.rel_paths();
+        self.saved.docs_active = self.documents_state.active_index();
         eframe::set_value(storage, eframe::APP_KEY, &self.saved);
     }
 }

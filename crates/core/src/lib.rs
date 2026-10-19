@@ -6,7 +6,9 @@
 
 pub mod constants;
 pub mod db;
+pub mod documents;
 pub mod error;
+pub mod fsutil;
 pub mod import;
 pub mod models;
 pub mod notes;

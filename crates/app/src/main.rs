@@ -6,6 +6,7 @@ mod anim;
 mod app;
 mod dnd;
 mod icons;
+mod pdf;
 mod theme;
 mod views;
 mod watcher;

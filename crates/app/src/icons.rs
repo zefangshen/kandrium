@@ -28,6 +28,11 @@ static ICONS: &[(&str, &[u8])] = &[
         "folder-plus",
         include_bytes!("../assets/icons/folder-plus.svg"),
     ),
+    (
+        "highlighter",
+        include_bytes!("../assets/icons/highlighter.svg"),
+    ),
+    ("minus", include_bytes!("../assets/icons/minus.svg")),
     ("moon", include_bytes!("../assets/icons/moon.svg")),
     ("pencil", include_bytes!("../assets/icons/pencil.svg")),
     ("plus", include_bytes!("../assets/icons/plus.svg")),

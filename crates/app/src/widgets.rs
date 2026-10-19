@@ -4,6 +4,7 @@ pub mod card;
 pub mod card_modal;
 pub mod column;
 pub mod confirm;
+pub mod tabs;
 
 /// Right inset for Kanban-column content that must NOT run under the
 /// scrollbar. Column frames use a 1px right inner margin so the card-list
