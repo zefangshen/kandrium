@@ -174,8 +174,8 @@ mod tests {
     #[test]
     fn seed_is_guarded_and_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        let db = open_db(&dir.path().join("t.db")).unwrap();
-        run_schema(&db).unwrap();
+        let mut db = open_db(&dir.path().join("t.db")).unwrap();
+        run_schema(&mut db).unwrap();
 
         assert!(!has_boards(&db).unwrap());
         seed(&db).unwrap();

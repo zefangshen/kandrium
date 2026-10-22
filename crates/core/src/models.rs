@@ -65,23 +65,47 @@ pub struct Board {
     pub title: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Card {
     pub id: String,
     pub column_id: String,
+    /// Board that owns `column_id`. Resolved by the services; for a card
+    /// mirrored onto an area board this is the card's real (project) board.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub board_id: String,
     pub title: String,
     pub description: String,
     pub due_date: String,
     pub labels: Vec<i64>,
+    /// Project the card belongs to (project-board cards) or is tagged with
+    /// (area-board cards).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// Area board that mirrors a project card. Only set on project cards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub area_board_id: Option<String>,
+    /// Resolved identifier of [`Self::project_id`] (read-only convenience).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_identifier: Option<String>,
+    /// Second-row context label for the board being rendered: the area board
+    /// title (Career / Work / Life) on a project board, the project identifier
+    /// on normal boards. Resolved by `services::board` per board; UI-only, so
+    /// it stays out of the MCP payload.
+    #[serde(skip)]
+    pub meta_label: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Column {
     pub id: String,
     pub title: String,
     pub cards: Vec<Card>,
+    /// Project cards filed to the owning area board. Kept out of `cards` so
+    /// drag/drop indices and card positions always refer to real column rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirrored: Vec<Card>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -233,6 +257,9 @@ pub struct AllCardRow {
     pub board_title: String,
     pub order_status: Option<String>,
     pub order_position: Option<i64>,
+    pub project_id: Option<String>,
+    pub area_board_id: Option<String>,
+    pub project_identifier: Option<String>,
 }
 
 /// Row in the persisted All-board ordering table.

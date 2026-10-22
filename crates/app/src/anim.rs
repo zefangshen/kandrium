@@ -764,6 +764,7 @@ mod tests {
             description: String::new(),
             due_date: String::new(),
             labels: vec![],
+            ..Default::default()
         };
         frame(&ctx, 0.032, &|ctx| {
             CardRig::card_laid_out(ctx, "s2", base, 0);
@@ -802,6 +803,7 @@ mod tests {
             description: String::new(),
             due_date: String::new(),
             labels: vec![],
+            ..Default::default()
         };
         let slot = Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::new(248.0, 40.0));
         // Seed the rig as if the card had been laid out, then pick it up.
@@ -854,6 +856,7 @@ mod tests {
             description: String::new(),
             due_date: "2026-01-01".into(),
             labels: vec![],
+            ..Default::default()
         };
 
         const SCREEN: Vec2 = Vec2::new(400.0, 700.0);
@@ -882,7 +885,7 @@ mod tests {
 
         // --- Render the real chip and capture its painted frame fill rect.
         let shapes = render(&|ui| {
-            let _ = crate::widgets::card::card_chip(ui, &card, None, 0);
+            let _ = crate::widgets::card::card_chip(ui, &card, None, 0, None, true);
         });
         // Exclude the CentralPanel background (full-screen) and the
         // transparent gap-frame rect; keep the chip's fill.
@@ -901,7 +904,7 @@ mod tests {
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.set_width(280.0);
-                    let _ = crate::widgets::card::card_chip(ui, &card, None, 0);
+                    let _ = crate::widgets::card::card_chip(ui, &card, None, 0, None, true);
                 });
             },
         );

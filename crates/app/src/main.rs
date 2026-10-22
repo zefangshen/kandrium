@@ -34,8 +34,37 @@ fn dock_icon_image() -> usize {
     })
 }
 
-/// Apply the dock icon when running as a bare binary (dev via `cargo run`).
-/// Bundled `.app` builds get their icon from Contents/Resources/*.icns.
+/// True when the running executable lives in a `.app` that actually ships an
+/// `.icns` icon. Packaged builds do; the minimal dev bundle
+/// (`target/Kandrium-dev.app`) has only `Contents/MacOS` and an `Info.plist`,
+/// so it still needs the runtime icon.
+#[cfg(target_os = "macos")]
+fn bundle_ships_icon() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    for ancestor in exe.ancestors() {
+        if ancestor.file_name().and_then(|name| name.to_str()) != Some("Contents") {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(ancestor.join("Resources")) else {
+            return false;
+        };
+        return entries.flatten().any(|entry| {
+            entry.path().is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("icns"))
+        });
+    }
+    false
+}
+
+/// Apply the dock icon when the executable has no bundled `.icns` (bare
+/// `cargo run` binaries and the dev `.app`). Packaged `.app` builds get their
+/// icon from `Contents/Resources/*.icns` and skip this.
 /// Returns true when the icon is confirmed applied (or not needed).
 ///
 /// Must be called from the main thread once the app is running; calls made
@@ -46,11 +75,8 @@ pub fn set_dock_icon() -> bool {
     use objc::{msg_send, sel, sel_impl};
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    // Bundled app: macOS already uses the bundle's .icns.
-    let in_bundle = std::env::current_exe()
-        .map(|p| p.to_string_lossy().contains(".app/Contents/MacOS/"))
-        .unwrap_or(false);
-    if in_bundle {
+    // Packaged app with a real .icns: macOS already uses the bundle icon.
+    if bundle_ships_icon() {
         return true;
     }
 

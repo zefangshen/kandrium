@@ -27,6 +27,10 @@ pub enum ConfirmAction {
     /// Documents page: file or folder to delete (absolute path under the
     /// documents root).
     DeleteDocPath(std::path::PathBuf),
+    /// Projects page: project id to delete (row + board + documents folder).
+    DeleteProject(String),
+    /// Projects page: folder id to delete (recursive).
+    DeleteProjectFolder(String),
 }
 
 /// What happened this frame.

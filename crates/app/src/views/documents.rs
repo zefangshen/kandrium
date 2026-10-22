@@ -15,12 +15,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use egui::{Color32, Pos2, Rect, Vec2};
+use egui_commonmark::CommonMarkCache;
 use kandrium_core::documents::{
     self, AnnotationDoc, AnnotationKind, DocAnnotation, DocEntry, new_annotation,
 };
 
 use crate::pdf::{self, PageText, PdfWorker};
 use crate::theme::{self, Press, Tokens};
+use crate::views::notes_highlight::MarkdownHighlighter;
+use crate::widgets;
+use crate::widgets::markdown::{self, NoteMode};
 use crate::widgets::tabs::TAB_H;
 
 const AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -100,11 +104,20 @@ impl Selection {
     }
 }
 
+/// Which viewer a tab uses. PDF tabs own a render worker; Markdown tabs own
+/// an editable text buffer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DocKind {
+    Pdf,
+    Markdown,
+}
+
 /// One open document tab (UI side).
 pub struct OpenDoc {
+    kind: DocKind,
     path: PathBuf,
     worker: Option<PdfWorker>,
-    events: std::sync::mpsc::Receiver<pdf::Event>,
+    events: Option<std::sync::mpsc::Receiver<pdf::Event>>,
     page_count: usize,
     /// Load/render error (sticky once shown).
     error: Option<String>,
@@ -130,6 +143,10 @@ pub struct OpenDoc {
     scroll_to_page: Option<usize>,
     /// Page currently on screen (for the toolbar label).
     visible_page: usize,
+    /// Markdown buffer (empty for PDF tabs).
+    text: String,
+    /// Markdown editor/preview mode.
+    mode: NoteMode,
 }
 
 /// Screen point → page view space (points), given the page's screen rect
@@ -184,6 +201,11 @@ pub struct DocumentsState {
     open: Vec<OpenDoc>,
     active: Option<usize>,
     tool: Tool,
+    /// Left file-tree panel visibility (persisted across restarts).
+    pub tree_open: bool,
+    highlighter: Option<MarkdownHighlighter>,
+    highlighter_dark: bool,
+    preview_cache: CommonMarkCache,
     error: Option<String>,
 }
 
@@ -208,6 +230,10 @@ impl DocumentsState {
                     open: Vec::new(),
                     active: None,
                     tool: Tool::Select,
+                    tree_open: true,
+                    highlighter: None,
+                    highlighter_dark: true,
+                    preview_cache: CommonMarkCache::default(),
                     error: None,
                 };
                 state.rescan();
@@ -223,8 +249,20 @@ impl DocumentsState {
                 open: Vec::new(),
                 active: None,
                 tool: Tool::Select,
+                tree_open: true,
+                highlighter: None,
+                highlighter_dark: true,
+                preview_cache: CommonMarkCache::default(),
                 error: Some(format!("Cannot open documents folder: {e}")),
             },
+        }
+    }
+
+    /// Rebuild the markdown highlighter when the app theme changes.
+    fn set_dark(&mut self, dark: bool) {
+        if self.highlighter.is_none() || self.highlighter_dark != dark {
+            self.highlighter = Some(MarkdownHighlighter::new(dark));
+            self.highlighter_dark = dark;
         }
     }
 
@@ -243,39 +281,113 @@ impl DocumentsState {
         }
     }
 
-    /// Open a PDF in a tab (or activate its existing tab). The worker reads
-    /// and parses the file off-thread; annotations load lazily from the
-    /// sidecar once that open is confirmed.
+    /// Copy picked files into the selected tree folder, then reveal them.
+    /// The native picker itself is opened by [`Self::pick_and_import`].
+    pub fn import_paths(&mut self, paths: Vec<PathBuf>) {
+        let dest = if self.selected_dir.is_dir() {
+            self.selected_dir.clone()
+        } else {
+            self.root.clone()
+        };
+        let mut errors = Vec::new();
+        for src in paths {
+            if let Err(e) = documents::import_file(&src, &dest, &self.root) {
+                errors.push(format!("Cannot upload {}: {e}", src.display()));
+            }
+        }
+        self.selected_dir = dest.clone();
+        self.expanded.insert(dest);
+        self.rescan();
+        if !errors.is_empty() {
+            let scan_error = self.error.take();
+            let mut message = errors.join("; ");
+            if let Some(scan_error) = scan_error {
+                message.push_str("; ");
+                message.push_str(&scan_error);
+            }
+            self.error = Some(message);
+        }
+    }
+
+    /// Open the native multi-select picker and import the chosen files.
+    fn pick_and_import(&mut self) {
+        let picked = rfd::FileDialog::new()
+            .add_filter("Documents", &["pdf", "md", "markdown"])
+            .pick_files();
+        if let Some(paths) = picked {
+            self.import_paths(paths);
+        }
+    }
+
+    /// Open a document in a tab (or activate its existing tab). PDFs start an
+    /// off-thread render worker; Markdown files load their text for editing.
     pub fn open_file(&mut self, path: PathBuf) {
         if let Some(idx) = self.open.iter().position(|d| d.path == path) {
             self.active = Some(idx);
             return;
         }
-        let repaint = self.ui_ctx.clone().unwrap_or_default();
-        let (worker, events) = PdfWorker::open(path.clone(), repaint);
-        self.open.push(OpenDoc {
-            path,
-            worker: Some(worker),
-            events,
-            page_count: 0,
-            error: None,
-            zoom: 1.0,
-            textures: HashMap::new(),
-            texture_stamps: HashMap::new(),
-            page_size: None,
-            page_texts: HashMap::new(),
-            text_requested: HashSet::new(),
-            pending: HashSet::new(),
-            annotations: Vec::new(),
-            dirty_since: None,
-            selection: None,
-            popover: None,
-            scroll_to_page: None,
-            visible_page: 0,
-        });
-        let idx = self.open.len() - 1;
-        self.active = Some(idx);
-        self.load_annotations(idx);
+        if documents::is_pdf(&path) {
+            let repaint = self.ui_ctx.clone().unwrap_or_default();
+            let (worker, events) = PdfWorker::open(path.clone(), repaint);
+            self.open.push(OpenDoc {
+                kind: DocKind::Pdf,
+                path,
+                worker: Some(worker),
+                events: Some(events),
+                page_count: 0,
+                error: None,
+                zoom: 1.0,
+                textures: HashMap::new(),
+                texture_stamps: HashMap::new(),
+                page_size: None,
+                page_texts: HashMap::new(),
+                text_requested: HashSet::new(),
+                pending: HashSet::new(),
+                annotations: Vec::new(),
+                dirty_since: None,
+                selection: None,
+                popover: None,
+                scroll_to_page: None,
+                visible_page: 0,
+                text: String::new(),
+                mode: NoteMode::Edit,
+            });
+            let idx = self.open.len() - 1;
+            self.active = Some(idx);
+            self.load_annotations(idx);
+        } else if documents::is_markdown(&path) {
+            match documents::read_text(&path, &self.root) {
+                Ok(text) => {
+                    self.open.push(OpenDoc {
+                        kind: DocKind::Markdown,
+                        path,
+                        worker: None,
+                        events: None,
+                        page_count: 0,
+                        error: None,
+                        zoom: 1.0,
+                        textures: HashMap::new(),
+                        texture_stamps: HashMap::new(),
+                        page_size: None,
+                        page_texts: HashMap::new(),
+                        text_requested: HashSet::new(),
+                        pending: HashSet::new(),
+                        annotations: Vec::new(),
+                        dirty_since: None,
+                        selection: None,
+                        popover: None,
+                        scroll_to_page: None,
+                        visible_page: 0,
+                        text,
+                        mode: NoteMode::Edit,
+                    });
+                    self.active = Some(self.open.len() - 1);
+                }
+                Err(e) => self.error = Some(format!("Cannot open document: {e}")),
+            }
+        } else {
+            self.error = Some("Unsupported document type".to_string());
+        }
     }
 
     fn load_annotations(&mut self, idx: usize) {
@@ -300,21 +412,28 @@ impl DocumentsState {
             return;
         }
         let path = doc.path.clone();
+        let kind = doc.kind;
+        let text = doc.text.clone();
         let annotations = AnnotationDoc {
             annotations: doc.annotations.clone(),
             ..AnnotationDoc::default()
         };
-        match documents::save_annotations(&path, &self.root, &annotations) {
-            Ok(()) => {
-                if let Some(doc) = self.open.get_mut(idx) {
-                    doc.dirty_since = None;
+        let result = match kind {
+            DocKind::Pdf => documents::save_annotations(&path, &self.root, &annotations)
+                .map_err(|e| format!("Cannot save annotations: {e}")),
+            DocKind::Markdown => documents::write_text(&path, &self.root, &text)
+                .map_err(|e| format!("Cannot save document: {e}")),
+        };
+        if let Some(doc) = self.open.get_mut(idx) {
+            match result {
+                Ok(()) => doc.dirty_since = None,
+                Err(e) => {
+                    // Keep the buffer dirty and back off before the next
+                    // autosave attempt; a transient write error must not
+                    // silently discard the edit.
+                    doc.dirty_since = Some(Instant::now());
+                    self.error = Some(e);
                 }
-            }
-            Err(e) => {
-                if let Some(doc) = self.open.get_mut(idx) {
-                    doc.dirty_since = None;
-                }
-                self.error = Some(format!("Cannot save annotations: {e}"));
             }
         }
     }
@@ -347,6 +466,11 @@ impl DocumentsState {
 
     fn close_tab(&mut self, idx: usize) {
         self.flush(idx);
+        // A failed save keeps the tab (and its dirty buffer) open so the
+        // user can retry instead of losing the edit.
+        if self.open.get(idx).is_some_and(|d| d.dirty_since.is_some()) {
+            return;
+        }
         self.remove_tab(idx);
     }
 
@@ -438,7 +562,7 @@ impl DocumentsState {
     /// before drawing so textures/text are fresh.
     fn pump_events(&mut self, ctx: &egui::Context) {
         for idx in 0..self.open.len() {
-            while let Ok(event) = self.open[idx].events.try_recv() {
+            while let Some(Ok(event)) = self.open[idx].events.as_ref().map(|rx| rx.try_recv()) {
                 self.apply_event(idx, event, ctx);
             }
         }
@@ -515,22 +639,36 @@ fn permille(scale: f32) -> u32 {
 // ---------------------------------------------------------------------------
 
 pub fn show(ui: &mut egui::Ui, state: &mut DocumentsState, dark: bool) -> DocumentsActions {
+    state.set_dark(dark);
     let mut actions = DocumentsActions::default();
     let t = Tokens::get(ui.ctx());
-    let _ = dark;
 
     state.ui_ctx = Some(ui.ctx().clone());
     state.pump_events(ui.ctx());
 
-    egui::Panel::left("documents-tree")
-        .resizable(true)
-        .default_size(TREE_DEFAULT_W)
-        .min_size(160.0)
-        .max_size(480.0)
-        .frame(egui::Frame::new().fill(t.panel))
-        .show(ui, |ui| {
-            tree_panel(ui, state, &mut actions);
-        });
+    if state.tree_open {
+        egui::Panel::left("documents-tree")
+            .resizable(true)
+            .default_size(TREE_DEFAULT_W)
+            .min_size(160.0)
+            .max_size(480.0)
+            .frame(egui::Frame::new().fill(t.panel))
+            .show(ui, |ui| {
+                tree_panel(ui, state, &mut actions);
+            });
+    } else {
+        egui::Panel::left("documents-tree-rail")
+            .resizable(false)
+            .default_size(widgets::RAIL_W)
+            .min_size(widgets::RAIL_W)
+            .max_size(widgets::RAIL_W)
+            .frame(egui::Frame::new().fill(t.panel))
+            .show(ui, |ui| {
+                if widgets::expand_button(ui) {
+                    state.tree_open = true;
+                }
+            });
+    }
 
     viewer_panel(ui, state);
     actions
@@ -541,13 +679,21 @@ pub fn show(ui: &mut egui::Ui, state: &mut DocumentsState, dark: bool) -> Docume
 fn tree_panel(ui: &mut egui::Ui, state: &mut DocumentsState, actions: &mut DocumentsActions) {
     ui.add_space(6.0);
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
         ui.add_space(4.0);
         ui.label(
-            egui::RichText::new("PDFs")
+            egui::RichText::new("Documents")
                 .text_style(theme::small_strong())
                 .color(Tokens::get(ui.ctx()).text_muted),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if widgets::collapse_button(ui) {
+                state.tree_open = false;
+            }
+            if theme::icon_button(ui, "upload", 26.0, false, "Upload to selected folder").clicked()
+            {
+                state.pick_and_import();
+            }
             if theme::icon_button(ui, "rotate-cw", 26.0, false, "Refresh").clicked() {
                 state.rescan();
             }
@@ -630,7 +776,13 @@ fn tree_row(
         }
         x += 14.0;
 
-        let icon = if entry.is_dir { "folder" } else { "file" };
+        let icon = if entry.is_dir {
+            "folder"
+        } else if documents::is_markdown(&entry.path) {
+            "file-text"
+        } else {
+            "file"
+        };
         crate::icons::paint(
             ui,
             Rect::from_center_size(egui::pos2(x + 7.0, cy), Vec2::splat(14.0)),
@@ -715,7 +867,7 @@ fn viewer_panel(ui: &mut egui::Ui, state: &mut DocumentsState) {
     if state.open.is_empty() {
         ui.vertical_centered(|ui| {
             ui.add_space(60.0);
-            ui.weak("Select a PDF to open");
+            ui.weak("Select a document to open");
         });
         return;
     }
@@ -729,7 +881,11 @@ fn viewer_panel(ui: &mut egui::Ui, state: &mut DocumentsState) {
     let idx = state.active.unwrap_or(0).min(state.open.len() - 1);
     state.active = Some(idx);
 
-    viewer(ui, state, idx);
+    if state.open[idx].kind == DocKind::Markdown {
+        markdown_viewer(ui, state, idx);
+    } else {
+        viewer(ui, state, idx);
+    }
 }
 
 fn tab_strip(ui: &mut egui::Ui, state: &mut DocumentsState) {
@@ -850,6 +1006,32 @@ fn viewer_toolbar(ui: &mut egui::Ui, state: &mut DocumentsState, idx: usize) {
         }
     });
     ui.add_space(2.0);
+}
+
+/// Render the active Markdown tab: mode toggle + the shared editor/preview.
+fn markdown_viewer(ui: &mut egui::Ui, state: &mut DocumentsState, idx: usize) {
+    ui.horizontal(|ui| {
+        ui.add_space(4.0);
+        let _ = markdown::mode_toggle(ui, &mut state.open[idx].mode);
+    });
+    ui.add_space(2.0);
+
+    // Disjoint field borrows: the buffer and the shared preview cache live on
+    // different fields of the state.
+    let DocumentsState {
+        open,
+        highlighter,
+        preview_cache,
+        ..
+    } = state;
+    let Some(highlighter) = highlighter.as_ref() else {
+        return;
+    };
+    let doc = &mut open[idx];
+    let id = egui::Id::new(("doc-markdown", doc.path.as_os_str()));
+    if markdown::body(ui, id, &mut doc.text, doc.mode, highlighter, preview_cache) {
+        doc.dirty_since = Some(Instant::now());
+    }
 }
 
 /// Render the active document's pages, selection, annotations, and popover.
@@ -1332,6 +1514,10 @@ mod tests {
             open: Vec::new(),
             active: None,
             tool: Tool::Select,
+            tree_open: true,
+            highlighter: None,
+            highlighter_dark: true,
+            preview_cache: CommonMarkCache::default(),
             error: None,
         };
         state.rescan();
@@ -1385,6 +1571,7 @@ mod tests {
         // Minimal fake PDF file; the worker is not started (worker: None).
         std::fs::write(root.join("a.pdf"), b"%PDF-fake").unwrap();
         std::fs::write(root.join("b.pdf"), b"%PDF-fake").unwrap();
+        std::fs::write(root.join("notes.md"), "# Notes\n").unwrap();
 
         let ctx = egui::Context::default();
         crate::theme::install_fonts(&ctx);
@@ -1400,26 +1587,35 @@ mod tests {
         state.open[1].worker = None;
         state.open[1].page_count = 2;
         state.open[1].page_size = Some((612.0, 792.0));
-        state.active = Some(0);
+        state.open_file(root.join("notes.md"));
+        assert_eq!(state.open[2].kind, DocKind::Markdown);
 
-        for _ in 0..2 {
-            let mut output = ctx.run_ui(Default::default(), |ctx| {
-                let mut ui = egui::Ui::new(
-                    ctx.clone(),
-                    egui::Id::new("root"),
-                    egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
-                        egui::pos2(0.0, 0.0),
-                        egui::vec2(1000.0, 700.0),
-                    )),
-                );
-                show(&mut ui, &mut state, true);
-            });
-            let text = shapes_text(&output);
-            assert!(
-                !text.contains("use of"),
-                "duplicate-ID warning visible:\n{text}"
-            );
-            output.textures_delta.clear();
+        // Expanded tree and collapsed rail must both render cleanly, for a
+        // PDF tab and a Markdown tab.
+        for tree_open in [true, false] {
+            state.tree_open = tree_open;
+            for active in [0, 2] {
+                state.active = Some(active);
+                for _ in 0..2 {
+                    let mut output = ctx.run_ui(Default::default(), |ctx| {
+                        let mut ui = egui::Ui::new(
+                            ctx.clone(),
+                            egui::Id::new("root"),
+                            egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+                                egui::pos2(0.0, 0.0),
+                                egui::vec2(1000.0, 700.0),
+                            )),
+                        );
+                        show(&mut ui, &mut state, true);
+                    });
+                    let text = shapes_text(&output);
+                    assert!(
+                        !text.contains("use of"),
+                        "duplicate-ID warning visible:\n{text}"
+                    );
+                    output.textures_delta.clear();
+                }
+            }
         }
     }
 
@@ -1447,5 +1643,68 @@ mod tests {
         assert_eq!(state.open.len(), 1);
         assert_eq!(state.active, Some(0));
         assert_eq!(state.open[0].path, root.join("b.pdf"));
+    }
+
+    #[test]
+    fn markdown_tab_edits_and_flushes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("documents");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("notes.md"), "# One\n").unwrap();
+
+        let mut state = test_state(&root);
+        state.open_file(root.join("notes.md"));
+        assert_eq!(state.open.len(), 1);
+        assert_eq!(state.open[0].kind, DocKind::Markdown);
+        assert_eq!(state.open[0].text, "# One\n");
+
+        state.open[0].text = "# Two\n".into();
+        state.open[0].dirty_since = Some(Instant::now());
+        state.flush_all();
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes.md")).unwrap(),
+            "# Two\n"
+        );
+        assert!(state.open[0].dirty_since.is_none());
+    }
+
+    #[test]
+    fn import_paths_copies_into_the_selected_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("documents");
+        let papers = root.join("papers");
+        std::fs::create_dir_all(&papers).unwrap();
+        let src = tmp.path().join("incoming");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("paper.pdf"), b"%PDF-fake").unwrap();
+        std::fs::write(src.join("notes.md"), "# Notes\n").unwrap();
+        std::fs::write(src.join("bad.txt"), "x").unwrap();
+
+        let mut state = test_state(&root);
+        state.selected_dir = papers.clone();
+        state.import_paths(vec![src.join("paper.pdf"), src.join("notes.md")]);
+
+        assert!(papers.join("paper.pdf").is_file());
+        assert!(papers.join("notes.md").is_file());
+        assert!(state.expanded.contains(&papers));
+        let row = state.tree.iter().find(|e| e.name == "papers").unwrap();
+        let names: Vec<&str> = row
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(names, ["notes.md", "paper.pdf"]);
+        assert!(state.error.is_none());
+
+        state.import_paths(vec![src.join("bad.txt")]);
+        assert!(
+            state
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("Cannot upload")),
+            "unsupported uploads surface an error"
+        );
     }
 }

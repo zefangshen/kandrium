@@ -9,6 +9,7 @@ description = "Kandrium data layer: SQLite schema, services, seed, and legacy im
 dirs = "7.0.0"
 rand = "0.10.3"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite_migration = "2.6"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tempfile = "3.27.0"

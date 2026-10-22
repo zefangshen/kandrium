@@ -5,13 +5,19 @@ use std::collections::HashMap;
 use rusqlite::Connection;
 
 use crate::constants::{ALL_BOARD_ID, ALL_COLUMN_PREFIX, CARD_STATUSES, status_from_column_title};
-use crate::db::parse_labels;
+use crate::db::{parse_labels, uid};
 use crate::error::{KandriumError, Result};
 use crate::models::*;
+use crate::services::column::require_title;
 
-/// List all boards.
+/// List all boards for the Tasks section. Project-owned boards are excluded
+/// (they are reachable from the Projects overview instead).
 pub fn list_boards(db: &Connection) -> Result<BoardsResult> {
-    let mut stmt = db.prepare("SELECT id, title FROM boards ORDER BY position")?;
+    let mut stmt = db.prepare(
+        "SELECT id, title FROM boards \
+         WHERE id NOT IN (SELECT board_id FROM projects) \
+         ORDER BY position",
+    )?;
     let boards = stmt
         .query_map([], |r| {
             Ok(Board {
@@ -21,6 +27,21 @@ pub fn list_boards(db: &Connection) -> Result<BoardsResult> {
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(BoardsResult { boards })
+}
+
+/// Create a bare board at the end of the list. No default columns — callers
+/// (the project templates) scaffold those. Errors if title is empty.
+pub fn create_board(db: &Connection, title: &str) -> Result<Board> {
+    let title = require_title(title)?;
+    // Single INSERT...SELECT computes the next position in the same statement,
+    // so concurrent writers can't race a separate MAX(position) read.
+    let id = uid();
+    db.execute(
+        "INSERT INTO boards (id, title, position) \
+         SELECT ?, ?, COALESCE(MAX(position), -1) + 1 FROM boards",
+        rusqlite::params![id, title],
+    )?;
+    Ok(Board { id, title })
 }
 
 /// Load a single board with columns and cards. Errors if board not found.
@@ -38,6 +59,12 @@ pub fn get_board(db: &Connection, id: &str) -> Result<BoardWithColumns> {
         return Err(KandriumError::new("Board not found"));
     };
 
+    let project_board: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM projects WHERE board_id = ?)",
+        [&board_id],
+        |r| r.get(0),
+    )?;
+
     let mut col_stmt =
         db.prepare("SELECT id, title FROM columns WHERE board_id = ? ORDER BY position")?;
     let columns = col_stmt
@@ -47,20 +74,61 @@ pub fn get_board(db: &Connection, id: &str) -> Result<BoardWithColumns> {
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let mut card_stmt = db.prepare(
-        "SELECT id, column_id, title, description, due_date, labels FROM cards \
-         WHERE column_id = ? AND archived = 0 ORDER BY position",
+        "SELECT c.id, c.column_id, c.title, c.description, c.due_date, c.labels, \
+                c.project_id, c.area_board_id, p.identifier, ab.title \
+         FROM cards c LEFT JOIN projects p ON p.id = c.project_id \
+         LEFT JOIN boards ab ON ab.id = c.area_board_id \
+         WHERE c.column_id = ? AND c.archived = 0 ORDER BY c.position",
     )?;
 
     let mut board_columns = Vec::with_capacity(columns.len());
     for (col_id, col_title) in columns {
         let cards = card_stmt
-            .query_map([&col_id], map_card_row)?
+            .query_map([&col_id], |r| map_card_row(r, &board_id, project_board))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         board_columns.push(Column {
             id: col_id,
             title: col_title,
             cards,
+            mirrored: Vec::new(),
         });
+    }
+
+    // Area boards also show project cards filed to them ("mirror"). They stay
+    // in their real project column in the database; here they are bucketed
+    // into the area column with the same canonical status, appended after the
+    // board's own cards so native drag/drop indices are unaffected.
+    if !project_board {
+        let mut mirror_stmt = db.prepare(
+            r#"SELECT c.id, c.column_id, c.title, c.description, c.due_date, c.labels,
+                      COALESCE(c.project_id, p.id) AS project_id,
+                      c.area_board_id, p.identifier, ab.title,
+                      col.board_id AS home_board_id, col.title AS home_column_title
+               FROM cards c
+               JOIN columns col ON c.column_id = col.id
+               JOIN projects p ON p.board_id = col.board_id
+               LEFT JOIN boards ab ON ab.id = c.area_board_id
+               WHERE c.area_board_id = ? AND c.archived = 0
+               ORDER BY p.position, c.position"#,
+        )?;
+        let rows: Vec<(Card, String)> = mirror_stmt
+            .query_map([&board_id], |r| {
+                let home_board_id: String = r.get(10)?;
+                let home_column_title: String = r.get(11)?;
+                Ok((map_card_row(r, &home_board_id, false)?, home_column_title))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (card, home_column_title) in rows {
+            let Some(status) = status_from_column_title(&home_column_title) else {
+                continue;
+            };
+            if let Some(column) = board_columns
+                .iter_mut()
+                .find(|c| status_from_column_title(&c.title) == Some(status))
+            {
+                column.mirrored.push(card);
+            }
+        }
     }
 
     Ok(BoardWithColumns {
@@ -70,11 +138,24 @@ pub fn get_board(db: &Connection, id: &str) -> Result<BoardWithColumns> {
     })
 }
 
-/// Row mapper for non-archived card selects.
-fn map_card_row(r: &rusqlite::Row) -> rusqlite::Result<Card> {
+/// Row mapper for non-archived card selects. `board_id` is the home board of
+/// the card's column (not necessarily the board being rendered).
+///
+/// `project_board` selects the second-row label: a project board shows the
+/// area the card is filed to (the project identifier is redundant there),
+/// while a normal/area board shows the project identifier.
+fn map_card_row(r: &rusqlite::Row, board_id: &str, project_board: bool) -> rusqlite::Result<Card> {
+    let project_identifier: Option<String> = r.get(8)?;
+    let area_board_title: Option<String> = r.get(9)?;
+    let meta_label = if project_board {
+        area_board_title
+    } else {
+        project_identifier.clone()
+    };
     Ok(Card {
         id: r.get(0)?,
         column_id: r.get(1)?,
+        board_id: board_id.to_string(),
         title: r.get(2)?,
         description: r.get(3)?,
         due_date: r.get(4)?,
@@ -82,6 +163,10 @@ fn map_card_row(r: &rusqlite::Row) -> rusqlite::Result<Card> {
             .get::<_, String>(5)
             .map(|s| parse_labels(&s).unwrap_or_default())
             .unwrap_or_default(),
+        project_id: r.get(6)?,
+        area_board_id: r.get(7)?,
+        project_identifier,
+        meta_label,
     })
 }
 
@@ -100,13 +185,19 @@ pub fn get_all_board(db: &Connection) -> Result<AllBoard> {
     let mut stmt = db.prepare(
         r#"SELECT c.id, c.title, c.description, c.due_date, c.labels, c.position,
                   col.id AS column_id, col.title AS column_title,
-                  b.id AS board_id, b.title AS board_title,
-                  o.status AS order_status, o.position AS order_position
+                  b.id AS board_id,
+                  COALESCE(ab.title, b.title) AS board_title,
+                  o.status AS order_status, o.position AS order_position,
+                  c.project_id, c.area_board_id, p.identifier AS project_identifier
            FROM cards c
            JOIN columns col ON c.column_id = col.id
            JOIN boards b ON col.board_id = b.id
+           LEFT JOIN boards ab ON ab.id = c.area_board_id
+           LEFT JOIN projects p ON p.id = c.project_id
            LEFT JOIN all_card_order o ON o.card_id = c.id
            WHERE c.archived = 0
+             AND (col.board_id NOT IN (SELECT board_id FROM projects)
+                  OR c.area_board_id IS NOT NULL)
            ORDER BY b.position, col.position, c.position"#,
     )?;
     let rows: Vec<AllCardRow> = stmt
@@ -124,6 +215,9 @@ pub fn get_all_board(db: &Connection) -> Result<AllBoard> {
                 board_title: r.get(9)?,
                 order_status: r.get(10)?,
                 order_position: r.get(11)?,
+                project_id: r.get(12)?,
+                area_board_id: r.get(13)?,
+                project_identifier: r.get(14)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -205,10 +299,15 @@ pub fn get_all_board(db: &Connection) -> Result<AllBoard> {
             card: Card {
                 id: r.id.clone(),
                 column_id: r.column_id.clone(),
+                board_id: r.board_id.clone(),
                 title: r.title.clone(),
                 description: r.description.clone(),
                 due_date: r.due_date.clone(),
                 labels,
+                project_id: r.project_id.clone(),
+                area_board_id: r.area_board_id.clone(),
+                project_identifier: r.project_identifier.clone(),
+                meta_label: None,
             },
             board_id: r.board_id.clone(),
             board_title: r.board_title.clone(),

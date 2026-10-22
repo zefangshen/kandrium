@@ -20,6 +20,12 @@ const BOTTOM_GUTTER: f32 = 15.0;
 #[derive(Default)]
 pub struct BoardActions {
     pub open_card: Option<String>,
+    /// Pencil pressed on a card (open the inline title editor).
+    pub edit_card: Option<String>,
+    /// Inline title editor submitted (Enter/blur); text lives in the app draft.
+    pub edit_commit: Option<String>,
+    /// Inline title editor canceled (Esc).
+    pub edit_cancel: Option<String>,
     /// Drop performed: (card_id, target_col_id, before_card_id).
     pub card_drop: Option<(String, String, Option<String>)>,
     /// Column reorder: (col_id, before_col_id).
@@ -44,7 +50,9 @@ struct ColumnLayout {
 /// Render the board. Returns this frame's actions.
 ///
 /// The add-card draft is mutated in place; the submit action tells the view
-/// to read + consume it.
+/// to read + consume it. `edit_card` names the card whose title is being
+/// edited inline and `edit_draft` holds its live text (mutated in place).
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut Ui,
     board: &BoardWithColumns,
@@ -53,6 +61,8 @@ pub fn show(
     add_form_col: Option<&str>,
     add_draft: &mut Option<String>,
     hover: Option<(ColKey, usize)>,
+    edit_card: Option<&str>,
+    edit_draft: &mut String,
 ) -> BoardActions {
     let mut out = BoardActions::default();
     let dragging_card = drag.map(|d| d.card_id.clone());
@@ -129,6 +139,8 @@ pub fn show(
                                         max_col_height,
                                         gap_idx,
                                         gap_height,
+                                        edit_card,
+                                        &mut *edit_draft,
                                     )
                                 })
                                 .inner
@@ -158,6 +170,15 @@ pub fn show(
                     }
                     if let Some(card) = actions.open_card {
                         out.open_card = Some(card);
+                    }
+                    if let Some(card) = actions.edit_card {
+                        out.edit_card = Some(card);
+                    }
+                    if let Some(card) = actions.edit_commit {
+                        out.edit_commit = Some(card);
+                    }
+                    if let Some(card) = actions.edit_cancel {
+                        out.edit_cancel = Some(card);
                     }
                     if let Some(card) = actions.archive_card {
                         out.archive_card = Some(card);
@@ -210,6 +231,7 @@ mod layout_tests {
                     description: String::new(),
                     due_date: String::new(),
                     labels: vec![],
+                    ..Default::default()
                 },
                 // Short title must not shrink the chip to text width.
                 Card {
@@ -219,8 +241,10 @@ mod layout_tests {
                     description: String::new(),
                     due_date: String::new(),
                     labels: vec![],
+                    ..Default::default()
                 },
             ],
+            mirrored: vec![],
         };
         BoardWithColumns {
             id: "b".into(),
@@ -255,6 +279,8 @@ mod layout_tests {
                 None,
                 &mut add_draft,
                 None,
+                None,
+                &mut String::new(),
             );
         });
         output.textures_delta.clear();
@@ -348,8 +374,10 @@ mod layout_tests {
                     description: String::new(),
                     due_date: String::new(),
                     labels: vec![],
+                    ..Default::default()
                 })
                 .collect(),
+            mirrored: vec![],
         };
         let board = BoardWithColumns {
             id: "b".into(),
@@ -375,6 +403,8 @@ mod layout_tests {
                 None,
                 &mut add_draft,
                 None,
+                None,
+                &mut String::new(),
             );
         });
         output.textures_delta.clear();
@@ -456,6 +486,8 @@ mod layout_tests {
                         None,
                         &mut add_draft,
                         hover.clone(),
+                        None,
+                        &mut String::new(),
                     );
                 },
             );
@@ -563,6 +595,8 @@ mod layout_tests {
                     None,
                     &mut add_draft,
                     hover.clone(),
+                    None,
+                    &mut String::new(),
                 );
             },
         );
@@ -633,6 +667,8 @@ mod layout_tests {
                             None,
                             &mut add_draft,
                             hover.clone(),
+                            None,
+                            &mut String::new(),
                         );
                         // Same call site as `App::content`: advances/finishes
                         // the ghost lifecycle.

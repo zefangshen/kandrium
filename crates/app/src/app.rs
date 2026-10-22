@@ -10,13 +10,14 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use kandrium_core::{
-    AllBoard, ArchiveAllResult, ArchivedCard, Board, BoardWithColumns, Card, CreateCardBody,
+    AllBoard, ArchiveAllResult, ArchivedCard, Board, BoardWithColumns, Card, CardStatus,
+    CreateCardBody, ProjectChoice,
 };
 
 use crate::anim;
 use crate::dnd::{self, ColKey, Drag, DropZone};
 use crate::theme;
-use crate::views::{all_board, archive, board, documents, notes};
+use crate::views::{all_board, archive, board, documents, notes, projects};
 use crate::watcher;
 use crate::widgets::{card_modal, confirm};
 
@@ -49,12 +50,12 @@ enum View {
     Archived,
 }
 
-/// Top-level app section (header row 1). Only Tasks has content today;
-/// Notes and Documents are blank placeholders.
+/// Top-level app section (header row 1).
 #[derive(Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 enum Section {
     #[default]
     Tasks,
+    Projects,
     Notes,
     Documents,
 }
@@ -79,6 +80,13 @@ struct EditSession {
     archived: bool,
     /// Board the card lives on (for the "Move to board" picker).
     home_board_id: String,
+    /// True when the card lives on a project board: the modal then offers the
+    /// area picker instead of the project tag picker.
+    is_project_card: bool,
+    /// Normal boards a project card can be mirrored onto.
+    area_targets: Vec<Board>,
+    /// All projects, for tagging a normal-board card.
+    project_targets: Vec<ProjectChoice>,
 }
 
 /// Persisted UI state.
@@ -98,6 +106,30 @@ struct SavedState {
     docs_open: Vec<String>,
     #[serde(default)]
     docs_active: Option<usize>,
+    /// Projects section: last selected project + expanded folder ids.
+    #[serde(default)]
+    projects_selected: Option<String>,
+    #[serde(default)]
+    projects_expanded: Vec<String>,
+    /// Project ids whose inline document trees are expanded in the project
+    /// tree (persisted).
+    #[serde(default)]
+    projects_docs_expanded: Vec<String>,
+    /// Left tree panel visibility per section (default: expanded).
+    #[serde(default = "default_true")]
+    notes_tree_open: bool,
+    #[serde(default = "default_true")]
+    docs_tree_open: bool,
+    #[serde(default = "default_true")]
+    projects_tree_open: bool,
+    /// Overview Documents section body visibility.
+    #[serde(default = "default_true")]
+    projects_docs_open: bool,
+}
+
+/// Serde default for booleans that must start `true` in older saved sessions.
+fn default_true() -> bool {
+    true
 }
 
 impl Default for SavedState {
@@ -110,6 +142,13 @@ impl Default for SavedState {
             notes_active: None,
             docs_open: Vec::new(),
             docs_active: None,
+            projects_selected: None,
+            projects_expanded: Vec::new(),
+            projects_docs_expanded: Vec::new(),
+            notes_tree_open: true,
+            docs_tree_open: true,
+            projects_tree_open: true,
+            projects_docs_open: true,
         }
     }
 }
@@ -132,6 +171,9 @@ pub struct KandriumApp {
 
     boards: Vec<Board>,
     board: Option<BoardData>,
+    /// Id of the board currently in `board` (drives context switches between
+    /// the Tasks board and a project's embedded board).
+    board_loaded_id: Option<String>,
     status: Option<StatusMsg>,
 
     // Archive view
@@ -140,6 +182,9 @@ pub struct KandriumApp {
 
     // Notes section
     notes_state: notes::NotesState,
+
+    // Projects section
+    projects_state: projects::ProjectsState,
 
     // Documents section
     documents_state: documents::DocumentsState,
@@ -165,7 +210,24 @@ pub struct KandriumApp {
     /// form reopens. Non-empty text only.
     draft_stash: HashMap<String, String>,
 
-    // Dock-icon retry state for bare `cargo run` binaries (no bundle .icns)
+    // Inline add-card form (All board): one bucket at a time.
+    /// Bucket whose inline add-card form is open (None = closed).
+    all_add_status: Option<CardStatus>,
+    /// Live title draft for that form.
+    all_add_draft: Option<String>,
+    /// Board the new card lands on. Session-only; seeded to "Career" each
+    /// launch (falling back to the first visible board).
+    all_add_board: Option<String>,
+    /// Stashed All-board drafts per bucket; restored when the form reopens.
+    all_draft_stash: HashMap<CardStatus, String>,
+
+    /// Card whose title is being edited inline on the board (None = none).
+    edit_card: Option<String>,
+    /// Live text of the inline title editor (only meaningful while
+    /// `edit_card` is set).
+    edit_draft: String,
+
+    // Dock-icon retry state for executables without a bundled .icns
     dock_icon_pending: bool,
     dock_icon_tries: u32,
 }
@@ -195,6 +257,7 @@ impl KandriumApp {
             view: View::Board,
             boards: Vec::new(),
             board: None,
+            board_loaded_id: None,
             status: Some(StatusMsg {
                 msg: "Loading...".to_string(),
                 is_error: false,
@@ -203,6 +266,7 @@ impl KandriumApp {
             archive_state: archive::ArchiveState::default(),
             archived: None,
             notes_state: notes::NotesState::new(),
+            projects_state: projects::ProjectsState::new(),
             documents_state: documents::DocumentsState::new(),
             drag: None,
             zones: Vec::new(),
@@ -213,9 +277,25 @@ impl KandriumApp {
             add_col: None,
             add_draft: None,
             draft_stash: HashMap::new(),
+            all_add_status: None,
+            all_add_draft: None,
+            all_add_board: None,
+            all_draft_stash: HashMap::new(),
+            edit_card: None,
+            edit_draft: String::new(),
             dock_icon_pending: true,
             dock_icon_tries: 0,
         };
+        // Restore the Projects section selection before the first load so the
+        // overview pane comes back populated.
+        let projects_selected = app.saved.projects_selected.clone();
+        let projects_expanded = app.saved.projects_expanded.clone();
+        let projects_docs_expanded = app.saved.projects_docs_expanded.clone();
+        app.projects_state.restore_session(
+            projects_selected,
+            projects_expanded,
+            projects_docs_expanded,
+        );
         // Load once up front. Every other caller (`refresh`, `run`, tab
         // switches, external-sync events) runs only after the user acts, so
         // without this the first frame paints with `board: None` and the app
@@ -229,6 +309,11 @@ impl KandriumApp {
         let docs_open = app.saved.docs_open.clone();
         let docs_active = app.saved.docs_active;
         app.documents_state.open_relative(&docs_open, docs_active);
+        // Restore the per-section tree panel visibility.
+        app.notes_state.tree_open = app.saved.notes_tree_open;
+        app.documents_state.tree_open = app.saved.docs_tree_open;
+        app.projects_state.tree_open = app.saved.projects_tree_open;
+        app.projects_state.docs_open = app.saved.projects_docs_open;
         app
     }
 
@@ -254,6 +339,14 @@ impl KandriumApp {
     /// Load boards + the active board (or the archive list). Shows no
     /// "Loading..." flash — used after mutations and external syncs.
     fn reload_silent(&mut self) {
+        // A board change hides the card whose title is being edited inline.
+        // Save that draft before the old board data is replaced; the cards
+        // themselves still exist in SQLite.
+        let target_board_id = self.displayed_board_id();
+        if self.board_loaded_id.as_deref() != Some(target_board_id.as_str()) {
+            self.finish_active_inline_edit();
+        }
+
         let db = self.db.clone();
         let Ok(db) = db.lock() else {
             self.set_status("Failed to load: database is locked", true);
@@ -267,18 +360,39 @@ impl KandriumApp {
 
         match self.view {
             View::Board => {
-                let id = self.saved.active_board_id.clone();
+                let id = self.displayed_board_id();
+                let project_board = self.saved.section == Section::Projects
+                    && self.projects_state.detail_tab_is_board();
                 let result = if id == kandrium_core::ALL_BOARD_ID {
                     kandrium_core::get_all_board(&db).map(BoardData::All)
                 } else {
-                    kandrium_core::get_board(&db, &id).map(|b| BoardData::Real(Box::new(b)))
+                    match kandrium_core::get_board(&db, &id) {
+                        Ok(b) => Ok(BoardData::Real(Box::new(b))),
+                        // The saved Tasks board vanished: fall back to the
+                        // All board instead of leaving a dead tab active. A
+                        // project board has no fallback — its tab shows the
+                        // load error.
+                        Err(e) if e.0 == "Board not found" && !project_board => {
+                            self.saved.active_board_id = kandrium_core::ALL_BOARD_ID.to_string();
+                            kandrium_core::get_all_board(&db).map(BoardData::All)
+                        }
+                        Err(e) => Err(e),
+                    }
                 };
                 match result {
                     Ok(data) => {
                         self.board = Some(data);
+                        self.board_loaded_id = Some(id);
                         self.clear_status_if_loading();
                     }
                     Err(e) => {
+                        if project_board {
+                            self.board = None;
+                            // Remember the attempt so the mismatch check does
+                            // not re-query every frame; an external change or
+                            // tab switch retries.
+                            self.board_loaded_id = Some(id);
+                        }
                         self.set_status(format!("Failed to load board: {}", e.0), true);
                     }
                 }
@@ -292,6 +406,9 @@ impl KandriumApp {
             },
         }
 
+        // Keep the Projects tree in sync with kanban/external changes too.
+        self.projects_state.reload(&db);
+
         drop(db);
         self.reconcile_editing();
     }
@@ -302,22 +419,31 @@ impl KandriumApp {
         self.reload_silent();
     }
 
+    /// Board the content area renders: the selected project's board while its
+    /// detail Board tab is open, otherwise the saved Tasks board.
+    fn displayed_board_id(&self) -> String {
+        if self.saved.section == Section::Projects
+            && self.projects_state.detail_tab_is_board()
+            && let Some(id) = self.projects_state.selected_board_id()
+        {
+            return id;
+        }
+        self.saved.active_board_id.clone()
+    }
+
     /// Close the card editor when its card disappeared (removed or archived
-    /// externally).
+    /// externally), and drop any inline title edit whose card is gone.
     fn reconcile_editing(&mut self) {
+        // Drop an inline title edit whose card is gone (removed or archived
+        // externally).
+        if let Some(id) = self.edit_card.clone()
+            && self.find_card(&id).is_none()
+        {
+            self.edit_card = None;
+        }
         let Some(editing) = &self.editing else { return };
         let card_id = &editing.state.card_id;
-        let still_there = match &self.board {
-            Some(BoardData::Real(b)) => b
-                .columns
-                .iter()
-                .any(|c| c.cards.iter().any(|card| &card.id == card_id)),
-            Some(BoardData::All(b)) => b
-                .columns
-                .iter()
-                .any(|c| c.cards.iter().any(|card| &card.card.id == card_id)),
-            None => false,
-        };
+        let still_there = self.find_card(card_id).is_some();
         if !still_there {
             self.editing = None;
             self.set_status("This card was removed or archived externally", false);
@@ -356,8 +482,9 @@ impl KandriumApp {
             BoardData::Real(b) => b.columns.iter().find_map(|col| {
                 col.cards
                     .iter()
+                    .chain(col.mirrored.iter())
                     .find(|c| c.id == card_id)
-                    .map(|c| (c.clone(), b.id.clone()))
+                    .map(|c| (c.clone(), c.board_id.clone()))
             }),
             BoardData::All(b) => b.columns.iter().find_map(|col| {
                 col.cards
@@ -369,27 +496,107 @@ impl KandriumApp {
     }
 
     fn open_editor(&mut self, card_id: &str) {
-        if let Some((card, board_id)) = self.find_card(card_id) {
+        if let Some((card, home_board_id)) = self.find_card(card_id) {
+            // Cards on project boards (including their mirrors on area boards)
+            // are owned by a project; cards on normal boards can be tagged.
+            let is_project_card = !self.boards.iter().any(|b| b.id == home_board_id);
             self.editing = Some(EditSession {
                 state: card_modal::CardEditState::from_card(&card),
                 archived: false,
-                home_board_id: board_id,
+                home_board_id,
+                is_project_card,
+                area_targets: self.boards.clone(),
+                project_targets: self.projects_state.project_choices(),
             });
+        }
+    }
+
+    /// Open the inline title editor on a card, seeding the draft with the
+    /// current title.
+    fn begin_inline_edit(&mut self, card_id: &str) {
+        if let Some((card, _)) = self.find_card(card_id) {
+            self.edit_card = Some(card_id.to_string());
+            self.edit_draft = card.title;
+        }
+    }
+
+    /// Commit the inline title editor: save the trimmed draft, or warn on an
+    /// empty title (the editor closes either way).
+    fn commit_inline_edit(&mut self, card_id: &str) {
+        if self.finish_inline_edit(card_id) {
+            self.reload_silent();
+        }
+    }
+
+    /// Write the active inline title edit (if any) without reloading the board.
+    /// Returns true when `card_id` was the active editor.
+    fn finish_inline_edit(&mut self, card_id: &str) -> bool {
+        if self.edit_card.as_deref() != Some(card_id) {
+            return false;
+        }
+        let title = self.edit_draft.trim().to_string();
+        self.edit_card = None;
+        if title.is_empty() {
+            self.set_status("Card title can't be empty", true);
+            return true;
+        }
+        let db = self.db.clone();
+        let outcome = match db.lock() {
+            Ok(db) => kandrium_core::rename_card(&db, card_id, &title)
+                .map(|_| ())
+                .map_err(|e| format!("Save failed: {}", e.0)),
+            Err(_) => Err("Save failed: database is locked".to_string()),
+        };
+        if let Err(msg) = outcome {
+            self.set_status(msg, true);
+        }
+        true
+    }
+
+    /// Finish an active inline edit before a context switch that will reload
+    /// the board itself.
+    fn finish_active_inline_edit(&mut self) {
+        if let Some(card_id) = self.edit_card.clone() {
+            self.finish_inline_edit(&card_id);
+        }
+    }
+
+    /// Finish an active inline edit and reload the currently displayed board.
+    fn commit_active_inline_edit(&mut self) {
+        if self.edit_card.is_some() {
+            self.finish_active_inline_edit();
+            self.reload_silent();
+        }
+    }
+
+    /// Cancel the inline title editor (Esc), leaving the title unchanged.
+    fn cancel_inline_edit(&mut self, card_id: &str) {
+        if self.edit_card.as_deref() == Some(card_id) {
+            self.edit_card = None;
         }
     }
 
     // -- mutations ----------------------------------------------------------
 
-    fn run(&mut self, err_prefix: &str, f: impl FnOnce(&Connection) -> kandrium_core::Result<()>) {
+    fn run(
+        &mut self,
+        err_prefix: &str,
+        f: impl FnOnce(&Connection) -> kandrium_core::Result<()>,
+    ) -> bool {
         let db = self.db.clone();
         let outcome = match db.lock() {
             Ok(db) => f(&db).map_err(|e| format!("{}: {}", err_prefix, e.0)),
             Err(_) => Err(format!("{}: database is locked", err_prefix)),
         };
-        if let Err(msg) = outcome {
-            self.set_status(msg, true);
-        }
+        let ok = match outcome {
+            Ok(()) => true,
+            Err(msg) => {
+                self.set_status(msg, true);
+                false
+            }
+        };
         self.reload_silent();
+        ok
     }
 
     fn run_confirmed(&mut self, action: &confirm::ConfirmAction) {
@@ -436,6 +643,32 @@ impl KandriumApp {
                     }
                     Err(e) => self.set_status(format!("Delete failed: {}", e.0), true),
                 }
+            }
+            confirm::ConfirmAction::DeleteProject(id) => {
+                let root = self.projects_state.root().to_path_buf();
+                let db = self.db.clone();
+                let result = match db.lock() {
+                    Ok(db) => kandrium_core::projects::delete_project(&db, &root, &id),
+                    Err(_) => Err(kandrium_core::KandriumError::new("database is locked")),
+                };
+                match result {
+                    Ok(()) => self.set_status("Deleted", false),
+                    Err(e) => self.set_status(format!("Delete failed: {}", e.0), true),
+                }
+                self.reload_silent();
+            }
+            confirm::ConfirmAction::DeleteProjectFolder(id) => {
+                let root = self.projects_state.root().to_path_buf();
+                let db = self.db.clone();
+                let result = match db.lock() {
+                    Ok(db) => kandrium_core::projects::delete_folder(&db, &root, &id),
+                    Err(_) => Err(kandrium_core::KandriumError::new("database is locked")),
+                };
+                match result {
+                    Ok(()) => self.set_status("Deleted", false),
+                    Err(e) => self.set_status(format!("Delete failed: {}", e.0), true),
+                }
+                self.reload_silent();
             }
         }
     }
@@ -518,11 +751,20 @@ impl KandriumApp {
 
             // Row 1: top-level sections.
             ui.horizontal(|ui| {
-                const SECTIONS: [Section; 3] = [Section::Tasks, Section::Notes, Section::Documents];
+                const SECTIONS: [Section; 4] = [
+                    Section::Tasks,
+                    Section::Projects,
+                    Section::Notes,
+                    Section::Documents,
+                ];
                 let segments = [
                     theme::Segment {
                         label: "Tasks",
                         icon: "square-kanban",
+                    },
+                    theme::Segment {
+                        label: "Projects",
+                        icon: "briefcase",
                     },
                     theme::Segment {
                         label: "Notes",
@@ -559,12 +801,22 @@ impl KandriumApp {
                 ui.add_space(5.0);
                 ui.horizontal(|ui| {
                     // Tabs: virtual All board first, then real boards.
-                    let tabs: Vec<(String, String)> = std::iter::once((
+                    let mut tabs: Vec<(String, String)> = std::iter::once((
                         kandrium_core::ALL_BOARD_ID.to_string(),
                         "All".to_string(),
                     ))
                     .chain(self.boards.iter().map(|b| (b.id.clone(), b.title.clone())))
                     .collect();
+
+                    // A project-owned board is not in `self.boards` (project
+                    // boards are hidden from the Tasks tab list); keep the
+                    // currently open one visible so its tab stays active.
+                    if self.view == View::Board
+                        && !tabs.iter().any(|(id, _)| *id == self.saved.active_board_id)
+                        && let Some(BoardData::Real(b)) = &self.board
+                    {
+                        tabs.push((b.id.clone(), b.title.clone()));
+                    }
 
                     for (id, title) in &tabs {
                         let active = self.view == View::Board && *id == self.saved.active_board_id;
@@ -593,6 +845,7 @@ impl KandriumApp {
                     )
                     .clicked()
                     {
+                        self.finish_active_inline_edit();
                         self.view = View::Archived;
                         self.clear_inline_editors();
                         self.drag = None;
@@ -610,12 +863,19 @@ impl KandriumApp {
         if self.saved.section == section {
             return;
         }
+        self.finish_active_inline_edit();
         // Leaving Notes/Documents: flush dirty tabs so nothing is lost.
         if self.saved.section == Section::Notes {
             self.notes_state.flush_all();
         }
         if self.saved.section == Section::Documents {
             self.documents_state.flush_all();
+        }
+        if self.saved.section == Section::Projects {
+            let db = self.db.clone();
+            if let Ok(db) = db.lock() {
+                self.projects_state.flush_all(&db);
+            }
         }
         self.saved.section = section;
         self.clear_inline_editors();
@@ -626,12 +886,16 @@ impl KandriumApp {
         self.editing = None;
         self.confirm = None;
         anim::CardRig::clear_drag(ctx);
+        // The displayed board depends on the section (project Board tab vs
+        // the Tasks board), so reload it for the new context.
+        self.reload_silent();
     }
 
     fn switch_board(&mut self, id: String, ctx: &egui::Context) {
         if self.view == View::Board && self.saved.active_board_id == id {
             return;
         }
+        self.finish_active_inline_edit();
         self.saved.active_board_id = id;
         self.view = View::Board;
         self.clear_inline_editors();
@@ -650,6 +914,14 @@ impl KandriumApp {
                 self.draft_stash.insert(col_id, trimmed);
             }
         }
+        // Same for the All board's inline form.
+        if let (Some(status), Some(draft)) = (self.all_add_status.take(), self.all_add_draft.take())
+        {
+            let trimmed = draft.trim().to_string();
+            if !trimmed.is_empty() {
+                self.all_draft_stash.insert(status, trimmed);
+            }
+        }
     }
 
     // -- content ------------------------------------------------------------
@@ -657,6 +929,82 @@ impl KandriumApp {
     fn content(&mut self, ui: &mut egui::Ui) {
         // Notes and Documents live outside the kanban UI entirely.
         match self.saved.section {
+            Section::Projects => {
+                let dark = self.saved.dark_mode;
+                let db = self.db.clone();
+                let actions = projects::show_tree(ui, &mut self.projects_state, &db);
+                if let Some(kind) = actions.request_delete {
+                    let (title, message) = match &kind {
+                        projects::DeleteKind::Project { name, .. } => (
+                            "Delete project",
+                            format!(
+                                "Permanently delete \"{name}\", its tasks and its documents? \
+                                 This cannot be undone."
+                            ),
+                        ),
+                        projects::DeleteKind::Folder { name, .. } => (
+                            "Delete folder",
+                            format!(
+                                "Permanently delete \"{name}\" and every project inside it — \
+                                 including their boards, tasks and documents? \
+                                 This cannot be undone."
+                            ),
+                        ),
+                    };
+                    self.confirm = Some(confirm::ConfirmRequest {
+                        title: title.to_string(),
+                        message,
+                        confirm_label: "Delete".to_string(),
+                        action: match kind {
+                            projects::DeleteKind::Project { id, .. } => {
+                                confirm::ConfirmAction::DeleteProject(id)
+                            }
+                            projects::DeleteKind::Folder { id, .. } => {
+                                confirm::ConfirmAction::DeleteProjectFolder(id)
+                            }
+                        },
+                    });
+                }
+                if let Some(board_id) = actions.open_board {
+                    self.switch_section(Section::Tasks, ui.ctx());
+                    self.switch_board(board_id, ui.ctx());
+                    return;
+                }
+
+                // Reserve a small gutter on the detail's left so it does not
+                // sit flush against the tree panel (the page already insets
+                // it by 12 px on the right). No fill: the pasteboard shows
+                // through as the gap.
+                egui::Frame::new()
+                    .inner_margin(egui::Margin {
+                        left: projects::PANE_GAP as i8,
+                        right: 0,
+                        top: 0,
+                        bottom: 0,
+                    })
+                    .show(ui, |ui| {
+                        let kind = projects::detail_tab_strip(ui, &mut self.projects_state, dark);
+                        if kind == Some(projects::DetailKind::Board) {
+                            // `content_board` bails on the archive view; the
+                            // project board always draws the board.
+                            self.view = View::Board;
+                            // The strip can switch tabs mid-frame (e.g. the
+                            // overview's Open board pill), so compare against
+                            // the board actually held in memory.
+                            let id = self.displayed_board_id();
+                            if self.board_loaded_id.as_deref() != Some(id.as_str()) {
+                                self.reload_silent();
+                            }
+                            self.content_board(ui);
+                        } else {
+                            // Leaving the project board hides the inline title
+                            // editor; save it rather than dropping the draft.
+                            self.commit_active_inline_edit();
+                            projects::detail_body(ui, &mut self.projects_state, &db, dark);
+                        }
+                    });
+                return;
+            }
             Section::Notes => {
                 let dark = self.saved.dark_mode;
                 let actions = notes::show(ui, &mut self.notes_state, dark);
@@ -732,6 +1080,11 @@ impl KandriumApp {
             return;
         }
 
+        self.content_board(ui);
+    }
+
+    /// Board body shared by the Tasks section and the project Board tab.
+    fn content_board(&mut self, ui: &mut egui::Ui) {
         let drag = self.drag.clone();
 
         // Drop the settle placeholder once the release flight has finished;
@@ -785,6 +1138,7 @@ impl KandriumApp {
             }
             Some(BoardData::Real(data)) => {
                 let add_col = self.add_col.clone();
+                let edit_card = self.edit_card.clone();
                 let actions = {
                     let add_draft = &mut self.add_draft;
                     board::show(
@@ -795,12 +1149,27 @@ impl KandriumApp {
                         add_col.as_deref(),
                         add_draft,
                         hover,
+                        edit_card.as_deref(),
+                        &mut self.edit_draft,
                     )
                 };
                 self.handle_board_actions(actions);
             }
             Some(BoardData::All(data)) => {
-                let actions = all_board::show(ui, data, view_drag, &mut self.zones, hover);
+                let edit_card = self.edit_card.clone();
+                let actions = all_board::show(
+                    ui,
+                    data,
+                    &self.boards,
+                    view_drag,
+                    &mut self.zones,
+                    self.all_add_status,
+                    self.all_add_board.as_deref(),
+                    &mut self.all_add_draft,
+                    hover,
+                    edit_card.as_deref(),
+                    &mut self.edit_draft,
+                );
                 self.handle_all_board_actions(actions);
             }
         }
@@ -855,6 +1224,15 @@ impl KandriumApp {
     fn handle_board_actions(&mut self, actions: board::BoardActions) {
         if let Some(card_id) = actions.open_card {
             self.open_editor(&card_id);
+        }
+        if let Some(card_id) = actions.edit_commit {
+            self.commit_inline_edit(&card_id);
+        }
+        if let Some(card_id) = actions.edit_cancel {
+            self.cancel_inline_edit(&card_id);
+        }
+        if let Some(card_id) = actions.edit_card {
+            self.begin_inline_edit(&card_id);
         }
         if let Some((card_id, to_col, before)) = actions.card_drop {
             self.drag = None;
@@ -912,10 +1290,7 @@ impl KandriumApp {
             self.add_draft = Some(self.draft_stash.remove(&col_id).unwrap_or_default());
         }
         if let Some((col_id, title)) = actions.create_card {
-            self.add_col = None;
-            self.add_draft = None;
-            self.draft_stash.remove(&col_id);
-            self.run("Add card failed", |db| {
+            let created = self.run("Add card failed", |db| {
                 kandrium_core::create_card(
                     db,
                     &col_id,
@@ -928,6 +1303,11 @@ impl KandriumApp {
                 )
                 .map(|_| ())
             });
+            if created {
+                self.add_col = None;
+                self.add_draft = None;
+                self.draft_stash.remove(&col_id);
+            }
         }
         if let Some(col_id) = actions.cancel_add
             && self.add_col.as_deref() == Some(col_id.as_str())
@@ -946,6 +1326,15 @@ impl KandriumApp {
     fn handle_all_board_actions(&mut self, actions: all_board::AllBoardActions) {
         if let Some(card_id) = actions.open_card {
             self.open_editor(&card_id);
+        }
+        if let Some(card_id) = actions.edit_commit {
+            self.commit_inline_edit(&card_id);
+        }
+        if let Some(card_id) = actions.edit_cancel {
+            self.cancel_inline_edit(&card_id);
+        }
+        if let Some(card_id) = actions.edit_card {
+            self.begin_inline_edit(&card_id);
         }
         if let Some((card_id, to_status, before)) = actions.card_drop {
             self.drag = None;
@@ -975,6 +1364,75 @@ impl KandriumApp {
                 confirm_label: "Delete".to_string(),
                 action: confirm::ConfirmAction::DeleteCard(card_id),
             });
+        }
+        if let Some(status) = actions.open_add_form {
+            self.open_all_add_form(status);
+        }
+        if let Some(board_id) = actions.choose_board {
+            self.all_add_board = Some(board_id);
+        }
+        if let Some((status, board_id, title)) = actions.create_card {
+            let created = self.run("Add card failed", |db| {
+                kandrium_core::create_card_in_status(
+                    db,
+                    &board_id,
+                    status,
+                    &CreateCardBody {
+                        title,
+                        description: Some(String::new()),
+                        due_date: None,
+                        labels: None,
+                    },
+                )
+                .map(|_| ())
+            });
+            if created {
+                self.all_add_status = None;
+                self.all_add_draft = None;
+                self.all_draft_stash.remove(&status);
+            }
+        }
+        if let Some(status) = actions.cancel_add
+            && self.all_add_status == Some(status)
+        {
+            // Stash the draft so reopening the form restores it.
+            if let Some(draft) = self.all_add_draft.take() {
+                let trimmed = draft.trim().to_string();
+                if !trimmed.is_empty() {
+                    self.all_draft_stash.insert(status, trimmed);
+                }
+            }
+            self.all_add_status = None;
+        }
+    }
+
+    /// Open the All board's inline add-card form for `status`, stashing any
+    /// draft from another bucket and seeding the target board (Career by
+    /// default, else the first visible board).
+    fn open_all_add_form(&mut self, status: CardStatus) {
+        if self.all_add_status == Some(status) {
+            return;
+        }
+        if let (Some(prev), Some(draft)) = (self.all_add_status.take(), self.all_add_draft.take()) {
+            let trimmed = draft.trim().to_string();
+            if !trimmed.is_empty() {
+                self.all_draft_stash.insert(prev, trimmed);
+            }
+        }
+        self.all_add_status = Some(status);
+        self.all_add_draft = Some(self.all_draft_stash.remove(&status).unwrap_or_default());
+
+        let still_valid = self
+            .all_add_board
+            .as_ref()
+            .is_some_and(|id| self.boards.iter().any(|b| &b.id == id));
+        if !still_valid {
+            self.all_add_board = self
+                .boards
+                .iter()
+                .find(|b| b.title.eq_ignore_ascii_case("career"))
+                .or_else(|| self.boards.first())
+                .map(|b| b.id.clone());
         }
     }
 
@@ -1108,15 +1566,44 @@ impl KandriumApp {
                 .cloned()
                 .collect();
 
-            match card_modal::show(&ctx, &mut editing.state, archived, &move_targets) {
+            match card_modal::show(
+                &ctx,
+                &mut editing.state,
+                archived,
+                &move_targets,
+                &editing.area_targets,
+                &editing.project_targets,
+                editing.is_project_card,
+            ) {
                 card_modal::CardModalOutcome::None => {}
                 card_modal::CardModalOutcome::Closed => self.editing = None,
                 card_modal::CardModalOutcome::Action(actions) => {
                     if actions.save {
                         let body = editing.state.to_body();
+                        let project_id = editing.state.project_id.clone();
+                        let area_board_id = if editing.state.area_enabled {
+                            editing.state.area_board_id.clone()
+                        } else {
+                            None
+                        };
+                        let is_project_card = editing.is_project_card;
                         self.editing = None;
                         self.run("Save failed", |db| {
-                            kandrium_core::update_card(db, &card_id, &body).map(|_| ())
+                            kandrium_core::update_card(db, &card_id, &body)?;
+                            if is_project_card {
+                                kandrium_core::set_card_area(
+                                    db,
+                                    &card_id,
+                                    area_board_id.as_deref(),
+                                )?;
+                            } else {
+                                kandrium_core::set_card_project(
+                                    db,
+                                    &card_id,
+                                    project_id.as_deref(),
+                                )?;
+                            }
+                            Ok(())
                         });
                     }
                     if actions.toggle_archive {
@@ -1159,9 +1646,10 @@ impl KandriumApp {
 impl eframe::App for KandriumApp {
     /// Drain watcher events and expire transient banners before painting.
     fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Bare `cargo run` binaries carry no bundle .icns; apply the dock
-        // icon from the first frame on. egui repaints on demand, so request
-        // repaints until the icon is confirmed applied (~2s budget).
+        // Bare `cargo run` binaries and the minimal dev `.app` carry no
+        // bundle .icns; apply the dock icon from the first frame on. egui
+        // repaints on demand, so request repaints until the icon is
+        // confirmed applied (~2s budget).
         if self.dock_icon_pending {
             _ctx.request_repaint();
             self.dock_icon_tries += 1;
@@ -1217,6 +1705,14 @@ impl eframe::App for KandriumApp {
         }
         if self.saved.section == Section::Documents && self.documents_state.tick_autosave() {
             _ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        if self.saved.section == Section::Projects {
+            let db = self.db.clone();
+            if let Ok(db) = db.lock()
+                && self.projects_state.tick_autosave(&db)
+            {
+                _ctx.request_repaint_after(Duration::from_millis(100));
+            }
         }
     }
 
@@ -1274,6 +1770,18 @@ impl eframe::App for KandriumApp {
         self.documents_state.flush_all();
         self.saved.docs_open = self.documents_state.rel_paths();
         self.saved.docs_active = self.documents_state.active_index();
+        // Flush any pending project description and remember the tree session.
+        let db = self.db.clone();
+        if let Ok(db) = db.lock() {
+            self.projects_state.flush_all(&db);
+        }
+        self.saved.projects_selected = self.projects_state.selected_id();
+        self.saved.projects_expanded = self.projects_state.expanded_ids();
+        self.saved.projects_docs_expanded = self.projects_state.docs_expanded_ids();
+        self.saved.notes_tree_open = self.notes_state.tree_open;
+        self.saved.docs_tree_open = self.documents_state.tree_open;
+        self.saved.projects_tree_open = self.projects_state.tree_open;
+        self.saved.projects_docs_open = self.projects_state.docs_open;
         eframe::set_value(storage, eframe::APP_KEY, &self.saved);
     }
 }
@@ -1297,8 +1805,8 @@ fn open_db_or_die() -> Arc<Mutex<Connection>> {
         let _ = std::fs::create_dir_all(dir);
     }
     match kandrium_core::open_db(&path) {
-        Ok(db) => {
-            if let Err(e) = kandrium_core::bootstrap(&db) {
+        Ok(mut db) => {
+            if let Err(e) = kandrium_core::bootstrap(&mut db) {
                 eprintln!("[kandrium-app] bootstrap failed: {}", e.0);
             }
             Arc::new(Mutex::new(db))

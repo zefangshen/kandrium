@@ -4,7 +4,44 @@ pub mod card;
 pub mod card_modal;
 pub mod column;
 pub mod confirm;
+pub mod markdown;
 pub mod tabs;
+
+/// Width of the collapsed left-panel ("sidebar") rail. Panel collapse helpers
+/// below keep the three tree pages (Projects, Notes, Documents) consistent.
+pub const RAIL_W: f32 = 30.0;
+
+/// Chevron for a left panel header that collapses the tree. Returns true when
+/// clicked. Call it inside a right-to-left layout so it hugs the panel edge.
+pub fn collapse_button(ui: &mut egui::Ui) -> bool {
+    crate::theme::icon_button(ui, "chevron-left", 26.0, false, "Collapse sidebar").clicked()
+}
+
+/// Expand affordance for the collapsed rail. The whole bar is a click target
+/// (only the chevron would be a 26 px sliver), with the chevron painted on
+/// top. Returns true when the rail was clicked.
+pub fn expand_button(ui: &mut egui::Ui) -> bool {
+    let t = crate::theme::Tokens::get(ui.ctx());
+    // Registered before the chevron, so the button keeps priority on its own
+    // pixels while every other pixel of the rail expands too.
+    let rail = ui.max_rect();
+    let resp = ui
+        .interact(rail, ui.id().with("rail-expand"), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Expand sidebar");
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rail, egui::CornerRadius::ZERO, t.hover);
+    }
+
+    let mut clicked = resp.clicked();
+    ui.add_space(6.0);
+    ui.vertical_centered(|ui| {
+        clicked |=
+            crate::theme::icon_button(ui, "chevron-right", 26.0, false, "Expand sidebar").clicked();
+    });
+    clicked
+}
 
 /// Right inset for Kanban-column content that must NOT run under the
 /// scrollbar. Column frames use a 1px right inner margin so the card-list

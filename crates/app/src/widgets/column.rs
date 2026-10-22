@@ -17,6 +17,12 @@ use crate::widgets::card::{CardMenuAction, card_chip, card_context_menu};
 pub struct ColumnActions {
     /// Card id that was clicked (open editor).
     pub open_card: Option<String>,
+    /// Card id whose hover pencil was pressed (open inline title editor).
+    pub edit_card: Option<String>,
+    /// Card id whose inline title editor submitted (Enter/blur).
+    pub edit_commit: Option<String>,
+    /// Card id whose inline title editor was canceled (Esc).
+    pub edit_cancel: Option<String>,
     /// Card id chosen from the right-click "Archive" menu item.
     pub archive_card: Option<String>,
     /// Card id chosen from the right-click "Delete" menu item.
@@ -41,6 +47,9 @@ impl Default for ColumnActions {
     fn default() -> Self {
         ColumnActions {
             open_card: None,
+            edit_card: None,
+            edit_commit: None,
+            edit_cancel: None,
             archive_card: None,
             delete_card: None,
             card_rects: Vec::new(),
@@ -69,6 +78,9 @@ impl Default for ColumnActions {
 /// * `gap_idx` — insertion index of the open drag placeholder, if the
 ///   pointer is hovering this column.
 /// * `gap_height` — animated height of the placeholder slot.
+/// * `edit_card` — card whose title is being edited inline, if it lives here.
+/// * `edit_draft` — live text of that inline title editor (mutated in place).
+#[allow(clippy::too_many_arguments)]
 pub fn show_column(
     ui: &mut Ui,
     column: &Column,
@@ -77,6 +89,8 @@ pub fn show_column(
     max_col_height: f32,
     gap_idx: Option<usize>,
     gap_height: f32,
+    edit_card: Option<&str>,
+    edit_draft: &mut String,
 ) -> ColumnActions {
     let mut actions = ColumnActions::default();
     let t = Tokens::get(ui.ctx());
@@ -115,9 +129,11 @@ pub fn show_column(
                         ui.add_space(2.0);
                         ui.add(
                             Label::new(
-                                egui::RichText::new(column.cards.len().to_string())
-                                    .text_style(theme::small_strong())
-                                    .color(t.text_faint),
+                                egui::RichText::new(
+                                    (column.cards.len() + column.mirrored.len()).to_string(),
+                                )
+                                .text_style(theme::small_strong())
+                                .color(t.text_faint),
                             )
                             .wrap_mode(TextWrapMode::Extend),
                         );
@@ -146,7 +162,7 @@ pub fn show_column(
             // the baseline; 108px per card covers all common variants at
             // the app's 1.2x font scale while still triggering the scroll
             // threshold sensibly.
-            let estimated = column.cards.len() as f32 * 108.0;
+            let estimated = (column.cards.len() + column.mirrored.len()) as f32 * 108.0;
             if estimated <= max_body {
                 // Direct layout — cards grow/shrink column naturally. Inset
                 // so the cards' right edge matches the classic 8px margin
@@ -160,12 +176,32 @@ pub fn show_column(
                         if gap_idx == Some(rendered) {
                             anim::gap_slot(ui, gap_height);
                         }
-                        let response =
-                            card_chip(ui, card, None, anim::stagger_order(gap_idx, rendered));
-                        if response.clicked() {
+                        let editing = edit_card == Some(card.id.as_str());
+                        let chip = card_chip(
+                            ui,
+                            card,
+                            None,
+                            anim::stagger_order(gap_idx, rendered),
+                            if editing {
+                                Some(&mut *edit_draft)
+                            } else {
+                                None
+                            },
+                            true,
+                        );
+                        if chip.response.clicked() {
                             actions.open_card = Some(card.id.clone());
                         }
-                        match card_context_menu(&response) {
+                        if chip.edit_clicked {
+                            actions.edit_card = Some(card.id.clone());
+                        }
+                        if chip.edit_commit {
+                            actions.edit_commit = Some(card.id.clone());
+                        }
+                        if chip.edit_cancel {
+                            actions.edit_cancel = Some(card.id.clone());
+                        }
+                        match card_context_menu(&chip.response) {
                             Some(CardMenuAction::Archive) => {
                                 actions.archive_card = Some(card.id.clone());
                             }
@@ -174,12 +210,13 @@ pub fn show_column(
                             }
                             None => {}
                         }
-                        card_rects.push((card.id.clone(), response.rect));
+                        card_rects.push((card.id.clone(), chip.response.rect));
                         rendered += 1;
                     }
                     if gap_idx == Some(rendered) {
                         anim::gap_slot(ui, gap_height);
                     }
+                    mirrored_cards(ui, column, edit_card, edit_draft, &mut actions);
                 });
             } else {
                 egui::ScrollArea::vertical()
@@ -207,12 +244,32 @@ pub fn show_column(
                             if gap_idx == Some(rendered) {
                                 anim::gap_slot(ui, gap_height);
                             }
-                            let response =
-                                card_chip(ui, card, None, anim::stagger_order(gap_idx, rendered));
-                            if response.clicked() {
+                            let editing = edit_card == Some(card.id.as_str());
+                            let chip = card_chip(
+                                ui,
+                                card,
+                                None,
+                                anim::stagger_order(gap_idx, rendered),
+                                if editing {
+                                    Some(&mut *edit_draft)
+                                } else {
+                                    None
+                                },
+                                true,
+                            );
+                            if chip.response.clicked() {
                                 actions.open_card = Some(card.id.clone());
                             }
-                            match card_context_menu(&response) {
+                            if chip.edit_clicked {
+                                actions.edit_card = Some(card.id.clone());
+                            }
+                            if chip.edit_commit {
+                                actions.edit_commit = Some(card.id.clone());
+                            }
+                            if chip.edit_cancel {
+                                actions.edit_cancel = Some(card.id.clone());
+                            }
+                            match card_context_menu(&chip.response) {
                                 Some(CardMenuAction::Archive) => {
                                     actions.archive_card = Some(card.id.clone());
                                 }
@@ -221,12 +278,13 @@ pub fn show_column(
                                 }
                                 None => {}
                             }
-                            card_rects.push((card.id.clone(), response.rect));
+                            card_rects.push((card.id.clone(), chip.response.rect));
                             rendered += 1;
                         }
                         if gap_idx == Some(rendered) {
                             anim::gap_slot(ui, gap_height);
                         }
+                        mirrored_cards(ui, column, edit_card, edit_draft, &mut actions);
                     });
             }
             let body_bottom = ui.cursor().top();
@@ -313,6 +371,66 @@ pub fn show_column(
 
     let _ = frame_response;
     actions
+}
+
+/// Render project cards filed to this area board after the column's own
+/// cards. Mirrored cards can be opened, renamed inline and archived, but they
+/// are not drag sources and never become drop anchors: their position is
+/// owned by their project board.
+fn mirrored_cards(
+    ui: &mut Ui,
+    column: &Column,
+    edit_card: Option<&str>,
+    edit_draft: &mut String,
+    actions: &mut ColumnActions,
+) {
+    if column.mirrored.is_empty() {
+        return;
+    }
+    let t = Tokens::get(ui.ctx());
+    ui.add_space(4.0);
+    let (rule, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rule, egui::CornerRadius::ZERO, t.divider);
+    ui.add_space(4.0);
+
+    for card in &column.mirrored {
+        let editing = edit_card == Some(card.id.as_str());
+        let chip = card_chip(
+            ui,
+            card,
+            None,
+            0,
+            if editing {
+                Some(&mut *edit_draft)
+            } else {
+                None
+            },
+            false,
+        );
+        if chip.response.clicked() {
+            actions.open_card = Some(card.id.clone());
+        }
+        if chip.edit_clicked {
+            actions.edit_card = Some(card.id.clone());
+        }
+        if chip.edit_commit {
+            actions.edit_commit = Some(card.id.clone());
+        }
+        if chip.edit_cancel {
+            actions.edit_cancel = Some(card.id.clone());
+        }
+        match card_context_menu(&chip.response) {
+            Some(CardMenuAction::Archive) => {
+                actions.archive_card = Some(card.id.clone());
+            }
+            Some(CardMenuAction::Delete) => {
+                actions.delete_card = Some(card.id.clone());
+            }
+            None => {}
+        }
+    }
 }
 
 fn add_form_height(open: bool) -> f32 {

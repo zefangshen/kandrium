@@ -60,8 +60,8 @@ pub fn import_old_db(old_path: &Path, new_path: &Path) -> Result<ImportCounts> {
             }
         }
 
-        let new = open_db(new_path)?;
-        run_schema(&new)?;
+        let mut new = open_db(new_path)?;
+        run_schema(&mut new)?;
         if has_boards(&new)? {
             return Err(KandriumError(
                 "Target database already contains boards; refusing to import".to_string(),

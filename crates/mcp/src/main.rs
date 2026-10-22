@@ -1,6 +1,9 @@
 //! Kandrium MCP server — port of `src/mcp/server.ts` onto the official Rust
-//! MCP SDK (rmcp). Same 17 tools, same names/descriptions/schemas, same
-//! result shapes (pretty JSON text; tool-level `isError` + message on failure).
+//! MCP SDK (rmcp). Exposes a curated 13-tool subset: names, descriptions,
+//! schemas, and result shapes match the legacy tools for everything exposed
+//! (pretty JSON text; tool-level `isError` + message on failure). Column
+//! create/rename/delete/move are intentionally app-only; only
+//! `archive_all_cards` remains as a column mutation.
 //!
 //! DB path resolution matches the core crate: `KANDRIUM_DB` env override, else
 //! `<data_dir>/kandrium/kandrium.db`. Logging goes to stderr only — stdout is
@@ -24,40 +27,6 @@ use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 struct BoardIdInput {
     /// Board id
     board_id: String,
-}
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-struct CreateColumnInput {
-    /// Board id
-    board_id: String,
-    /// Column title
-    title: String,
-}
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-struct ColumnIdInput {
-    /// Column id
-    id: String,
-}
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-struct RenameColumnInput {
-    /// Column id
-    id: String,
-    /// New column title
-    title: String,
-}
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-struct MoveColumnInput {
-    /// Column id to move
-    id: String,
-    /// Place the column before this column id, null/omit for end
-    before_column_id: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -228,43 +197,6 @@ impl KandriumServer {
 
     // -- Columns ------------------------------------------------------------
 
-    #[tool(description = "Create a new column (list) on a board, appended at the end")]
-    fn create_column(
-        &self,
-        Parameters(CreateColumnInput { board_id, title }): Parameters<CreateColumnInput>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.run(|db| core::create_column(db, &board_id, &title))
-    }
-
-    #[tool(description = "Rename a column")]
-    fn rename_column(
-        &self,
-        Parameters(RenameColumnInput { id, title }): Parameters<RenameColumnInput>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.run(|db| core::rename_column(db, &id, &title))
-    }
-
-    #[tool(description = "Delete a column and all its cards (permanent)")]
-    fn delete_column(
-        &self,
-        Parameters(ColumnIdInput { id }): Parameters<ColumnIdInput>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.run(|db| core::delete_column(db, &id))
-    }
-
-    #[tool(
-        description = "Move/reorder a column within its board; place it before beforeColumnId, or at the end if omitted"
-    )]
-    fn move_column(
-        &self,
-        Parameters(MoveColumnInput {
-            id,
-            before_column_id,
-        }): Parameters<MoveColumnInput>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.run(|db| core::move_column(db, &id, before_column_id.as_deref()))
-    }
-
     #[tool(
         description = "Archive every non-archived card in a column; returns how many were archived"
     )]
@@ -423,8 +355,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             db_path.display()
         );
     }
-    let db = core::open_db(&db_path)?;
-    core::bootstrap(&db)?;
+    let mut db = core::open_db(&db_path)?;
+    core::bootstrap(&mut db)?;
     eprintln!("[kandrium-mcp] DB: {}", db_path.display());
 
     let service = KandriumServer::new(db)
@@ -432,4 +364,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_router_exposes_the_curated_set() {
+        let server = KandriumServer::new(rusqlite::Connection::open_in_memory().unwrap());
+        let mut names: Vec<String> = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        names.sort();
+
+        let expected = [
+            "archive_all_cards",
+            "archive_card",
+            "create_card",
+            "delete_card",
+            "get_all_board",
+            "get_board",
+            "list_archived_cards",
+            "list_boards",
+            "move_all_card",
+            "move_card",
+            "move_card_to_board",
+            "restore_card",
+            "update_card",
+        ];
+        let expected: Vec<String> = expected.iter().map(|name| name.to_string()).collect();
+        assert_eq!(names, expected);
+    }
 }

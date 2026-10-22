@@ -3,7 +3,7 @@
 Kandrium is a local-first Kanban desktop app with a companion [Model Context Protocol](https://modelcontextprotocol.io/) server. Boards, columns, and cards live in a single SQLite database that the egui desktop app and any MCP client (an AI assistant, scripts) can read and write at the same time.
 
 - **Native desktop UI** built with [eframe/egui](https://github.com/emilk/egui) — no Electron, no web runtime
-- **MCP server over stdio** exposing 17 tools for board/column/card operations
+- **MCP server over stdio** exposing 13 tools for board/column-archive/card operations
 - **Multi-process sync** — changes made through MCP appear in the running app automatically
 - **Virtual "All" board** that aggregates every card into To Do / In Progress / Done with its own ordering
 - **Local SQLite storage** (WAL mode), no account and no network
@@ -87,7 +87,7 @@ The server exposes the following tools:
 | Area | Tools |
 | --- | --- |
 | Boards | `list_boards`, `get_board`, `get_all_board` |
-| Columns | `create_column`, `rename_column`, `delete_column`, `move_column`, `archive_all_cards` |
+| Columns | `archive_all_cards` |
 | Cards | `create_card`, `update_card`, `move_card`, `move_all_card`, `move_card_to_board`, `delete_card`, `archive_card`, `restore_card`, `list_archived_cards` |
 
 Tool results are JSON objects with camelCase field names (e.g.

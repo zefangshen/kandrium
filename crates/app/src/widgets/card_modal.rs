@@ -2,7 +2,7 @@
 
 use egui::{Context, Modal};
 
-use kandrium_core::{Board, Card, CreateCardBody};
+use kandrium_core::{Board, Card, CreateCardBody, ProjectChoice};
 
 use crate::theme::{self, Tokens};
 
@@ -14,6 +14,13 @@ pub struct CardEditState {
     pub description: String,
     pub due_date: String,
     pub labels: Vec<i64>,
+    /// Project tag (normal boards) or owning project (project boards).
+    pub project_id: Option<String>,
+    /// Area board a project card is mirrored onto (`None` = project board only).
+    /// Kept while the checkbox is off so re-checking restores the same board.
+    pub area_board_id: Option<String>,
+    /// "Show on Tasks boards" checkbox for project cards.
+    pub area_enabled: bool,
 }
 
 impl CardEditState {
@@ -24,6 +31,9 @@ impl CardEditState {
             description: card.description.clone(),
             due_date: card.due_date.clone(),
             labels: card.labels.clone(),
+            project_id: card.project_id.clone(),
+            area_board_id: card.area_board_id.clone(),
+            area_enabled: card.area_board_id.is_some(),
         }
     }
 
@@ -60,12 +70,18 @@ pub enum CardModalOutcome {
 
 /// Show the card editor. `archived` controls the archive button label.
 /// `move_targets` are the boards the card can be moved to (empty hides the
-/// picker).
+/// picker). `is_project_card` swaps the project picker for the "Show on Tasks
+/// boards" checkbox + board picker, and hides "Move to board": project cards
+/// stay on their project board and are mirrored onto one normal board, while
+/// normal cards can be tagged with a project and moved between boards.
 pub fn show(
     ctx: &Context,
     state: &mut CardEditState,
     archived: bool,
     move_targets: &[Board],
+    area_targets: &[Board],
+    project_targets: &[ProjectChoice],
+    is_project_card: bool,
 ) -> CardModalOutcome {
     let mut actions = ModalActions {
         save: false,
@@ -98,6 +114,124 @@ pub fn show(
                 .frame(edit_frame()),
         );
         ui.add_space(6.0);
+
+        if is_project_card {
+            // Project cards are owned by their project board; the only
+            // project-related choice is which area board mirrors them.
+            let project_label = state
+                .project_id
+                .as_ref()
+                .and_then(|id| project_targets.iter().find(|p| &p.id == id))
+                .map(|p| format!("{} — {}", p.identifier, p.name))
+                .unwrap_or_else(|| "—".to_string());
+            ui.horizontal(|ui| {
+                ui.label("Project");
+                ui.label(
+                    egui::RichText::new(project_label)
+                        .text_style(egui::TextStyle::Small)
+                        .color(t.text_muted),
+                );
+            });
+            ui.add_space(4.0);
+            let has_targets = !area_targets.is_empty();
+            ui.add_enabled_ui(has_targets, |ui| {
+                ui.checkbox(&mut state.area_enabled, "Show on Tasks boards");
+            });
+            if !has_targets {
+                state.area_enabled = false;
+            }
+            if state.area_enabled {
+                // Keep a valid board selected so Save can't produce a
+                // half-checked mirror.
+                if !area_targets
+                    .iter()
+                    .any(|b| Some(&b.id) == state.area_board_id.as_ref())
+                {
+                    state.area_board_id = area_targets.first().map(|b| b.id.clone());
+                }
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(22.0);
+                    ui.label("Board");
+                    let area_label = state
+                        .area_board_id
+                        .as_ref()
+                        .and_then(|id| area_targets.iter().find(|b| &b.id == id))
+                        .map(|b| b.title.clone())
+                        .unwrap_or_else(|| "Select a board…".to_string());
+                    egui::ComboBox::from_id_salt("card-area-combo")
+                        .selected_text(area_label)
+                        .width(180.0)
+                        .show_ui(ui, |ui| {
+                            for board in area_targets {
+                                let selected =
+                                    state.area_board_id.as_deref() == Some(board.id.as_str());
+                                if ui.selectable_label(selected, &board.title).clicked() {
+                                    state.area_board_id = Some(board.id.clone());
+                                    ui.close();
+                                }
+                            }
+                        });
+                });
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(22.0);
+                    ui.label(
+                        egui::RichText::new("Mirrors this card onto the selected board.")
+                            .text_style(egui::TextStyle::Small)
+                            .color(t.text_faint),
+                    );
+                });
+            } else {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(22.0);
+                    ui.label(
+                        egui::RichText::new("Not mirrored onto a Tasks board; hidden from All.")
+                            .text_style(egui::TextStyle::Small)
+                            .color(t.text_faint),
+                    );
+                });
+            }
+            ui.add_space(6.0);
+        } else if !project_targets.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label("Project");
+                let project_label = state
+                    .project_id
+                    .as_ref()
+                    .and_then(|id| project_targets.iter().find(|p| &p.id == id))
+                    .map(|p| format!("{} — {}", p.identifier, p.name))
+                    .unwrap_or_else(|| "None".to_string());
+                egui::ComboBox::from_id_salt("card-project-combo")
+                    .selected_text(project_label)
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(state.project_id.is_none(), "None")
+                            .clicked()
+                        {
+                            state.project_id = None;
+                            ui.close();
+                        }
+                        for project in project_targets {
+                            let label = format!("{} — {}", project.identifier, project.name);
+                            let selected = state.project_id.as_deref() == Some(project.id.as_str());
+                            if ui.selectable_label(selected, label).clicked() {
+                                state.project_id = Some(project.id.clone());
+                                ui.close();
+                            }
+                        }
+                    });
+            });
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new("Shows the project identifier on this card.")
+                    .text_style(egui::TextStyle::Small)
+                    .color(t.text_faint),
+            );
+            ui.add_space(6.0);
+        }
 
         ui.label("Description");
         description_editor(ui, &mut state.description);
@@ -155,7 +289,7 @@ pub fn show(
             }
         });
 
-        if !move_targets.is_empty() {
+        if !is_project_card && !move_targets.is_empty() {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.label("Move to board");
@@ -287,5 +421,85 @@ mod tests {
             (long - DESC_FIELD_HEIGHT).abs() <= 1.0,
             "long text: expected ~{DESC_FIELD_HEIGHT}px, got {long}"
         );
+    }
+
+    /// Paint the modal for one frame and return every text shape, so the
+    /// tests can assert which controls the project/normal variants expose.
+    fn modal_text(is_project_card: bool) -> String {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply_visuals(&ctx, false);
+        let mut state = CardEditState {
+            card_id: "c1".into(),
+            title: "Task".into(),
+            description: String::new(),
+            due_date: String::new(),
+            labels: vec![],
+            project_id: Some("p1".into()),
+            area_board_id: None,
+            // Exercise the checked branch (and the auto-pick of the first
+            // board) on the project-card variant.
+            area_enabled: is_project_card,
+        };
+        let area = [Board {
+            id: "b1".into(),
+            title: "Career".into(),
+        }];
+        let projects = [ProjectChoice {
+            id: "p1".into(),
+            name: "Kandrium".into(),
+            identifier: "kan".into(),
+        }];
+        let mut text = String::new();
+        // A modal fades in over a few frames; collect the settled frame.
+        for _ in 0..3 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 700.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let _ = show(
+                        ctx,
+                        &mut state,
+                        false,
+                        &area,
+                        &area,
+                        &projects,
+                        is_project_card,
+                    );
+                },
+            );
+            text = output
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::epaint::Shape::Text(t) => Some(t.galley.job.text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            output.textures_delta.clear();
+        }
+        text
+    }
+
+    #[test]
+    fn project_modal_offers_show_on_tasks_boards_not_move_to_board() {
+        let text = modal_text(true);
+        assert!(text.contains("Show on Tasks boards"), "{text}");
+        assert!(text.contains("Board"), "{text}");
+        assert!(text.contains("Career"), "{text}");
+        assert!(!text.contains("Move to board"), "{text}");
+    }
+
+    #[test]
+    fn normal_modal_keeps_move_to_board() {
+        let text = modal_text(false);
+        assert!(text.contains("Move to board"), "{text}");
+        assert!(!text.contains("Show on Tasks boards"), "{text}");
     }
 }

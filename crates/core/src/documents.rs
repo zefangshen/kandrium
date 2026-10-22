@@ -1,13 +1,13 @@
-//! Documents file-system layer — PDF files under a per-user root, with
-//! per-file annotation sidecars.
+//! Documents file-system layer — PDFs and Markdown files under a per-user
+//! root, with per-file annotation sidecars for PDFs.
 //!
-//! PDFs live outside the SQLite database: `<data_dir>/kandrium/documents/`
-//! (override with `KANDRIUM_DOCS`). Highlights and sticky notes are stored
+//! Documents live outside the SQLite database: `<data_dir>/kandrium/documents/`
+//! (override with `KANDRIUM_DOCS`). PDF highlights and sticky notes are stored
 //! as a sidecar JSON file next to each PDF (`<name>.pdf.kandrium.json`) so
-//! the PDF itself is never modified and read-only files work. All functions
-//! are synchronous and validate that every touched path stays inside the
-//! root (no `..` traversal, no symlink escapes); the shared plumbing lives
-//! in [`crate::fsutil`].
+//! the PDF itself is never modified and read-only files work. Markdown files
+//! are plain text, edited in the app. All functions are synchronous and
+//! validate that every touched path stays inside the root (no `..` traversal,
+//! no symlink escapes); the shared plumbing lives in [`crate::fsutil`].
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,6 +22,9 @@ const SIDECAR_SUFFIX: &str = ".kandrium.json";
 /// Sidecar format version this build reads and writes. A version mismatch
 /// fails the load instead of silently downgrading the file on the next save.
 pub const ANNOTATION_VERSION: u32 = 1;
+
+/// File types listed in the documents tree.
+pub const DOC_EXTENSIONS: &[&str] = &["pdf", "md", "markdown"];
 
 /// One node in the documents tree.
 pub type DocEntry = FsEntry;
@@ -95,10 +98,84 @@ pub fn ensure_root() -> Result<PathBuf> {
     Ok(root)
 }
 
-/// Recursively scan `root` into a sorted tree; only `.pdf` files are
-/// listed (sidecars are `.json` and never appear).
+/// Recursively scan `root` into a sorted tree; only PDF and Markdown files
+/// are listed (sidecars are `.json` and never appear).
 pub fn scan_tree(root: &Path) -> Result<Vec<DocEntry>> {
-    fsutil::scan_tree(root, &["pdf"])
+    fsutil::scan_tree(root, DOC_EXTENSIONS)
+}
+
+/// True for a PDF path (case-insensitive).
+pub fn is_pdf(path: &Path) -> bool {
+    fsutil::has_extension(path, &["pdf"])
+}
+
+/// True for a Markdown path (`.md` / `.markdown`, case-insensitive).
+pub fn is_markdown(path: &Path) -> bool {
+    fsutil::has_extension(path, &["md", "markdown"])
+}
+
+/// Read a Markdown document, guarded to the documents root.
+pub fn read_text(path: &Path, root: &Path) -> Result<String> {
+    let path = fsutil::guard(root, path)?;
+    Ok(fs::read_to_string(path)?)
+}
+
+/// Write a Markdown document, guarded to the documents root.
+pub fn write_text(path: &Path, root: &Path, text: &str) -> Result<()> {
+    let path = fsutil::guard(root, path)?;
+    fs::write(path, text)?;
+    Ok(())
+}
+
+/// Copy a local PDF or Markdown file into `dest_dir` inside the documents
+/// root. Existing names are never overwritten: collisions gain a `-2`,
+/// `-3`, … suffix before the extension (`report.pdf` → `report-2.pdf`).
+/// Returns the new path. Sidecars are not copied — an imported PDF starts
+/// without annotations.
+pub fn import_file(source: &Path, dest_dir: &Path, root: &Path) -> Result<PathBuf> {
+    let dest_dir = fsutil::guard(root, dest_dir)?;
+    if !dest_dir.is_dir() {
+        return Err(KandriumError::new("Upload target is not a folder"));
+    }
+    if !source.is_file() {
+        return Err(KandriumError::new("Only files can be uploaded"));
+    }
+    if !fsutil::has_extension(source, DOC_EXTENSIONS) {
+        return Err(KandriumError::new(
+            "Only PDF and Markdown files can be uploaded",
+        ));
+    }
+    let name = source
+        .file_name()
+        .ok_or_else(|| KandriumError::new("Invalid file name"))?;
+    let target = unique_target(&dest_dir, Path::new(name));
+    fs::copy(source, &target)?;
+    Ok(target)
+}
+
+/// First free `<name>`, `<stem>-2.<ext>`, `<stem>-3.<ext>`, … in `dir`.
+fn unique_target(dir: &Path, name: &Path) -> PathBuf {
+    let candidate = dir.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let stem = name
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("document");
+    let ext = name.extension().and_then(|e| e.to_str()).unwrap_or("");
+    for n in 2.. {
+        let file = if ext.is_empty() {
+            format!("{stem}-{n}")
+        } else {
+            format!("{stem}-{n}.{ext}")
+        };
+        let candidate = dir.join(file);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded suffix loop")
 }
 
 /// Sidecar path for a PDF: the same file name with `.kandrium.json`
@@ -175,11 +252,7 @@ pub fn new_annotation(
 /// PDF, its sidecar moves with it (when one exists).
 pub fn rename_path(path: &Path, root: &Path, new_name: &str) -> Result<PathBuf> {
     let path = fsutil::guard(root, path)?;
-    let sidecar = path.is_file()
-        && path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
+    let sidecar = path.is_file() && is_pdf(&path);
     let sidecar_from = sidecar.then(|| annotations_path(&path));
     let new_path = crate::notes::rename_in_root(&path, root, new_name)?;
     if let Some(from) = sidecar_from {
@@ -198,12 +271,7 @@ pub fn delete_path(path: &Path, root: &Path) -> Result<()> {
     if path == fsutil::canonical_root(root)? {
         return Err(KandriumError::new("Cannot delete the documents root"));
     }
-    if path.is_file()
-        && path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
-    {
+    if path.is_file() && is_pdf(&path) {
         let sidecar = annotations_path(&path);
         if sidecar.exists() {
             fs::remove_file(&sidecar)?;
@@ -245,18 +313,68 @@ mod tests {
     }
 
     #[test]
-    fn scan_lists_only_pdfs() {
+    fn scan_lists_pdfs_and_markdown() {
         let f = fixture();
         fs::write(f.root.join("a.pdf"), "").unwrap();
         fs::write(f.root.join("b.kandrium.json"), "").unwrap();
         fs::write(f.root.join("c.md"), "").unwrap();
+        fs::write(f.root.join("e.markdown"), "").unwrap();
         fs::create_dir(f.root.join("sub")).unwrap();
         fs::write(f.root.join("sub").join("d.PDF"), "").unwrap();
 
         let tree = scan_tree(&f.root).unwrap();
         let names: Vec<&str> = tree.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, ["sub", "a.pdf"]);
+        assert_eq!(names, ["sub", "a.pdf", "c.md", "e.markdown"]);
         assert_eq!(tree[0].children.as_ref().unwrap()[0].name, "d.PDF");
+    }
+
+    #[test]
+    fn import_copies_pdf_and_markdown_with_unique_names() {
+        let f = fixture();
+        let src = f._tmp.path().join("incoming");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("report.pdf"), b"%PDF-1.4 fake").unwrap();
+        fs::write(src.join("report.pdf.kandrium.json"), "{}").unwrap();
+        fs::write(src.join("notes.md"), "# Notes\n").unwrap();
+        fs::create_dir(f.root.join("papers")).unwrap();
+
+        let pdf = import_file(&src.join("report.pdf"), &f.root.join("papers"), &f.root).unwrap();
+        assert!(pdf.ends_with("papers/report.pdf"));
+        assert_eq!(fs::read(&pdf).unwrap(), b"%PDF-1.4 fake");
+        // The source sidecar is not carried over: a new import has no
+        // annotations.
+        assert!(!annotations_path(&pdf).exists());
+
+        // Re-importing the same name never overwrites.
+        let again = import_file(&src.join("report.pdf"), &f.root.join("papers"), &f.root).unwrap();
+        assert!(again.ends_with("papers/report-2.pdf"));
+
+        let md = import_file(&src.join("notes.md"), &f.root.join("papers"), &f.root).unwrap();
+        assert!(md.ends_with("papers/notes.md"));
+        assert_eq!(fs::read_to_string(&md).unwrap(), "# Notes\n");
+        assert_eq!(read_text(&md, &f.root).unwrap(), "# Notes\n");
+
+        write_text(&md, &f.root, "# Updated\n").unwrap();
+        assert_eq!(fs::read_to_string(&md).unwrap(), "# Updated\n");
+    }
+
+    #[test]
+    fn import_rejects_unsupported_files_directories_and_escapes() {
+        let f = fixture();
+        let src = f._tmp.path().join("incoming");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("notes.txt"), "x").unwrap();
+        fs::write(src.join("outside.pdf"), "x").unwrap();
+        fs::create_dir(src.join("folder.md")).unwrap();
+
+        assert!(import_file(&src.join("notes.txt"), &f.root, &f.root).is_err());
+        assert!(import_file(&src.join("folder.md"), &f.root, &f.root).is_err());
+        assert!(import_file(&src.join("missing.pdf"), &f.root, &f.root).is_err());
+        // The destination must stay inside the root.
+        assert!(
+            import_file(&src.join("outside.pdf"), f._tmp.path(), &f.root).is_err(),
+            "upload target outside the root must be rejected"
+        );
     }
 
     #[test]

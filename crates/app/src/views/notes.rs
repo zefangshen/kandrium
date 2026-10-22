@@ -10,11 +10,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use egui::Rect;
-use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
+use egui_commonmark::CommonMarkCache;
 use kandrium_core::notes::{self, NoteEntry};
 
 use crate::theme::{self, Press, Tokens};
 use crate::views::notes_highlight::MarkdownHighlighter;
+use crate::widgets;
+use crate::widgets::markdown::{self, NoteMode};
 use crate::widgets::tabs::TAB_H;
 
 const AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -25,12 +27,6 @@ const INDENT: f32 = 14.0;
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum NoteMode {
-    Edit,
-    Preview,
-}
 
 /// One open editor tab.
 pub struct OpenNote {
@@ -53,6 +49,8 @@ pub struct NotesState {
     highlighter: Option<MarkdownHighlighter>,
     highlighter_dark: bool,
     preview_cache: CommonMarkCache,
+    /// Left file-tree panel visibility (persisted across restarts).
+    pub tree_open: bool,
     error: Option<String>,
 }
 
@@ -78,6 +76,7 @@ impl NotesState {
                     highlighter: None,
                     highlighter_dark: true,
                     preview_cache: CommonMarkCache::default(),
+                    tree_open: true,
                     error: None,
                 };
                 state.rescan();
@@ -94,6 +93,7 @@ impl NotesState {
                 highlighter: None,
                 highlighter_dark: true,
                 preview_cache: CommonMarkCache::default(),
+                tree_open: true,
                 error: Some(format!("Cannot open notes folder: {e}")),
             },
         }
@@ -280,15 +280,29 @@ pub fn show(ui: &mut egui::Ui, state: &mut NotesState, dark: bool) -> NotesActio
     let mut actions = NotesActions::default();
     let t = Tokens::get(ui.ctx());
 
-    egui::Panel::left("notes-tree")
-        .resizable(true)
-        .default_size(TREE_DEFAULT_W)
-        .min_size(160.0)
-        .max_size(480.0)
-        .frame(egui::Frame::new().fill(t.panel))
-        .show(ui, |ui| {
-            tree_panel(ui, state, &mut actions);
-        });
+    if state.tree_open {
+        egui::Panel::left("notes-tree")
+            .resizable(true)
+            .default_size(TREE_DEFAULT_W)
+            .min_size(160.0)
+            .max_size(480.0)
+            .frame(egui::Frame::new().fill(t.panel))
+            .show(ui, |ui| {
+                tree_panel(ui, state, &mut actions);
+            });
+    } else {
+        egui::Panel::left("notes-tree-rail")
+            .resizable(false)
+            .default_size(widgets::RAIL_W)
+            .min_size(widgets::RAIL_W)
+            .max_size(widgets::RAIL_W)
+            .frame(egui::Frame::new().fill(t.panel))
+            .show(ui, |ui| {
+                if widgets::expand_button(ui) {
+                    state.tree_open = true;
+                }
+            });
+    }
 
     editor_panel(ui, state);
     actions
@@ -318,6 +332,11 @@ fn tree_panel(ui: &mut egui::Ui, state: &mut NotesState, actions: &mut NotesActi
         if theme::icon_button(ui, "rotate-cw", 26.0, false, "Refresh").clicked() {
             state.rescan();
         }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if widgets::collapse_button(ui) {
+                state.tree_open = false;
+            }
+        });
     });
     ui.add_space(4.0);
 
@@ -532,55 +551,10 @@ fn editor_panel(ui: &mut egui::Ui, state: &mut NotesState) {
     } = state;
     let note = &mut open[idx];
 
-    match note.mode {
-        NoteMode::Edit => {
-            let avail = ui.available_size();
-            let outer_h = avail.y.max(80.0);
-            let t = Tokens::get(ui.ctx());
-            egui::Frame::new()
-                .fill(t.field)
-                .stroke(egui::Stroke::new(1.0, t.border))
-                .corner_radius(egui::CornerRadius::same(t.radius))
-                .inner_margin(egui::Margin::same(8))
-                .show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    let inner_h = outer_h - 18.0; // margins + stroke
-                    egui::ScrollArea::vertical()
-                        .id_salt(("note-editor-scroll", note.path.as_os_str()))
-                        .max_height(inner_h)
-                        .auto_shrink([false; 2])
-                        .show(ui, |ui| {
-                            let hl = highlighter.as_ref().expect("highlighter set in show()");
-                            let mut layouter =
-                                |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
-                                    let mut job = hl.layout_job(ui, buf.as_str());
-                                    job.wrap.max_width = wrap;
-                                    ui.fonts_mut(|f| f.layout_job(job))
-                                };
-                            let resp = ui.add(
-                                egui::TextEdit::multiline(&mut note.text)
-                                    .id_salt(("note-editor", note.path.as_os_str()))
-                                    .frame(egui::Frame::new())
-                                    .desired_width(f32::INFINITY)
-                                    .font(egui::TextStyle::Monospace)
-                                    .layouter(&mut layouter)
-                                    .min_size(egui::vec2(ui.available_width(), inner_h)),
-                            );
-                            if resp.changed() {
-                                note.dirty_since = Some(Instant::now());
-                            }
-                        });
-                });
-        }
-        NoteMode::Preview => {
-            egui::ScrollArea::vertical()
-                .id_salt(("note-preview-scroll", note.path.as_os_str()))
-                .auto_shrink([false; 2])
-                .show(ui, |ui| {
-                    ui.add_space(4.0);
-                    CommonMarkViewer::new().show(ui, preview_cache, &note.text);
-                });
-        }
+    let id = egui::Id::new(("note-editor", note.path.as_os_str()));
+    let hl = highlighter.as_ref().expect("highlighter set in show()");
+    if markdown::body(ui, id, &mut note.text, note.mode, hl, preview_cache) {
+        note.dirty_since = Some(Instant::now());
     }
 }
 
@@ -624,17 +598,7 @@ fn tab_strip(ui: &mut egui::Ui, state: &mut NotesState) {
 
         // Edit/preview toggle for the active tab.
         if let Some(idx) = state.active {
-            let mode = state.open[idx].mode;
-            let (icon, tip) = match mode {
-                NoteMode::Edit => ("eye", "Preview"),
-                NoteMode::Preview => ("pencil", "Edit"),
-            };
-            if theme::icon_button(ui, icon, 26.0, false, tip).clicked() {
-                state.open[idx].mode = match mode {
-                    NoteMode::Edit => NoteMode::Preview,
-                    NoteMode::Preview => NoteMode::Edit,
-                };
-            }
+            markdown::mode_toggle(ui, &mut state.open[idx].mode);
         }
     });
 }
@@ -684,14 +648,73 @@ mod tests {
             highlighter: None,
             highlighter_dark: true,
             preview_cache: CommonMarkCache::default(),
+            tree_open: true,
             error: None,
         };
         state.rescan();
         state.open_file(root.join("a.md"));
         state.open_file(root.join("b.md"));
 
-        for _ in 0..2 {
-            let mut output = ctx.run_ui(Default::default(), |ctx| {
+        // Expanded tree and collapsed rail must both render cleanly.
+        for tree_open in [true, false] {
+            state.tree_open = tree_open;
+            for _ in 0..2 {
+                let mut output = ctx.run_ui(Default::default(), |ctx| {
+                    let mut ui = egui::Ui::new(
+                        ctx.clone(),
+                        egui::Id::new("root"),
+                        egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+                            egui::pos2(0.0, 0.0),
+                            egui::vec2(1000.0, 700.0),
+                        )),
+                    );
+                    show(&mut ui, &mut state, true);
+                });
+                let text = shapes_text(&output);
+                assert!(
+                    !text.contains("use of"),
+                    "duplicate-ID warning visible:\n{text}"
+                );
+                output.textures_delta.clear();
+            }
+        }
+    }
+
+    /// A click anywhere on the collapsed rail expands the tree, not just on
+    /// the chevron in its header.
+    #[test]
+    fn rail_click_expands_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("notes");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.md"), "# A").unwrap();
+
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply_visuals(&ctx, true);
+
+        let mut state = NotesState {
+            root: root.clone(),
+            selected_dir: root.clone(),
+            tree: Vec::new(),
+            expanded: HashSet::new(),
+            renaming: None,
+            open: Vec::new(),
+            active: None,
+            highlighter: None,
+            highlighter_dark: true,
+            preview_cache: CommonMarkCache::default(),
+            tree_open: false,
+            error: None,
+        };
+        state.rescan();
+
+        let mut frame = |events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(raw, |ctx| {
                 let mut ui = egui::Ui::new(
                     ctx.clone(),
                     egui::Id::new("root"),
@@ -702,12 +725,25 @@ mod tests {
                 );
                 show(&mut ui, &mut state, true);
             });
-            let text = shapes_text(&output);
-            assert!(
-                !text.contains("use of"),
-                "duplicate-ID warning visible:\n{text}"
-            );
             output.textures_delta.clear();
-        }
+        };
+
+        // Middle of the 30 px rail, well away from the chevron.
+        let pos = egui::pos2(15.0, 300.0);
+        frame(vec![egui::Event::PointerMoved(pos)]);
+        frame(vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        }]);
+        frame(vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        }]);
+
+        assert!(state.tree_open, "clicking the rail should expand the tree");
     }
 }

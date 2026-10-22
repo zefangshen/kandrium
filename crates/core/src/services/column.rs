@@ -23,6 +23,7 @@ pub fn create_column(db: &Connection, board_id: &str, title: &str) -> Result<Col
         id,
         title,
         cards: vec![],
+        mirrored: vec![],
     })
 }
 

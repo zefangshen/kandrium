@@ -9,11 +9,16 @@ use crate::theme::{self, Tokens};
 
 static ICONS: &[(&str, &[u8])] = &[
     ("archive", include_bytes!("../assets/icons/archive.svg")),
+    ("briefcase", include_bytes!("../assets/icons/briefcase.svg")),
     ("calendar", include_bytes!("../assets/icons/calendar.svg")),
     ("check", include_bytes!("../assets/icons/check.svg")),
     (
         "chevron-down",
         include_bytes!("../assets/icons/chevron-down.svg"),
+    ),
+    (
+        "chevron-left",
+        include_bytes!("../assets/icons/chevron-left.svg"),
     ),
     (
         "chevron-right",
@@ -23,7 +28,12 @@ static ICONS: &[(&str, &[u8])] = &[
     ("eye", include_bytes!("../assets/icons/eye.svg")),
     ("file", include_bytes!("../assets/icons/file.svg")),
     ("file-plus", include_bytes!("../assets/icons/file-plus.svg")),
+    ("file-text", include_bytes!("../assets/icons/file-text.svg")),
     ("folder", include_bytes!("../assets/icons/folder.svg")),
+    (
+        "folder-open",
+        include_bytes!("../assets/icons/folder-open.svg"),
+    ),
     (
         "folder-plus",
         include_bytes!("../assets/icons/folder-plus.svg"),
@@ -54,6 +64,7 @@ static ICONS: &[(&str, &[u8])] = &[
     ),
     ("sun", include_bytes!("../assets/icons/sun.svg")),
     ("trash-2", include_bytes!("../assets/icons/trash-2.svg")),
+    ("upload", include_bytes!("../assets/icons/upload.svg")),
     ("x", include_bytes!("../assets/icons/x.svg")),
 ];
 
@@ -106,28 +117,8 @@ pub fn button_tinted(
     tint: Color32,
     tooltip: &str,
 ) -> Response {
-    let t = Tokens::get(ui.ctx());
     let (rect, resp) = ui.allocate_exact_size(vec2(box_size, box_size), Sense::click());
-    resp.widget_info(|| {
-        egui::WidgetInfo::labeled(
-            egui::WidgetType::Button,
-            ui.is_enabled(),
-            if tooltip.is_empty() { name } else { tooltip },
-        )
-    });
-    let press = theme::Press::track(ui, &resp);
-    let fill = press.wash_color(&t, false);
-    if fill.a() > 0 {
-        ui.painter().rect_filled(rect, t.radius, fill);
-    }
-    let size = (box_size * 0.5).round() * (1.0 - 0.08 * press.down);
-    paint(ui, rect.translate(press.offset()), name, size, tint);
-    let resp = theme::hand(resp);
-    if tooltip.is_empty() {
-        resp
-    } else {
-        resp.on_hover_text(tooltip)
-    }
+    paint_button(ui, resp, rect, box_size, name, tint, false, tooltip)
 }
 
 /// Square icon button: transparent until hovered; `selected` gets the accent treatment.
@@ -140,6 +131,28 @@ pub fn button(
 ) -> Response {
     let t = Tokens::get(ui.ctx());
     let (rect, resp) = ui.allocate_exact_size(vec2(box_size, box_size), Sense::click());
+    let tint = if selected { t.accent_text } else { t.icon };
+    paint_button(ui, resp, rect, box_size, name, tint, selected, tooltip)
+}
+
+/// Paint a square icon button for an already-registered widget.
+///
+/// Split out from allocation so overlays can register their own rect/id with
+/// [`egui::Ui::interact`] — which does **not** consume layout space — and still
+/// get the standard wash/press treatment. The card hover pencil uses this so a
+/// box taller than the title row can never grow the card on hover.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_button(
+    ui: &egui::Ui,
+    resp: Response,
+    rect: Rect,
+    box_size: f32,
+    name: &str,
+    tint: Color32,
+    selected: bool,
+    tooltip: &str,
+) -> Response {
+    let t = Tokens::get(ui.ctx());
     resp.widget_info(|| {
         egui::WidgetInfo::labeled(
             egui::WidgetType::Button,
@@ -161,13 +174,7 @@ pub fn button(
         );
     }
     let size = (box_size * 0.5).round() * (1.0 - 0.08 * press.down);
-    paint(
-        ui,
-        rect.translate(press.offset()),
-        name,
-        size,
-        if selected { t.accent_text } else { t.icon },
-    );
+    paint(ui, rect.translate(press.offset()), name, size, tint);
     let resp = theme::hand(resp);
     if tooltip.is_empty() {
         resp
