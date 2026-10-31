@@ -48,7 +48,15 @@ Workspace, edition 2024. All comments, identifiers, and docs are in English.
   adds the reversible `projects.archived` / `archived_at` flag; v7 adds the
   free-form `projects.source` reference (local path or URL) shown on the
   Overview. The `db` module is split into `db/connection.rs` (open/path/legacy
-  migration/bootstrap) and `db/migrations.rs` (schema + runner).
+  migration/bootstrap), `db/migrations.rs` (schema + runner), and
+  `db/backup.rs` (snapshots + integrity). `db::bootstrap(&mut Connection,
+  &Path)` is the single boot path for both front-ends: it runs
+  `backup::check_integrity` (quarantine raw DB + `-wal`/`-shm` as
+  `<stem>-corrupt-<stamp>.db` on failure), snapshots before a pending migration
+  (`VACUUM INTO`, newest 5 kept) or once per local day (newest 7 kept), then
+  `run_schema` and `seed`. Snapshots live in `<db parent>/backups/`; every new
+  boot path must call `bootstrap` with the real path, never `run_schema`
+  directly.
 - Projects (`crates/core/src/projects.rs`) own a board each. Those boards are
   hidden from the Tasks tabs (`list_boards`) with
   `NOT IN (SELECT board_id FROM projects)`; the header re-adds the currently
@@ -114,6 +122,19 @@ Workspace, edition 2024. All comments, identifiers, and docs are in English.
   commands, marks, named registers, `%`, `>>`/`<<`, `.` repeat of Visual ops.
 - IDs are 24 lowercase hex chars (`db::uid()`), matching the old app. Seed data
   uses fixed string ids (`board_career`, `col_work_todo`, ...).
+- **Logging**: `kandrium_core::logging::init(component)` +
+  `install_panic_hook(component)` run first thing in every binary's `main`.
+  Logs go to `<data_dir>/kandrium/logs/<component>.log` (`KANDRIUM_LOG_DIR`
+  overrides), rotate to `.log.1` at 5 MB, and are mirrored to stderr so MCP
+  clients and CLI runs keep seeing them. Panics also write
+  `crash-<pid>-<stamp>.log` with a backtrace. Never add new `eprintln!`/`println!`
+  diagnostics in the app or MCP server — use `logging::info!` / `warn!` /
+  `error!`. (`println!` would corrupt the MCP stdout transport.)
+- **Atomic writes**: overwrite-style file writes (notes, project docs,
+  Markdown autosave, PDF annotation sidecars) go through
+  `fsutil::write_atomic` (unique sibling temp + `sync_all` + rename). Never
+  truncate a user file in place with `fs::write`. New-file creation is the
+  same helper.
 
 ## Naming constraints (do not regress)
 
@@ -129,7 +150,7 @@ importer) and historical reference comments.
 ```sh
 cargo run -p kandrium-app          # desktop app (also: just run)
 cargo run -p kandrium-mcp          # MCP stdio server
-cargo test --workspace             # ~40 tests, must stay green
+cargo test --workspace             # ~185 tests, must stay green
 cargo clippy --workspace           # must be warning-free
 cargo fmt
 cargo packager --release           # build Kandrium.app + DMG (packager.json)
@@ -258,6 +279,9 @@ reduced-motion support.
 - `KANDRIUM_PROJECTS` overrides the projects root; default
   `<data_dir>/kandrium/projects/` (one folder of plain files per project —
   the folder/project tree itself lives in SQLite, schema v2).
+- `KANDRIUM_LOG_DIR` overrides the log directory; default
+  `<data_dir>/kandrium/logs/` (one rolling `<component>.log` + panic crash
+  files).
 - Auto-migration from `<data_dir>/planly-rs/planly.db` runs once at app and MCP
   boot (staged `VACUUM INTO`, never writes the source). A `KANDRIUM_DB`
   override opts out of auto-migration.

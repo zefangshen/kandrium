@@ -113,8 +113,8 @@ pub fn set_dock_icon() -> bool {
 
         let ok = setter_ok || tile_ok;
         if !LOGGED.swap(true, Ordering::Relaxed) {
-            eprintln!(
-                "[kandrium] dock icon: setter_ok={setter_ok} tile_ok={tile_ok} \
+            kandrium_core::logging::info!(
+                "dock icon: setter_ok={setter_ok} tile_ok={tile_ok} \
                  (before={before:p} after={after:p} image={image:p})"
             );
         }
@@ -197,9 +197,11 @@ fn measure_traffic_lights() -> Option<(f32, f32)> {
         let key = ((m.0 * 2.0).round() as i32, (m.1 * 2.0).round() as i32);
         let mut last = LAST.lock().ok()?;
         if *last != Some(key) && LOGGED.load(std::sync::atomic::Ordering::Relaxed) < LOG_CAP {
-            eprintln!(
-                "[kandrium] traffic lights: center_y={} title_x={} frame_h={}",
-                m.0, m.1, win_frame.size.height
+            kandrium_core::logging::info!(
+                "traffic lights: center_y={} title_x={} frame_h={}",
+                m.0,
+                m.1,
+                win_frame.size.height
             );
             LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             *last = Some(key);
@@ -296,8 +298,8 @@ fn ensure_titlebar_overlay() {
             let _: () = msg_send![win, setTitleVisibility:TITLE_HIDDEN];
         }
         if !missing.is_empty() {
-            eprintln!(
-                "[kandrium] title-bar overlay: applied {:?} (mask was {mask:#x}, \
+            kandrium_core::logging::info!(
+                "title-bar overlay: applied {:?} (mask was {mask:#x}, \
                  content frame {content_frame:?})",
                 missing
             );
@@ -311,6 +313,9 @@ pub fn traffic_light_metrics() -> Option<(f32, f32)> {
 }
 
 fn main() -> eframe::Result {
+    let _ = kandrium_core::logging::init("kandrium-app");
+    kandrium_core::logging::install_panic_hook("kandrium-app");
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])

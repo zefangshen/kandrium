@@ -9,9 +9,12 @@
 
 use std::path::PathBuf;
 
-use kandrium_core::{import_old_db, resolve_db_path, resolve_old_db_path};
+use kandrium_core::{import_old_db, logging, resolve_db_path, resolve_old_db_path};
 
 fn main() {
+    let _ = logging::init("kandrium-import");
+    logging::install_panic_hook("kandrium-import");
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let old: PathBuf = args
         .first()
@@ -22,18 +25,21 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(resolve_db_path);
 
-    eprintln!("[kandrium-import] old: {}", old.display());
-    eprintln!("[kandrium-import] new: {}", new.display());
+    logging::info!("old: {}", old.display());
+    logging::info!("new: {}", new.display());
 
     match import_old_db(&old, &new) {
         Ok(counts) => {
-            eprintln!(
-                "[kandrium-import] done: {} boards, {} columns, {} cards, {} all_card_order rows",
-                counts.boards, counts.columns, counts.cards, counts.all_card_order
+            logging::info!(
+                "done: {} boards, {} columns, {} cards, {} all_card_order rows",
+                counts.boards,
+                counts.columns,
+                counts.cards,
+                counts.all_card_order
             );
         }
         Err(e) => {
-            eprintln!("[kandrium-import] failed: {e}");
+            logging::error!("failed: {e}");
             std::process::exit(1);
         }
     }

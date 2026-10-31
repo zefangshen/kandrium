@@ -10,6 +10,7 @@ pub mod documents;
 pub mod error;
 pub mod fsutil;
 pub mod import;
+pub mod logging;
 pub mod models;
 pub mod notes;
 pub mod projects;
@@ -21,7 +22,8 @@ pub use constants::{
     status_from_column_title,
 };
 pub use db::{
-    bootstrap, migrate_legacy_db, open_db, resolve_db_path, resolve_old_db_path, run_schema, uid,
+    backups_dir, bootstrap, migrate_legacy_db, open_db, resolve_db_path, resolve_old_db_path,
+    run_schema, uid,
 };
 pub use error::{KandriumError, Result};
 pub use import::{ImportCounts, import_old_db};

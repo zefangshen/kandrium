@@ -7,6 +7,7 @@
 //! extensions.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::{KandriumError, Result};
@@ -88,6 +89,41 @@ pub fn guard(root: &Path, path: &Path) -> Result<PathBuf> {
         return Err(KandriumError::new("Path escapes the root"));
     }
     Ok(resolved)
+}
+
+/// Replace a file's contents without ever truncating it in place.
+///
+/// The bytes go to a unique sibling temp file, are flushed to disk, and are
+/// renamed over the target, so a crash mid-write leaves the previous version
+/// intact. Used for every overwrite path (notes, documents, project docs,
+/// annotation sidecars).
+pub fn write_atomic(path: &Path, bytes: impl AsRef<[u8]>) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| KandriumError::new("Invalid path"))?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| KandriumError::new("Invalid path"))?;
+    let tmp = parent.join(format!(".{name}.tmp-{}", crate::db::uid()));
+
+    let result = (|| -> Result<()> {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(bytes.as_ref())?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        fs::remove_file(&tmp).ok();
+    }
+    result?;
+
+    // Best-effort: make the rename itself durable.
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 /// True when `path` has one of the given case-insensitive extensions.
@@ -201,6 +237,26 @@ mod tests {
         fs::write(root.join("b.Pdf"), "").unwrap();
         fs::write(root.join("c.pdf"), "").unwrap();
         assert_eq!(scan_tree(&root, &["pdf"]).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn write_atomic_replaces_content_without_temp_residue() {
+        let (_tmp, root) = fixture();
+        let path = root.join("note.md");
+        fs::write(&path, "old").unwrap();
+        write_atomic(&path, "new").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        let residue: Vec<String> = fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(".tmp-"))
+            .collect();
+        assert!(residue.is_empty(), "{residue:?}");
+
+        let missing = root.join("created.md");
+        write_atomic(&missing, "fresh").unwrap();
+        assert_eq!(fs::read_to_string(&missing).unwrap(), "fresh");
     }
 
     #[test]

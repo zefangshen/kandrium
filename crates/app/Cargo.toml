@@ -15,7 +15,7 @@ egui = "0.36.2"
 egui_commonmark = { version = "0.25", features = ["better_syntax_highlighting"] }
 egui_extras = { version = "0.36.2", features = ["svg", "datepicker", "serde"] }
 hayro = { workspace = true }
-jiff = "0.2"
+jiff = { workspace = true }
 kurbo = "0.13"
 kandrium-core = { path = "../core" }
 rfd = "0.15"

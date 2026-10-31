@@ -62,7 +62,7 @@ cargo build --release -p kandrium-app
 ## Test and lint
 
 ```sh
-cargo test --workspace     # ~40 tests, including headless egui geometry tests
+cargo test --workspace     # ~185 tests, including headless egui geometry tests
 cargo clippy --workspace
 cargo fmt
 ```
@@ -99,6 +99,8 @@ the MCP transport.
 | Path | Resolution |
 | --- | --- |
 | Database | `KANDRIUM_DB` env var, else `<data_dir>/kandrium/kandrium.db` |
+| Backups | `<database parent>/backups/` |
+| Logs | `KANDRIUM_LOG_DIR` env var, else `<data_dir>/kandrium/logs/` |
 | Legacy Electron DB (importer source) | `KANDRIUM_OLD_DB` env var, else `<data_dir>/planly/planly.db` |
 
 On macOS `<data_dir>` is `~/Library/Application Support`, so the default
@@ -108,6 +110,47 @@ On first boot, if no Kandrium database exists but a pre-rebrand
 `<data_dir>/planly-rs/planly.db` is found, it is copied into place
 automatically using a staged `VACUUM INTO` (the original file is never
 modified). Both the app and the MCP server perform this check at startup.
+
+### Data safety
+
+Every app and MCP boot runs `PRAGMA quick_check` before touching the schema.
+If the check fails, the raw database file (plus its `-wal`/`-shm` sidecars)
+is copied to the backup directory as `<stem>-corrupt-<stamp>.db`, and the app
+shows a dialog pointing at the copy and the log directory instead of starting
+on a broken file.
+
+Snapshots are written with `VACUUM INTO`, so they are a single consistent
+file even while WAL is active:
+
+- **Pre-migration** — one snapshot before any pending schema migration,
+  named `<stem>-pre-migration-v<old-version>-<YYYYMMDD-HHMMSS>.db`. The 5
+  newest are kept.
+- **Daily** — at most one per local calendar day, named
+  `<stem>-daily-<YYYYMMDD-HHMMSS>.db`. The 7 newest are kept.
+
+Snapshots are ordinary SQLite files, so restoring is a file copy:
+
+```sh
+# 1. Quit the app and any MCP server using the database.
+# 2. Move the broken/live database aside (keep it until you have verified).
+mv ~/Library/Application\ Support/kandrium/kandrium.db{,.broken}
+# 3. Restore the snapshot, then relaunch Kandrium.
+cp ~/Library/Application\ Support/kandrium/backups/<snapshot>.db \
+   ~/Library/Application\ Support/kandrium/kandrium.db
+```
+
+Notes, project documents, and Markdown files are written atomically (unique
+temp file + fsync + rename), so an interrupted autosave never truncates the
+previous contents.
+
+### Logs and crash reports
+
+Both binaries log to `<data_dir>/kandrium/logs/<component>.log` (app and MCP
+keep separate files, rotated to `.log.1` at 5 MB) and still mirror every line
+to stderr for CLI runs. Uncaught panics are logged with a backtrace and leave
+a one-off `crash-<pid>-<YYYYMMDD-HHMMSS>.log` in the same directory — this is
+the place to look when a packaged `.app` misbehaves, since macOS discards its
+stderr.
 
 ### Importing from the legacy Electron app
 

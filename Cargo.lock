@@ -2293,6 +2293,8 @@ name = "kandrium-core"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "jiff",
+ "log",
  "rand 0.10.3",
  "rusqlite",
  "rusqlite_migration",

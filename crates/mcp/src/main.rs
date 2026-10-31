@@ -347,17 +347,20 @@ impl ServerHandler for KandriumServer {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = core::logging::init("kandrium-mcp");
+    core::logging::install_panic_hook("kandrium-mcp");
+
     let db_path = core::resolve_db_path();
     if let Ok(Some(from)) = core::migrate_legacy_db() {
-        eprintln!(
-            "[kandrium-mcp] migrated database from {} to {}",
+        core::logging::info!(
+            "migrated database from {} to {}",
             from.display(),
             db_path.display()
         );
     }
     let mut db = core::open_db(&db_path)?;
-    core::bootstrap(&mut db)?;
-    eprintln!("[kandrium-mcp] DB: {}", db_path.display());
+    core::bootstrap(&mut db, &db_path)?;
+    core::logging::info!("DB: {}", db_path.display());
 
     let service = KandriumServer::new(db)
         .serve(rmcp::transport::stdio())

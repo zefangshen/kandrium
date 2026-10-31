@@ -49,7 +49,7 @@ pub fn read_note(path: &Path, root: &Path) -> Result<String> {
 
 pub fn write_note(path: &Path, root: &Path, text: &str) -> Result<()> {
     let path = fsutil::guard(root, path)?;
-    fs::write(path, text)?;
+    fsutil::write_atomic(&path, text)?;
     Ok(())
 }
 

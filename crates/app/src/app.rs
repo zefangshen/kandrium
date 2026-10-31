@@ -1666,8 +1666,8 @@ impl eframe::App for KandriumApp {
             if applied || self.dock_icon_tries >= 120 {
                 self.dock_icon_pending = false;
                 if !applied {
-                    eprintln!(
-                        "[kandrium] dock icon not applied after {} frames",
+                    kandrium_core::logging::warn!(
+                        "dock icon not applied after {} frames",
                         self.dock_icon_tries
                     );
                 }
@@ -1802,33 +1802,60 @@ impl eframe::App for KandriumApp {
 fn open_db_or_die() -> Arc<Mutex<Connection>> {
     let path = kandrium_core::resolve_db_path();
     match kandrium_core::migrate_legacy_db() {
-        Ok(Some(from)) => eprintln!(
-            "[kandrium-app] migrated database from {} to {}",
+        Ok(Some(from)) => kandrium_core::logging::info!(
+            "migrated database from {} to {}",
             from.display(),
             path.display()
         ),
         Ok(None) => {}
-        Err(e) => eprintln!("[kandrium-app] legacy database migration failed: {e}"),
+        Err(e) => kandrium_core::logging::warn!("legacy database migration failed: {e}"),
     }
     if let Some(dir) = std::path::Path::new(&path).parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     match kandrium_core::open_db(&path) {
         Ok(mut db) => {
-            if let Err(e) = kandrium_core::bootstrap(&mut db) {
-                eprintln!("[kandrium-app] bootstrap failed: {}", e.0);
+            if let Err(e) = kandrium_core::bootstrap(&mut db, &path) {
+                fail_startup(&path, &e.0);
             }
             Arc::new(Mutex::new(db))
         }
-        Err(e) => {
-            eprintln!(
-                "[kandrium-app] cannot open database at {}: {}",
-                path.display(),
-                e
-            );
-            std::process::exit(1);
-        }
+        Err(e) => fail_startup(&path, &e.to_string()),
     }
+}
+
+/// A database that cannot be opened, checked, or migrated is fatal: running
+/// with a half-initialized database hides the problem and risks data loss.
+fn fail_startup(path: &std::path::Path, problem: &str) -> ! {
+    let backups = kandrium_core::backups_dir(path);
+    let logs = kandrium_core::logging::log_dir();
+    kandrium_core::logging::error!(
+        "database startup failed for {}: {} (backups: {}, logs: {})",
+        path.display(),
+        problem,
+        backups.display(),
+        logs.display()
+    );
+    let body = format!(
+        "Kandrium could not prepare its database.\n\n\
+         Database: {}\n\
+         Problem: {}\n\n\
+         Backups: {}\n\
+         Logs: {}\n\n\
+         Quit the app and the MCP server, restore a backup, or check the log \
+         for details.",
+        path.display(),
+        problem,
+        backups.display(),
+        logs.display()
+    );
+    let _ = rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("Kandrium: database error")
+        .set_description(body)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+    std::process::exit(1);
 }
 
 #[cfg(test)]

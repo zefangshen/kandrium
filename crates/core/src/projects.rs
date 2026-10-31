@@ -345,7 +345,7 @@ pub fn create_project(
     for (file_name, content) in tpl.files {
         let path = dir.join(file_name);
         if !path.exists() {
-            fs::write(&path, content)?;
+            fsutil::write_atomic(&path, content)?;
         }
     }
 
@@ -805,7 +805,7 @@ pub fn read_doc(root: &Path, id: &str, rel: &Path) -> Result<String> {
 pub fn write_doc(root: &Path, id: &str, rel: &Path, text: &str) -> Result<()> {
     let dir = project_dir(root, id);
     let path = fsutil::guard(&dir, &dir.join(rel))?;
-    fs::write(path, text)?;
+    fsutil::write_atomic(&path, text)?;
     Ok(())
 }
 
@@ -973,8 +973,9 @@ mod tests {
 
     fn fixture() -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
-        let mut db = open_db(&tmp.path().join("t.db")).unwrap();
-        bootstrap(&mut db).unwrap();
+        let path = tmp.path().join("t.db");
+        let mut db = open_db(&path).unwrap();
+        bootstrap(&mut db, &path).unwrap();
         let root = tmp.path().join("projects");
         fs::create_dir_all(&root).unwrap();
         Fixture {

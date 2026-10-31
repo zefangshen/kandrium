@@ -66,6 +66,16 @@ pub(crate) fn migrations() -> Migrations<'static> {
     ])
 }
 
+/// Schema version currently recorded in the database.
+pub(crate) fn current_version(db: &Connection) -> Result<i64> {
+    Ok(db.query_row("PRAGMA user_version", [], |r| r.get(0))?)
+}
+
+/// True when the database is behind this binary's schema.
+pub(crate) fn pending_migrations(db: &Connection) -> Result<bool> {
+    Ok(current_version(db)? < SCHEMA_VERSION)
+}
+
 /// Apply all pending schema migrations atomically.
 ///
 /// The v3 step needs Rust-side identifier generation, so it runs as a

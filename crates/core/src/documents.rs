@@ -123,7 +123,7 @@ pub fn read_text(path: &Path, root: &Path) -> Result<String> {
 /// Write a Markdown document, guarded to the documents root.
 pub fn write_text(path: &Path, root: &Path, text: &str) -> Result<()> {
     let path = fsutil::guard(root, path)?;
-    fs::write(path, text)?;
+    fsutil::write_atomic(&path, text)?;
     Ok(())
 }
 
@@ -276,10 +276,8 @@ pub fn save_annotations(pdf: &Path, root: &Path, doc: &AnnotationDoc) -> Result<
     }
     let json = serde_json::to_string_pretty(doc)
         .map_err(|e| KandriumError::new(format!("Cannot serialize annotations: {e}")))?;
-    // Staged write: never leave a half-written sidecar behind.
-    let tmp = sidecar.with_extension("json.tmp");
-    fs::write(&tmp, json)?;
-    fs::rename(&tmp, &sidecar)?;
+    // Atomic write: never leave a half-written sidecar behind.
+    fsutil::write_atomic(&sidecar, json)?;
     Ok(())
 }
 

@@ -11,6 +11,8 @@ license-file = "LICENSE"
 [workspace.dependencies]
 # PDF rasterization for the Documents section.
 hayro = "0.7.1"
+# Date/time parsing and formatting.
+jiff = "0.2"
 
 [profile.release]
 lto = "thin"

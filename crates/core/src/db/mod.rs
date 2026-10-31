@@ -9,9 +9,11 @@
 //!   bootstrap.
 //! - [`migrations`] — the ordered migration set and `run_schema`.
 
+pub mod backup;
 pub mod connection;
 pub mod migrations;
 
+pub use backup::backups_dir;
 pub use connection::{
     bootstrap, has_boards, migrate_legacy_db, open_db, resolve_db_path, resolve_old_db_path,
 };

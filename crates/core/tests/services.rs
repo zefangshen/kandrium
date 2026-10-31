@@ -8,8 +8,9 @@ use kandrium_core::*;
 /// Fresh temp DB with the standard seed (3 boards × 3 columns × 3 cards).
 fn fresh_db() -> (tempfile::TempDir, rusqlite::Connection) {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = open_db(&dir.path().join("t.db")).unwrap();
-    bootstrap(&mut db).unwrap();
+    let path = dir.path().join("t.db");
+    let mut db = open_db(&path).unwrap();
+    bootstrap(&mut db, &path).unwrap();
     (dir, db)
 }
 
