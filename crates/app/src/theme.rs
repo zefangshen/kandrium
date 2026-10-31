@@ -808,20 +808,37 @@ pub fn toast(ctx: &Context, msg: &str) {
         Color32::from_rgb(0xFF, 0xFF, 0xFF)
     };
 
+    // Lay the text out against a stable width *before* creating the Area.
+    // `Area` reuses the previous frame's content size as its wrap width, so a
+    // short toast would leave a narrow box behind and the next longer message
+    // would break mid-word ("Archive / d 4 / cards").
+    let max_w = (ctx.content_rect().width() - 64.0).clamp(200.0, 460.0);
+    let job = egui::text::LayoutJob::simple(
+        msg.to_owned(),
+        TextStyle::Button.resolve(&ctx.global_style()),
+        text,
+        max_w,
+    );
+    let galley = ctx.fonts_mut(|fonts| fonts.layout_job(job));
+
+    let pad = Vec2::new(14.0, 8.0);
+    let size = galley.size() + pad * 2.0;
+    let pos = ctx.content_rect().center_bottom() - Vec2::new(size.x * 0.5, size.y + 24.0);
+    let radius = CornerRadius::same(8);
+    let shadow = egui::epaint::Shadow {
+        offset: [0, 6],
+        blur: 18,
+        spread: 0,
+        color: Color32::from_black_alpha(if t.dark { 90 } else { 30 }),
+    };
+
     egui::Area::new(egui::Id::new("kandrium-toast"))
         .order(egui::Order::Foreground)
-        .anchor(egui::Align2::CENTER_BOTTOM, Vec2::new(0.0, -24.0))
+        .fixed_pos(pos)
         .show(ctx, |ui| {
-            egui::Frame::new()
-                .fill(fill)
-                .corner_radius(CornerRadius::same(8))
-                .inner_margin(Margin::symmetric(14, 8))
-                .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(msg)
-                            .text_style(TextStyle::Button)
-                            .color(text),
-                    );
-                });
+            let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+            ui.painter().add(shadow.as_shape(rect, radius));
+            ui.painter().rect_filled(rect, radius, fill);
+            ui.painter().galley(rect.min + pad, galley, text);
         });
 }

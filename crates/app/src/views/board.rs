@@ -816,4 +816,73 @@ mod layout_tests {
         run_session(true); // cancel → snap-back to source
         run_session(false); // valid drop → fly into destination
     }
+
+    /// Project cards filed to a Tasks board are not a separate read-only
+    /// section: they are ordinary cards in the column's unified order and act
+    /// as drop anchors, so native cards can be dropped between them.
+    #[test]
+    fn mirrored_project_cards_are_drop_anchors_in_the_unified_order() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply_visuals(&ctx, false);
+
+        let card = |id: &str, display_position: i64| Card {
+            id: id.to_string(),
+            column_id: "1".to_string(),
+            title: format!("Card {id}"),
+            display_position,
+            ..Default::default()
+        };
+        let board = BoardWithColumns {
+            id: "b".into(),
+            title: "B".into(),
+            columns: vec![Column {
+                id: "1".into(),
+                title: "To Do".into(),
+                cards: vec![card("native", 1)],
+                mirrored: vec![card("project", 0)],
+            }],
+        };
+
+        let mut zones = Vec::new();
+        let mut output = ctx.run_ui(Default::default(), |ctx| {
+            let mut ui = egui::Ui::new(
+                ctx.clone(),
+                egui::Id::new("root"),
+                egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1000.0, 700.0),
+                )),
+            );
+            let mut add_draft = None;
+            super::show(
+                &mut ui,
+                &board,
+                None,
+                &mut zones,
+                None,
+                &mut add_draft,
+                None,
+                None,
+                &mut String::new(),
+            );
+        });
+        output.textures_delta.clear();
+
+        assert_eq!(zones.len(), 1);
+        let ids: Vec<&str> = zones[0]
+            .card_rects
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["project", "native"],
+            "mirrors and native cards share one display order"
+        );
+        assert!(
+            zones[0].card_rects[0].1.top() < zones[0].card_rects[1].1.top(),
+            "display_position decides the vertical order"
+        );
+    }
 }

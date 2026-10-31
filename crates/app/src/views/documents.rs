@@ -198,6 +198,8 @@ pub struct DocumentsState {
     expanded: HashSet<PathBuf>,
     selected_dir: PathBuf,
     renaming: Option<(PathBuf, String)>,
+    /// Inline “new file/folder” row draft in the tree.
+    doc_create: Option<DocCreate>,
     open: Vec<OpenDoc>,
     active: Option<usize>,
     tool: Tool,
@@ -207,6 +209,23 @@ pub struct DocumentsState {
     highlighter_dark: bool,
     preview_cache: CommonMarkCache,
     error: Option<String>,
+}
+
+/// Which kind of entry the Documents tree's inline create row will make.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DocCreateKind {
+    File,
+    Folder,
+}
+
+/// Inline “new file/folder” draft in the Documents tree.
+struct DocCreate {
+    kind: DocCreateKind,
+    /// Absolute folder the entry is created in (inside the documents root).
+    parent: PathBuf,
+    name: String,
+    /// Request keyboard focus on the next frame.
+    focus: bool,
 }
 
 #[derive(Default)]
@@ -220,6 +239,10 @@ impl DocumentsState {
     pub fn new() -> Self {
         match documents::ensure_root() {
             Ok(root) => {
+                // Tree entries are canonicalized by the scanner; keep the
+                // root in the same form so prefix checks and create targets
+                // agree on macOS (/var → /private/var).
+                let root = root.canonicalize().unwrap_or(root);
                 let mut state = Self {
                     ui_ctx: None,
                     selected_dir: root.clone(),
@@ -227,6 +250,7 @@ impl DocumentsState {
                     tree: Vec::new(),
                     expanded: HashSet::new(),
                     renaming: None,
+                    doc_create: None,
                     open: Vec::new(),
                     active: None,
                     tool: Tool::Select,
@@ -246,6 +270,7 @@ impl DocumentsState {
                 tree: Vec::new(),
                 expanded: HashSet::new(),
                 renaming: None,
+                doc_create: None,
                 open: Vec::new(),
                 active: None,
                 tool: Tool::Select,
@@ -316,6 +341,85 @@ impl DocumentsState {
             .pick_files();
         if let Some(paths) = picked {
             self.import_paths(paths);
+        }
+    }
+
+    /// Folder new entries are created in: the selected folder when valid,
+    /// otherwise the documents root.
+    fn create_parent(&self) -> PathBuf {
+        if self.selected_dir.starts_with(&self.root) && self.selected_dir.is_dir() {
+            self.selected_dir.clone()
+        } else {
+            self.root.clone()
+        }
+    }
+
+    fn begin_create(&mut self, kind: DocCreateKind) {
+        let parent = self.create_parent();
+        self.begin_create_in(kind, parent);
+    }
+
+    /// Open the inline create row inside `parent` (an existing folder under
+    /// the documents root).
+    fn begin_create_in(&mut self, kind: DocCreateKind, parent: PathBuf) {
+        if !parent.starts_with(&self.root) || !parent.is_dir() {
+            return;
+        }
+        if parent != self.root {
+            self.expanded.insert(parent.clone());
+        }
+        self.selected_dir = parent.clone();
+        self.doc_create = Some(DocCreate {
+            kind,
+            parent,
+            name: match kind {
+                DocCreateKind::File => "untitled.md".to_string(),
+                DocCreateKind::Folder => "New Folder".to_string(),
+            },
+            focus: true,
+        });
+    }
+
+    /// Commit the inline create row. A new folder is selected + expanded; a
+    /// new Markdown file opens in a tab. Failures keep the row open.
+    fn commit_create(&mut self) {
+        let Some(draft) = self.doc_create.take() else {
+            return;
+        };
+        let outcome = match draft.kind {
+            DocCreateKind::File => {
+                documents::create_markdown(&draft.parent, &self.root, &draft.name)
+            }
+            DocCreateKind::Folder => {
+                documents::create_folder(&draft.parent, &self.root, &draft.name)
+            }
+        };
+        match outcome {
+            Ok(path) => {
+                self.selected_dir = draft.parent.clone();
+                self.expanded.insert(draft.parent.clone());
+                if draft.kind == DocCreateKind::Folder {
+                    self.selected_dir = path.clone();
+                    self.expanded.insert(path.clone());
+                }
+                self.rescan();
+                if draft.kind == DocCreateKind::File {
+                    self.open_file(path);
+                }
+                self.error = None;
+            }
+            Err(e) => {
+                let what = match draft.kind {
+                    DocCreateKind::File => "file",
+                    DocCreateKind::Folder => "folder",
+                };
+                self.error = Some(format!("Cannot create {what}: {e}"));
+                // Keep the row open so the name can be corrected.
+                self.doc_create = Some(DocCreate {
+                    focus: true,
+                    ..draft
+                });
+            }
         }
     }
 
@@ -681,21 +785,18 @@ fn tree_panel(ui: &mut egui::Ui, state: &mut DocumentsState, actions: &mut Docum
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new("Documents")
-                .text_style(theme::small_strong())
-                .color(Tokens::get(ui.ctx()).text_muted),
-        );
+        if theme::icon_button(ui, "folder-plus", 26.0, false, "New folder").clicked() {
+            state.begin_create(DocCreateKind::Folder);
+        }
+        if theme::icon_button(ui, "file-plus", 26.0, false, "New Markdown file").clicked() {
+            state.begin_create(DocCreateKind::File);
+        }
+        if theme::icon_button(ui, "upload", 26.0, false, "Upload to selected folder").clicked() {
+            state.pick_and_import();
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if widgets::collapse_button(ui) {
                 state.tree_open = false;
-            }
-            if theme::icon_button(ui, "upload", 26.0, false, "Upload to selected folder").clicked()
-            {
-                state.pick_and_import();
-            }
-            if theme::icon_button(ui, "rotate-cw", 26.0, false, "Refresh").clicked() {
-                state.rescan();
             }
         });
     });
@@ -716,7 +817,8 @@ fn tree_panel(ui: &mut egui::Ui, state: &mut DocumentsState, actions: &mut Docum
             // Clone for display: rename/delete handlers trigger rescan(),
             // which rewrites `state.tree` mid-render.
             let entries = state.tree.clone();
-            tree_entries(ui, state, &entries, 0, actions);
+            let root = state.root.clone();
+            tree_entries(ui, state, &entries, &root, 0, actions);
         });
 }
 
@@ -724,18 +826,70 @@ fn tree_entries(
     ui: &mut egui::Ui,
     state: &mut DocumentsState,
     entries: &[DocEntry],
+    parent: &Path,
     depth: usize,
     actions: &mut DocumentsActions,
 ) {
+    doc_create_row(ui, state, parent, depth);
     for entry in entries {
         tree_row(ui, state, entry, depth, actions);
         if entry.is_dir
             && state.expanded.contains(&entry.path)
             && let Some(children) = &entry.children
         {
-            tree_entries(ui, state, children, depth + 1, actions);
+            tree_entries(ui, state, children, &entry.path, depth + 1, actions);
         }
     }
+}
+
+/// Inline "new file/folder" row at the top of a folder. Enter commits, Esc
+/// cancels, and losing focus commits (so clicking elsewhere keeps the item).
+fn doc_create_row(ui: &mut egui::Ui, state: &mut DocumentsState, dir: &Path, depth: usize) {
+    let Some(mut draft) = state.doc_create.take() else {
+        return;
+    };
+    if draft.parent != dir {
+        state.doc_create = Some(draft);
+        return;
+    }
+    let t = Tokens::get(ui.ctx());
+
+    ui.horizontal(|ui| {
+        ui.add_space(8.0 + depth as f32 * INDENT + 14.0);
+        let icon = match draft.kind {
+            DocCreateKind::File => "file-text",
+            DocCreateKind::Folder => "folder",
+        };
+        let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(14.0), egui::Sense::hover());
+        crate::icons::paint(ui, rect, icon, 14.0, t.icon);
+        ui.add_space(4.0);
+
+        let width = (ui.available_width() - 8.0).max(120.0);
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut draft.name)
+                .hint_text(match draft.kind {
+                    DocCreateKind::File => "name.md",
+                    DocCreateKind::Folder => "Folder name",
+                })
+                .desired_width(width)
+                .id(egui::Id::new(("documents-create", &draft.parent))),
+        );
+        let requested_now = draft.focus;
+        if draft.focus {
+            resp.request_focus();
+            draft.focus = false;
+        }
+        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        if escape {
+            // Cancel: dropping the draft closes the row.
+        } else if (enter || resp.lost_focus()) && !requested_now {
+            state.doc_create = Some(draft);
+            state.commit_create();
+        } else {
+            state.doc_create = Some(draft);
+        }
+    });
 }
 
 fn tree_row(
@@ -845,6 +999,17 @@ fn tree_row(
         }
 
         resp.context_menu(|ui| {
+            if entry.is_dir {
+                if theme::menu_item(ui, "file-plus", "New file here", false).clicked() {
+                    ui.close();
+                    state.begin_create_in(DocCreateKind::File, entry.path.clone());
+                }
+                if theme::menu_item(ui, "folder-plus", "New folder here", false).clicked() {
+                    ui.close();
+                    state.begin_create_in(DocCreateKind::Folder, entry.path.clone());
+                }
+                ui.separator();
+            }
             if !entry.is_dir && theme::menu_item(ui, "eye", "Open", false).clicked() {
                 ui.close();
                 state.open_file(entry.path.clone());
@@ -1504,13 +1669,15 @@ mod tests {
     }
 
     fn test_state(root: &Path) -> DocumentsState {
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         let mut state = DocumentsState {
             ui_ctx: None,
-            root: root.to_path_buf(),
-            selected_dir: root.to_path_buf(),
+            root: root.clone(),
+            selected_dir: root,
             tree: Vec::new(),
             expanded: HashSet::new(),
             renaming: None,
+            doc_create: None,
             open: Vec::new(),
             active: None,
             tool: Tool::Select,
@@ -1666,6 +1833,47 @@ mod tests {
             "# Two\n"
         );
         assert!(state.open[0].dirty_since.is_none());
+    }
+
+    #[test]
+    fn create_folder_and_markdown_file_updates_the_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("documents");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let mut state = test_state(&root);
+
+        state.begin_create(DocCreateKind::Folder);
+        state.doc_create.as_mut().unwrap().name = "Papers".into();
+        state.commit_create();
+
+        let papers = root.join("Papers");
+        assert!(papers.is_dir());
+        assert!(state.expanded.contains(&papers));
+        assert_eq!(state.selected_dir, papers);
+        assert!(state.error.is_none());
+
+        state.begin_create(DocCreateKind::File);
+        state.doc_create.as_mut().unwrap().name = "Reading list".into();
+        state.commit_create();
+
+        let note = papers.join("Reading list.md");
+        assert!(note.is_file());
+        assert_eq!(state.open.len(), 1);
+        assert_eq!(state.open[0].path, note);
+        assert!(state.error.is_none());
+
+        // Invalid names keep the inline row open for correction.
+        state.begin_create(DocCreateKind::File);
+        state.doc_create.as_mut().unwrap().name = "bad.txt".into();
+        state.commit_create();
+        assert!(state.doc_create.is_some());
+        assert!(
+            state
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("Cannot create file"))
+        );
     }
 
     #[test]

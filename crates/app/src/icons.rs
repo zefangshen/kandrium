@@ -25,11 +25,19 @@ static ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/icons/chevron-right.svg"),
     ),
     ("ellipsis", include_bytes!("../assets/icons/ellipsis.svg")),
+    (
+        "external-link",
+        include_bytes!("../assets/icons/external-link.svg"),
+    ),
     ("eye", include_bytes!("../assets/icons/eye.svg")),
     ("file", include_bytes!("../assets/icons/file.svg")),
     ("file-plus", include_bytes!("../assets/icons/file-plus.svg")),
     ("file-text", include_bytes!("../assets/icons/file-text.svg")),
     ("folder", include_bytes!("../assets/icons/folder.svg")),
+    (
+        "folder-kanban",
+        include_bytes!("../assets/icons/folder-kanban.svg"),
+    ),
     (
         "folder-open",
         include_bytes!("../assets/icons/folder-open.svg"),

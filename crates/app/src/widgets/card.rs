@@ -188,8 +188,9 @@ pub struct CardChip {
 /// in place; the chip's click/drag is disabled for that card so the editor
 /// owns interaction.
 ///
-/// `draggable` is false for mirrored project cards on area boards: they are
-/// clickable/editable but their position is owned by the project board.
+/// `draggable` is false when the caller wants a static chip (e.g. a drag
+/// ghost or a preview); on a board every card — native or project-mirrored —
+/// is draggable.
 pub fn card_chip(
     ui: &mut Ui,
     card: &Card,

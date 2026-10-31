@@ -94,6 +94,12 @@ pub struct Card {
     /// it stays out of the MCP payload.
     #[serde(skip)]
     pub meta_label: Option<String>,
+    /// Position in the board's unified display order. On non-project boards
+    /// native cards and mirrored project cards share one order
+    /// (`area_card_order`), so the UI merges both lists by this value. UI-only,
+    /// so it stays out of the MCP payload.
+    #[serde(skip)]
+    pub display_position: i64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -103,9 +109,25 @@ pub struct Column {
     pub title: String,
     pub cards: Vec<Card>,
     /// Project cards filed to the owning area board. Kept out of `cards` so
-    /// drag/drop indices and card positions always refer to real column rows.
+    /// MCP clients keep the legacy payload shape; the app renders the merged
+    /// order from [`Column::ordered_cards`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mirrored: Vec<Card>,
+}
+
+impl Column {
+    /// Every card in this column's unified display order: the column's own
+    /// cards and the project cards mirrored onto it, merged by
+    /// [`Card::display_position`] (assigned by `services::board::get_board`).
+    ///
+    /// The sort is stable, so a payload without positions (a project board, a
+    /// hand-built test fixture) renders the two lists in source order —
+    /// exactly the pre-v5 layout.
+    pub fn ordered_cards(&self) -> Vec<&Card> {
+        let mut cards: Vec<&Card> = self.cards.iter().chain(self.mirrored.iter()).collect();
+        cards.sort_by_key(|c| c.display_position);
+        cards
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

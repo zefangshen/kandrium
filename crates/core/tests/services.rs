@@ -28,6 +28,14 @@ fn card_titles(col: &Column) -> Vec<&str> {
     col.cards.iter().map(|c| c.title.as_str()).collect()
 }
 
+/// Ids in the board's unified display order (native + mirrored merged).
+fn ordered_ids(col: &Column) -> Vec<&str> {
+    col.ordered_cards()
+        .into_iter()
+        .map(|c| c.id.as_str())
+        .collect()
+}
+
 #[test]
 fn move_card_within_column_reindexes() {
     let (_d, db) = fresh_db();
@@ -762,4 +770,277 @@ fn moving_a_project_card_to_an_area_board_clears_its_mirror() {
     );
     let career = get_board(&db, "board_career").unwrap();
     assert!(career.columns.iter().all(|c| c.mirrored.is_empty()));
+}
+
+/// Fixture for the unified area-board order: a project with two cards filed to
+/// Career plus two extra native Career cards in To Do. Returns
+/// (project card P1, P2, native N1, N2, Career column ids).
+fn area_order_fixture(
+    db: &rusqlite::Connection,
+    root: &std::path::Path,
+) -> (Card, Card, Card, Card, Vec<String>) {
+    let project = create_project(db, root, "Kandrium", None, "blank").unwrap();
+    let project_cols = col_ids(db, &project.board_id);
+    let career_cols = col_ids(db, "board_career");
+
+    let p1 = create_card(
+        db,
+        &project_cols[0],
+        &CreateCardBody {
+            title: "P1".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let p2 = create_card(
+        db,
+        &project_cols[0],
+        &CreateCardBody {
+            title: "P2".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    set_card_area(db, &p1.id, Some("board_career")).unwrap();
+    set_card_area(db, &p2.id, Some("board_career")).unwrap();
+
+    let n1 = create_card(
+        db,
+        &career_cols[0],
+        &CreateCardBody {
+            title: "N1".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let n2 = create_card(
+        db,
+        &career_cols[0],
+        &CreateCardBody {
+            title: "N2".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    (p1, p2, n1, n2, career_cols)
+}
+
+#[test]
+fn area_board_backfills_native_cards_before_mirrors() {
+    let (_d, db) = fresh_db();
+    let root = _d.path().join("projects");
+    std::fs::create_dir_all(&root).unwrap();
+    let (p1, p2, n1, n2, _) = area_order_fixture(&db, &root);
+
+    let board = get_board(&db, "board_career").unwrap();
+    let todo = &board.columns[0];
+    // Seed card first, then the two new native cards, then the project cards
+    // in project order — the pre-v5 layout, native cards then mirrors.
+    let seed = todo.cards[0].id.clone();
+    assert_eq!(
+        ordered_ids(todo),
+        [
+            seed.as_str(),
+            n1.id.as_str(),
+            n2.id.as_str(),
+            p1.id.as_str(),
+            p2.id.as_str()
+        ]
+    );
+    // The MCP payload keeps its shape: own cards in `cards`, project cards in
+    // `mirrored`, in their real (separate) orders.
+    assert_eq!(todo.cards.len(), 3);
+    assert_eq!(todo.mirrored.len(), 2);
+    assert_eq!(todo.cards[0].display_position, 0);
+    assert_eq!(todo.mirrored[1].display_position, 4);
+}
+
+#[test]
+fn area_board_interleaves_native_and_project_cards() {
+    let (_d, db) = fresh_db();
+    let root = _d.path().join("projects");
+    std::fs::create_dir_all(&root).unwrap();
+    let (p1, p2, n1, n2, career_cols) = area_order_fixture(&db, &root);
+    let board = get_board(&db, "board_career").unwrap();
+    let seed = board.columns[0].cards[0].id.clone();
+    let todo_col = career_cols[0].clone();
+
+    // A project card dragged between native cards.
+    move_area_card(&db, &p1.id, &todo_col, Some(&seed)).unwrap();
+    let board = get_board(&db, "board_career").unwrap();
+    assert_eq!(
+        ordered_ids(&board.columns[0]),
+        [
+            p1.id.as_str(),
+            seed.as_str(),
+            n1.id.as_str(),
+            n2.id.as_str(),
+            p2.id.as_str()
+        ]
+    );
+
+    // A native card dragged between project cards.
+    move_area_card(&db, &seed, &todo_col, Some(&p2.id)).unwrap();
+    let board = get_board(&db, "board_career").unwrap();
+    assert_eq!(
+        ordered_ids(&board.columns[0]),
+        [
+            p1.id.as_str(),
+            n1.id.as_str(),
+            n2.id.as_str(),
+            seed.as_str(),
+            p2.id.as_str()
+        ]
+    );
+
+    // The project card never left its project column, and the native cards'
+    // real positions follow the shown order.
+    let project = get_project(&db, &p1.project_id.clone().unwrap()).unwrap();
+    let home: String = db
+        .query_row("SELECT column_id FROM cards WHERE id = ?", [&p1.id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(home, col_ids(&db, &project.board_id)[0]);
+    let positions: Vec<(String, i64)> = {
+        let mut stmt = db
+            .prepare("SELECT id, position FROM cards WHERE column_id = ? ORDER BY position")
+            .unwrap();
+        stmt.query_map([&todo_col], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        positions
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        [n1.id.as_str(), n2.id.as_str(), seed.as_str()]
+    );
+
+    // Reloading again keeps the same order (persisted, not recomputed).
+    let again = get_board(&db, "board_career").unwrap();
+    assert_eq!(
+        ordered_ids(&board.columns[0]),
+        ordered_ids(&again.columns[0])
+    );
+}
+
+#[test]
+fn moving_a_mirror_across_area_statuses_moves_its_project_column() {
+    let (_d, db) = fresh_db();
+    let root = _d.path().join("projects");
+    std::fs::create_dir_all(&root).unwrap();
+    let (p1, _, _, _, career_cols) = area_order_fixture(&db, &root);
+
+    move_area_card(&db, &p1.id, &career_cols[2], None).unwrap();
+
+    // The card still physically lives on its project board, now in Done.
+    let project_id = p1.project_id.clone().unwrap();
+    let project = get_project(&db, &project_id).unwrap();
+    let project_cols = col_ids(&db, &project.board_id);
+    let home: String = db
+        .query_row("SELECT column_id FROM cards WHERE id = ?", [&p1.id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(home, project_cols[2]);
+
+    let career = get_board(&db, "board_career").unwrap();
+    assert!(career.columns[0].mirrored.iter().all(|c| c.id != p1.id));
+    assert_eq!(career.columns[2].mirrored[0].id, p1.id);
+}
+
+#[test]
+fn move_card_keeps_the_area_display_order_in_step() {
+    let (_d, db) = fresh_db();
+    let root = _d.path().join("projects");
+    std::fs::create_dir_all(&root).unwrap();
+    let (p1, p2, n1, n2, career_cols) = area_order_fixture(&db, &root);
+    let board = get_board(&db, "board_career").unwrap();
+    let seed = board.columns[0].cards[0].id.clone();
+
+    // Reorder the native card through the plain service (MCP path). The
+    // unified order follows even though the project cards are untouched.
+    move_card(&db, &seed, &career_cols[0], None).unwrap();
+    let board = get_board(&db, "board_career").unwrap();
+    assert_eq!(
+        ordered_ids(&board.columns[0]),
+        [
+            n1.id.as_str(),
+            n2.id.as_str(),
+            seed.as_str(),
+            p1.id.as_str(),
+            p2.id.as_str()
+        ]
+    );
+}
+
+#[test]
+fn reorder_project_reindexes_siblings_only() {
+    let (d, db) = fresh_db();
+    let root = d.path().join("projects");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let alpha = create_project(&db, &root, "Alpha", None, "blank").unwrap();
+    let bravo = create_project(&db, &root, "Bravo", None, "blank").unwrap();
+    let charlie = create_project(&db, &root, "Charlie", None, "blank").unwrap();
+    let folder = create_folder(&db, "Group", None).unwrap();
+    let nested_a = create_project(&db, &root, "Nested A", Some(&folder.id), "blank").unwrap();
+    let nested_b = create_project(&db, &root, "Nested B", Some(&folder.id), "blank").unwrap();
+
+    fn names_at(db: &rusqlite::Connection, folder: Option<&str>) -> Vec<String> {
+        fn walk(nodes: &[ProjectNode], folder: Option<&str>, out: &mut Vec<String>) -> bool {
+            match folder {
+                None => {
+                    out.extend(nodes.iter().filter_map(|n| match n {
+                        ProjectNode::Project(p) => Some(p.name.clone()),
+                        ProjectNode::Folder { .. } => None,
+                    }));
+                    true
+                }
+                Some(id) => nodes.iter().any(|n| match n {
+                    ProjectNode::Folder {
+                        id: fid, children, ..
+                    } if fid == id => {
+                        walk(children, None, out);
+                        true
+                    }
+                    ProjectNode::Folder { children, .. } => walk(children, folder, out),
+                    ProjectNode::Project(_) => false,
+                }),
+            }
+        }
+        let tree = list_tree(db).unwrap();
+        let mut out = Vec::new();
+        walk(&tree, folder, &mut out);
+        out
+    }
+
+    assert_eq!(names_at(&db, None), ["Alpha", "Bravo", "Charlie"]);
+
+    // Move the last sibling to the front.
+    reorder_project(&db, &charlie.id, 0).unwrap();
+    assert_eq!(names_at(&db, None), ["Charlie", "Alpha", "Bravo"]);
+
+    // Move the first sibling to the middle.
+    reorder_project(&db, &charlie.id, 1).unwrap();
+    assert_eq!(names_at(&db, None), ["Alpha", "Charlie", "Bravo"]);
+
+    // Out-of-range indices clamp instead of failing.
+    reorder_project(&db, &alpha.id, 99).unwrap();
+    assert_eq!(names_at(&db, None), ["Charlie", "Bravo", "Alpha"]);
+
+    // Nested siblings reorder independently of the root tier.
+    reorder_project(&db, &nested_b.id, 0).unwrap();
+    assert_eq!(names_at(&db, Some(&folder.id)), ["Nested B", "Nested A"]);
+    reorder_project(&db, &nested_a.id, 0).unwrap();
+    assert_eq!(names_at(&db, Some(&folder.id)), ["Nested A", "Nested B"]);
+    assert_eq!(names_at(&db, None), ["Charlie", "Bravo", "Alpha"]);
+
+    // A move to the current slot is a no-op, and unknown ids error.
+    reorder_project(&db, &bravo.id, 1).unwrap();
+    assert_eq!(names_at(&db, None), ["Charlie", "Bravo", "Alpha"]);
+    assert!(reorder_project(&db, "missing", 0).is_err());
 }

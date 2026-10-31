@@ -125,6 +125,9 @@ struct SavedState {
     /// Overview Documents section body visibility.
     #[serde(default = "default_true")]
     projects_docs_open: bool,
+    /// Vim-style modal keys in markdown editors (on unless turned off).
+    #[serde(default = "default_true")]
+    vim_mode: bool,
 }
 
 /// Serde default for booleans that must start `true` in older saved sessions.
@@ -149,6 +152,7 @@ impl Default for SavedState {
             docs_tree_open: true,
             projects_tree_open: true,
             projects_docs_open: true,
+            vim_mode: true,
         }
     }
 }
@@ -242,6 +246,7 @@ impl KandriumApp {
             .and_then(|s| eframe::get_value(s, eframe::APP_KEY))
             .unwrap_or_default();
         theme::apply_visuals(&cc.egui_ctx, saved.dark_mode);
+        crate::widgets::vim::set_enabled(&cc.egui_ctx, saved.vim_mode);
 
         let db = open_db_or_die();
 
@@ -459,7 +464,7 @@ impl KandriumApp {
             match data {
                 BoardData::Real(b) => {
                     for col in &b.columns {
-                        for card in &col.cards {
+                        for card in col.ordered_cards() {
                             out.push(card.id.clone());
                         }
                     }
@@ -764,7 +769,7 @@ impl KandriumApp {
                     },
                     theme::Segment {
                         label: "Projects",
-                        icon: "briefcase",
+                        icon: "folder-kanban",
                     },
                     theme::Segment {
                         label: "Notes",
@@ -1237,7 +1242,7 @@ impl KandriumApp {
         if let Some((card_id, to_col, before)) = actions.card_drop {
             self.drag = None;
             self.run("Move failed", |db| {
-                kandrium_core::move_card(db, &card_id, &to_col, before.as_deref()).map(|_| ())
+                kandrium_core::move_area_card(db, &card_id, &to_col, before.as_deref()).map(|_| ())
             });
         }
         if let Some((col_id, before_col)) = actions.column_drop {
@@ -1500,8 +1505,8 @@ impl KandriumApp {
         let data = self.board.as_ref()?;
         match data {
             BoardData::Real(b) => b.columns.iter().find_map(|col| {
-                col.cards
-                    .iter()
+                col.ordered_cards()
+                    .into_iter()
                     .find(|c| c.id == card_id)
                     .map(|c| (c.clone(), None))
             }),
@@ -1524,7 +1529,8 @@ impl KandriumApp {
         match key {
             ColKey::Column(to_col) => {
                 self.run("Move failed", |db| {
-                    kandrium_core::move_card(db, &card_id, &to_col, before.as_deref()).map(|_| ())
+                    kandrium_core::move_area_card(db, &card_id, &to_col, before.as_deref())
+                        .map(|_| ())
                 });
             }
             ColKey::Bucket(to_status) => {
@@ -1646,6 +1652,9 @@ impl KandriumApp {
 impl eframe::App for KandriumApp {
     /// Drain watcher events and expire transient banners before painting.
     fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // The editor's status strip is the on/off switch for vim keys; keep
+        // the persisted preference in step with it.
+        self.saved.vim_mode = crate::widgets::vim::enabled(_ctx);
         // Bare `cargo run` binaries and the minimal dev `.app` carry no
         // bundle .icns; apply the dock icon from the first frame on. egui
         // repaints on demand, so request repaints until the icon is

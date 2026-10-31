@@ -34,6 +34,9 @@ pub fn body(
             let outer_h = avail.y.max(80.0);
             let t = Tokens::get(ui.ctx());
             let mut changed = false;
+            // Pinned widget id so the vim layer can load the same
+            // `TextEditState` from outside the scroll area.
+            let editor_id = ui.make_persistent_id(("markdown-editor", id));
             egui::Frame::new()
                 .fill(t.field)
                 .stroke(egui::Stroke::new(1.0, t.border))
@@ -41,7 +44,7 @@ pub fn body(
                 .inner_margin(egui::Margin::same(8))
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
-                    let inner_h = outer_h - 18.0; // margins + stroke
+                    let inner_h = outer_h - 18.0 - crate::widgets::vim::BAR_H; // margins + stroke + strip
                     egui::ScrollArea::vertical()
                         .id_salt(id.with("scroll"))
                         .max_height(inner_h)
@@ -53,19 +56,23 @@ pub fn body(
                                     job.wrap.max_width = wrap;
                                     ui.fonts_mut(|f| f.layout_job(job))
                                 };
-                            let resp = ui.add(
-                                egui::TextEdit::multiline(text)
-                                    .id_salt(id)
-                                    .frame(egui::Frame::new())
-                                    .desired_width(f32::INFINITY)
-                                    .font(egui::TextStyle::Monospace)
-                                    .layouter(&mut layouter)
-                                    .min_size(egui::vec2(ui.available_width(), inner_h)),
-                            );
-                            if resp.changed() {
+                            if crate::widgets::vim::pre_edit(ui.ctx(), editor_id, text) {
                                 changed = true;
                             }
+                            let output = egui::TextEdit::multiline(text)
+                                .id(editor_id)
+                                .frame(egui::Frame::new())
+                                .desired_width(f32::INFINITY)
+                                .font(egui::TextStyle::Monospace)
+                                .layouter(&mut layouter)
+                                .min_size(egui::vec2(ui.available_width(), inner_h))
+                                .show(ui);
+                            if output.response.response.changed() {
+                                changed = true;
+                            }
+                            crate::widgets::vim::paint(ui, editor_id, &output);
                         });
+                    crate::widgets::vim::status_bar(ui, editor_id);
                 });
             changed
         }

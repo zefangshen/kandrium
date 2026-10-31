@@ -39,6 +39,8 @@ pub struct Project {
     /// Short unique key shown in the tree and on cards (1–9 chars).
     pub identifier: String,
     pub description: String,
+    /// Free-form pointer to the project's source code (local folder or URL).
+    pub source: String,
     pub status: String,
     pub board_id: String,
     pub created_at: i64,
@@ -155,8 +157,7 @@ pub fn template(id: &str) -> Option<&'static ProjectTemplate> {
     TEMPLATES.iter().find(|t| t.id == id)
 }
 
-const PROJECT_COLUMNS: &str =
-    "id, folder_id, name, identifier, description, status, board_id, created_at, updated_at";
+const PROJECT_COLUMNS: &str = "id, folder_id, name, identifier, description, source, status, board_id, created_at, updated_at";
 
 // ---------------------------------------------------------------------------
 // Root resolution
@@ -213,7 +214,8 @@ pub fn list_tree(db: &Connection) -> Result<Vec<ProjectNode>> {
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let mut project_stmt = db.prepare(&format!(
-        "SELECT {PROJECT_COLUMNS} FROM projects ORDER BY position, name COLLATE NOCASE"
+        "SELECT {PROJECT_COLUMNS} FROM projects WHERE archived = 0 \
+         ORDER BY position, name COLLATE NOCASE"
     ))?;
     let projects = project_stmt
         .query_map([], map_project)?
@@ -418,6 +420,21 @@ pub fn update_project(
     get_project(db, id)
 }
 
+/// Point a project at its source code (local folder path or URL). The value
+/// is trimmed; an empty string clears the reference.
+pub fn set_source(db: &Connection, id: &str, source: &str) -> Result<Project> {
+    let source = source.trim();
+    let now = now_unix();
+    let changed = db.execute(
+        "UPDATE projects SET source = ?, updated_at = ? WHERE id = ?",
+        rusqlite::params![source, now, id],
+    )?;
+    if changed == 0 {
+        return Err(KandriumError::new("Project not found"));
+    }
+    get_project(db, id)
+}
+
 /// Pin a project's identifier. Lowercases and validates the value, then flips
 /// `identifier_locked` so later renames leave it alone.
 pub fn set_identifier(db: &Connection, id: &str, identifier: &str) -> Result<Project> {
@@ -446,7 +463,8 @@ pub fn set_identifier(db: &Connection, id: &str, identifier: &str) -> Result<Pro
 /// Flat project list for the card modal's project picker.
 pub fn list_project_choices(db: &Connection) -> Result<Vec<ProjectChoice>> {
     let mut stmt = db.prepare(
-        "SELECT id, name, identifier FROM projects ORDER BY position, name COLLATE NOCASE",
+        "SELECT id, name, identifier FROM projects WHERE archived = 0 \
+         ORDER BY position, name COLLATE NOCASE",
     )?;
     let choices = stmt
         .query_map([], |r| {
@@ -543,6 +561,47 @@ fn identifier_taken(db: &Connection, identifier: &str, exclude_id: Option<&str>)
     Ok(found > 0)
 }
 
+/// Move a project to `index` among its siblings (same `folder_id`).
+///
+/// `index` is clamped to the sibling range, so callers can pass a raw drop
+/// index without bounds juggling. Only `projects.position` is rewritten:
+/// folders keep their own sequence and always render above projects, so their
+/// ordering is unaffected.
+pub fn reorder_project(db: &Connection, id: &str, index: usize) -> Result<()> {
+    let folder_id: Option<String> = db
+        .query_row("SELECT folder_id FROM projects WHERE id = ?", [id], |r| {
+            r.get(0)
+        })
+        .optional()?
+        .ok_or_else(|| KandriumError::new("Project not found"))?;
+
+    let mut siblings: Vec<String> = {
+        let mut stmt = db.prepare(
+            "SELECT id FROM projects WHERE folder_id IS ? AND archived = 0 \
+             ORDER BY position, name COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![folder_id], |r| r.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let current = siblings
+        .iter()
+        .position(|sibling| sibling == id)
+        .ok_or_else(|| KandriumError::new("Project not found"))?;
+    siblings.remove(current);
+    let index = index.min(siblings.len());
+    siblings.insert(index, id.to_string());
+
+    let tx = db.unchecked_transaction()?;
+    for (position, sibling) in siblings.iter().enumerate() {
+        tx.execute(
+            "UPDATE projects SET position = ? WHERE id = ?",
+            rusqlite::params![position as i64, sibling],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Delete a project: its row and its board (cascading columns → cards →
 /// all_card_order), then its on-disk folder.
 pub fn delete_project(db: &Connection, root: &Path, id: &str) -> Result<()> {
@@ -557,6 +616,60 @@ pub fn delete_project(db: &Connection, root: &Path, id: &str) -> Result<()> {
     tx.execute("DELETE FROM boards WHERE id = ?", [board_id])?;
     tx.commit()?;
     remove_dir_ignore_missing(&project_dir(root, id))
+}
+
+// ---------------------------------------------------------------------------
+// Archive
+// ---------------------------------------------------------------------------
+
+/// Archive a project: it disappears from the tree and pickers, while its
+/// board, cards, documents, and on-disk folder stay untouched.
+pub fn archive_project(db: &Connection, id: &str) -> Result<()> {
+    let changed = db.execute(
+        "UPDATE projects SET archived = 1, archived_at = datetime('now') \
+         WHERE id = ? AND archived = 0",
+        [id],
+    )?;
+    if changed == 0 {
+        // Either the id is unknown or it was already archived; treat the
+        // latter as success so a stale menu click cannot surface an error.
+        let exists: bool = db
+            .query_row("SELECT 1 FROM projects WHERE id = ?", [id], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            return Err(KandriumError::new("Project not found"));
+        }
+    }
+    Ok(())
+}
+
+/// Restore an archived project to the active tree.
+pub fn unarchive_project(db: &Connection, id: &str) -> Result<()> {
+    let changed = db.execute(
+        "UPDATE projects SET archived = 0, archived_at = NULL WHERE id = ? AND archived = 1",
+        [id],
+    )?;
+    if changed == 0 {
+        let exists: bool = db
+            .query_row("SELECT 1 FROM projects WHERE id = ?", [id], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            return Err(KandriumError::new("Project not found"));
+        }
+    }
+    Ok(())
+}
+
+/// Archived projects, newest archive first, for the archive panel.
+pub fn list_archived_projects(db: &Connection) -> Result<Vec<Project>> {
+    let mut stmt = db.prepare(&format!(
+        "SELECT {PROJECT_COLUMNS} FROM projects WHERE archived = 1 \
+         ORDER BY archived_at DESC, name COLLATE NOCASE"
+    ))?;
+    let rows = stmt.query_map([], map_project)?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
 // ---------------------------------------------------------------------------
@@ -808,10 +921,11 @@ fn map_project(r: &rusqlite::Row) -> rusqlite::Result<Project> {
         name: r.get(2)?,
         identifier: r.get(3)?,
         description: r.get(4)?,
-        status: r.get(5)?,
-        board_id: r.get(6)?,
-        created_at: r.get(7)?,
-        updated_at: r.get(8)?,
+        source: r.get(5)?,
+        status: r.get(6)?,
+        board_id: r.get(7)?,
+        created_at: r.get(8)?,
+        updated_at: r.get(9)?,
     })
 }
 
@@ -900,6 +1014,61 @@ mod tests {
     }
 
     #[test]
+    fn archive_is_reversible_and_keeps_files() {
+        let f = fixture();
+        let keep = create_project(&f.db, &f.root, "Keep", None, "blank").unwrap();
+        let gone = create_project(&f.db, &f.root, "Gone", None, "software").unwrap();
+        let dir = project_dir(&f.root, &gone.id);
+        assert!(dir.join("README.md").is_file());
+
+        archive_project(&f.db, &gone.id).unwrap();
+
+        let tree = list_tree(&f.db).unwrap();
+        assert!(find_project(&tree, &gone.id).is_none());
+        assert!(find_project(&tree, &keep.id).is_some());
+        let archived = list_archived_projects(&f.db).unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].id, gone.id);
+        assert!(
+            list_project_choices(&f.db)
+                .unwrap()
+                .iter()
+                .all(|c| c.id != gone.id)
+        );
+        // Archiving never touches the on-disk folder.
+        assert!(dir.join("README.md").is_file());
+
+        unarchive_project(&f.db, &gone.id).unwrap();
+        assert!(find_project(&list_tree(&f.db).unwrap(), &gone.id).is_some());
+        assert!(list_archived_projects(&f.db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reorder_ignores_archived_siblings() {
+        let f = fixture();
+        let a = create_project(&f.db, &f.root, "A", None, "blank").unwrap();
+        let b = create_project(&f.db, &f.root, "B", None, "blank").unwrap();
+        let c = create_project(&f.db, &f.root, "C", None, "blank").unwrap();
+        archive_project(&f.db, &b.id).unwrap();
+
+        reorder_project(&f.db, &c.id, 0).unwrap();
+
+        fn project_names(nodes: &[ProjectNode]) -> Vec<String> {
+            let mut out = Vec::new();
+            for node in nodes {
+                match node {
+                    ProjectNode::Folder { children, .. } => out.extend(project_names(children)),
+                    ProjectNode::Project(p) => out.push(p.name.clone()),
+                }
+            }
+            out
+        }
+        let tree = list_tree(&f.db).unwrap();
+        assert_eq!(project_names(&tree), ["C", "A"]);
+        assert!(find_project(&tree, &a.id).is_some());
+    }
+
+    #[test]
     fn list_tree_nests_and_orders() {
         let f = fixture();
         let work = create_folder(&f.db, "Work", None).unwrap();
@@ -956,6 +1125,24 @@ mod tests {
         let after = get_project(&f.db, &project.id).unwrap();
         assert_eq!(after.status, "on_hold");
         assert_eq!(after.description, "hello");
+    }
+
+    #[test]
+    fn source_defaults_empty_and_set_source_roundtrips() {
+        let f = fixture();
+        let project = create_project(&f.db, &f.root, "Src", None, "blank").unwrap();
+        assert_eq!(project.source, "");
+
+        let updated = set_source(&f.db, &project.id, "  ~/code/src  ").unwrap();
+        assert_eq!(updated.source, "~/code/src");
+        assert_eq!(
+            get_project(&f.db, &project.id).unwrap().source,
+            "~/code/src"
+        );
+
+        // Emptying the field clears the reference.
+        assert_eq!(set_source(&f.db, &project.id, "  ").unwrap().source, "");
+        assert!(set_source(&f.db, "missing", "x").is_err());
     }
 
     #[test]

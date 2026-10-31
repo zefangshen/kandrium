@@ -69,6 +69,7 @@ pub fn create_card(db: &Connection, col_id: &str, data: &CreateCardBody) -> Resu
         area_board_id: None,
         project_identifier,
         meta_label: None,
+        display_position: 0,
     })
 }
 
@@ -312,6 +313,138 @@ pub fn move_card(
         }
     }
     tx.commit()?;
+
+    // A card move can change what a non-project board displays: its own card
+    // order, a mirror's status (project card moved on its project board), or
+    // whether a mirror is still visible (cross-board move). Keep the unified
+    // area order in step instead of leaving it to the next load. Project
+    // boards are a no-op inside `sync_area_order`.
+    let mut area_boards = vec![target_board_id];
+    if let Some(source) = source_board_id {
+        area_boards.push(source);
+    }
+    if let Some(area) = db
+        .query_row(
+            "SELECT area_board_id FROM cards WHERE id = ?",
+            [card_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+    {
+        area_boards.push(area);
+    }
+    area_boards.sort();
+    area_boards.dedup();
+    for board in area_boards {
+        crate::services::board::sync_area_order(db, &board)?;
+    }
+    Ok(OkResult::ok())
+}
+
+/// Move/reorder a card on a non-project ("Tasks"/area) board, where the
+/// board's own cards and the project cards filed to it share one display
+/// order (`area_card_order`).
+///
+/// - Native card: reordered inside the unified order (and moved to the target
+///   column when the status changed); `cards.position` is kept in step.
+/// - Mirrored project card: stays in its real project column. A status change
+///   moves it to the matching column on its project board; either way only the
+///   area board's slot changes, so it can be dragged between native cards.
+///
+/// Falls back to [`move_card`] for project boards and for columns that don't
+/// map to a canonical status (there is no unified order to update).
+pub fn move_area_card(
+    db: &Connection,
+    card_id: &str,
+    to_col_id: &str,
+    before_card_id: Option<&str>,
+) -> Result<OkResult> {
+    let card = get_full_card(db, card_id)?.ok_or_else(|| KandriumError::new("Card not found"))?;
+
+    let target: Option<(String, String)> = db
+        .query_row(
+            "SELECT board_id, title FROM columns WHERE id = ?",
+            [to_col_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((target_board_id, target_title)) = target else {
+        return Err(KandriumError::new("Column not found"));
+    };
+    let Some(target_status) = status_from_column_title(&target_title) else {
+        return move_card(db, card_id, to_col_id, before_card_id);
+    };
+    let project_board: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM projects WHERE board_id = ?)",
+        [&target_board_id],
+        |r| r.get(0),
+    )?;
+    if project_board {
+        return move_card(db, card_id, to_col_id, before_card_id);
+    }
+
+    // A card is a mirror on this board when it physically lives on a project
+    // board and is filed here.
+    let home_project_board: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM projects p JOIN columns col ON col.board_id = p.board_id \
+         WHERE col.id = ?)",
+        [&card.column_id],
+        |r| r.get(0),
+    )?;
+    let area_board_id: Option<String> = db.query_row(
+        "SELECT area_board_id FROM cards WHERE id = ?",
+        [card_id],
+        |r| r.get(0),
+    )?;
+    let mirrored = home_project_board && area_board_id.as_deref() == Some(target_board_id.as_str());
+
+    if mirrored {
+        let home_column_title: Option<String> = db
+            .query_row(
+                "SELECT title FROM columns WHERE id = ?",
+                [&card.column_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let current_status = home_column_title
+            .as_deref()
+            .and_then(status_from_column_title);
+        if current_status != Some(target_status) {
+            let project_board_id: String = db.query_row(
+                "SELECT p.board_id FROM projects p \
+                 JOIN columns col ON col.board_id = p.board_id WHERE col.id = ?",
+                [&card.column_id],
+                |r| r.get(0),
+            )?;
+            let target_col =
+                status_column_id(db, &project_board_id, target_status)?.ok_or_else(|| {
+                    KandriumError::new(format!(
+                        "\"{}\" column not found on the project board",
+                        target_status.title()
+                    ))
+                })?;
+            move_card(db, card_id, &target_col, None)?;
+        }
+    } else if card.column_id != to_col_id {
+        move_card(db, card_id, to_col_id, None)?;
+    }
+
+    crate::services::board::reorder_area_bucket(
+        db,
+        &target_board_id,
+        target_status,
+        card_id,
+        before_card_id,
+    )?;
+    if !mirrored {
+        crate::services::board::reindex_area_native_positions(
+            db,
+            &target_board_id,
+            target_status,
+            to_col_id,
+        )?;
+    }
     Ok(OkResult::ok())
 }
 
@@ -374,7 +507,10 @@ pub fn move_card_to_status(db: &Connection, card_id: &str, status: CardStatus) -
         )));
     };
 
-    reorder_column_cards(db, &target_col, &card)
+    reorder_column_cards(db, &target_col, &card)?;
+    // The card's home board may be a non-project board with a unified order.
+    crate::services::board::sync_area_order(db, &board_id)?;
+    Ok(OkResult::ok())
 }
 
 /// Move a card to a DIFFERENT board, landing it in the column whose canonical
@@ -625,6 +761,21 @@ pub fn list_archived_cards(db: &Connection) -> Result<ArchivedCardsResult> {
 
 fn to_labels_json(labels: &[i64]) -> Result<String> {
     Ok(serde_json::to_string(labels)?)
+}
+
+/// Column of `board_id` whose normalized title matches a canonical status.
+fn status_column_id(db: &Connection, board_id: &str, status: CardStatus) -> Result<Option<String>> {
+    let mut stmt =
+        db.prepare("SELECT id, title FROM columns WHERE board_id = ? ORDER BY position")?;
+    let columns = stmt
+        .query_map([board_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(columns
+        .into_iter()
+        .find(|(_, title)| status_from_column_title(title) == Some(status))
+        .map(|(id, _)| id))
 }
 
 /// Fetch the full internal card row (all columns).

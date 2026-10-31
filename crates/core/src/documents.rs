@@ -127,6 +127,61 @@ pub fn write_text(path: &Path, root: &Path, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Create an empty folder inside `parent` (which must be an existing folder
+/// below `root`). Returns the new folder's absolute path.
+pub fn create_folder(parent: &Path, root: &Path, name: &str) -> Result<PathBuf> {
+    let parent = guarded_parent(parent, root)?;
+    let name = validate_create_name(name)?;
+    let target = fsutil::guard(root, &parent.join(name))?;
+    if target.exists() {
+        return Err(KandriumError::new(format!("\"{name}\" already exists")));
+    }
+    fs::create_dir(&target)?;
+    Ok(target)
+}
+
+/// Create an empty Markdown file inside `parent`. A bare name gets `.md`;
+/// `.md` and `.markdown` are accepted. Returns the new file's absolute path.
+pub fn create_markdown(parent: &Path, root: &Path, name: &str) -> Result<PathBuf> {
+    let parent = guarded_parent(parent, root)?;
+    let mut name = validate_create_name(name)?.to_string();
+    if Path::new(&name).extension().is_none() {
+        name.push_str(".md");
+    }
+    if !is_markdown(Path::new(&name)) {
+        return Err(KandriumError::new("Use a .md or .markdown file"));
+    }
+    let target = fsutil::guard(root, &parent.join(&name))?;
+    if target.exists() {
+        return Err(KandriumError::new(format!("\"{name}\" already exists")));
+    }
+    fs::write(&target, "")?;
+    Ok(target)
+}
+
+fn guarded_parent(parent: &Path, root: &Path) -> Result<PathBuf> {
+    let parent = fsutil::guard(root, parent)?;
+    if !parent.is_dir() {
+        return Err(KandriumError::new("Parent folder not found"));
+    }
+    Ok(parent)
+}
+
+/// Validate a user-entered file/folder name. Hidden names and path
+/// separators are rejected; the trimmed name is returned.
+fn validate_create_name(name: &str) -> Result<&str> {
+    let name = name.trim();
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.starts_with('.')
+        || name.contains(['/', '\\'])
+    {
+        return Err(KandriumError::new("Invalid name"));
+    }
+    Ok(name)
+}
+
 /// Copy a local PDF or Markdown file into `dest_dir` inside the documents
 /// root. Existing names are never overwritten: collisions gain a `-2`,
 /// `-3`, … suffix before the extension (`report.pdf` → `report-2.pdf`).
@@ -375,6 +430,35 @@ mod tests {
             import_file(&src.join("outside.pdf"), f._tmp.path(), &f.root).is_err(),
             "upload target outside the root must be rejected"
         );
+    }
+
+    #[test]
+    fn create_folder_and_markdown_files_are_guarded_and_validated() {
+        let f = fixture();
+        let folder = create_folder(&f.root, &f.root, "  Papers  ").unwrap();
+        assert!(folder.ends_with("Papers"));
+        assert!(folder.is_dir());
+
+        let nested = create_markdown(&folder, &f.root, "Notes").unwrap();
+        assert!(nested.ends_with("Papers/Notes.md"));
+        assert_eq!(fs::read_to_string(&nested).unwrap(), "");
+
+        let markdown = create_markdown(&f.root, &f.root, "ideas.markdown").unwrap();
+        assert!(markdown.ends_with("ideas.markdown"));
+
+        // Bare names gain .md, while other extensions and invalid names fail.
+        assert!(
+            create_markdown(&f.root, &f.root, "plain")
+                .unwrap()
+                .ends_with("plain.md")
+        );
+        assert!(create_markdown(&f.root, &f.root, "other.txt").is_err());
+        assert!(create_markdown(&f.root, &f.root, "a/b.md").is_err());
+        assert!(create_folder(&f.root, &f.root, ".hidden").is_err());
+        assert!(create_folder(&f.root, &f.root, "").is_err());
+        assert!(create_folder(&f.root, &f.root, "Papers").is_err());
+        assert!(create_markdown(&f.root.join("missing"), &f.root, "x.md").is_err());
+        assert!(create_folder(f._tmp.path(), &f.root, "escape").is_err());
     }
 
     #[test]

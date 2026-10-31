@@ -1,6 +1,6 @@
--- Kandrium schema v2 — Projects. Kept in a separate file from schema.sql so
--- the v1 shape stays byte-identical to the legacy Drizzle schema (the row-copy
--- importer and MCP clients depend on that shape).
+-- Kandrium schema v2 — Projects. Kept in a separate file from the initial
+-- schema so the v1 shape stays byte-identical to the legacy Drizzle schema
+-- (the row-copy importer and MCP clients depend on that shape).
 -- Applied idempotently by db::run_schema via PRAGMA user_version.
 
 CREATE TABLE IF NOT EXISTS project_folders (

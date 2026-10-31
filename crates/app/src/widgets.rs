@@ -6,6 +6,7 @@ pub mod column;
 pub mod confirm;
 pub mod markdown;
 pub mod tabs;
+pub mod vim;
 
 /// Width of the collapsed left-panel ("sidebar") rail. Panel collapse helpers
 /// below keep the three tree pages (Projects, Notes, Documents) consistent.

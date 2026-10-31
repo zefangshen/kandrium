@@ -6,7 +6,7 @@
 
 use egui::{CornerRadius, Label, Layout, Rect, TextWrapMode, Ui};
 
-use kandrium_core::Column;
+use kandrium_core::{Card, Column};
 
 use crate::anim;
 use crate::icons;
@@ -162,61 +162,28 @@ pub fn show_column(
             // the baseline; 108px per card covers all common variants at
             // the app's 1.2x font scale while still triggering the scroll
             // threshold sensibly.
-            let estimated = (column.cards.len() + column.mirrored.len()) as f32 * 108.0;
+            //
+            // `ordered_cards` merges the column's own cards with the project
+            // cards mirrored onto it into the board's single display order, so
+            // both kinds are rendered — and dragged — as one list.
+            let ordered = column.ordered_cards();
+            let estimated = ordered.len() as f32 * 108.0;
             if estimated <= max_body {
                 // Direct layout — cards grow/shrink column naturally. Inset
                 // so the cards' right edge matches the classic 8px margin
                 // (the ScrollArea branch below runs 7px further right).
                 crate::widgets::right_inset(ui, |ui| {
-                    let mut rendered = 0usize;
-                    for card in &column.cards {
-                        if Some(card.id.as_str()) == dragging_card_id {
-                            continue;
-                        }
-                        if gap_idx == Some(rendered) {
-                            anim::gap_slot(ui, gap_height);
-                        }
-                        let editing = edit_card == Some(card.id.as_str());
-                        let chip = card_chip(
-                            ui,
-                            card,
-                            None,
-                            anim::stagger_order(gap_idx, rendered),
-                            if editing {
-                                Some(&mut *edit_draft)
-                            } else {
-                                None
-                            },
-                            true,
-                        );
-                        if chip.response.clicked() {
-                            actions.open_card = Some(card.id.clone());
-                        }
-                        if chip.edit_clicked {
-                            actions.edit_card = Some(card.id.clone());
-                        }
-                        if chip.edit_commit {
-                            actions.edit_commit = Some(card.id.clone());
-                        }
-                        if chip.edit_cancel {
-                            actions.edit_cancel = Some(card.id.clone());
-                        }
-                        match card_context_menu(&chip.response) {
-                            Some(CardMenuAction::Archive) => {
-                                actions.archive_card = Some(card.id.clone());
-                            }
-                            Some(CardMenuAction::Delete) => {
-                                actions.delete_card = Some(card.id.clone());
-                            }
-                            None => {}
-                        }
-                        card_rects.push((card.id.clone(), chip.response.rect));
-                        rendered += 1;
-                    }
-                    if gap_idx == Some(rendered) {
-                        anim::gap_slot(ui, gap_height);
-                    }
-                    mirrored_cards(ui, column, edit_card, edit_draft, &mut actions);
+                    render_cards(
+                        ui,
+                        &ordered,
+                        dragging_card_id,
+                        gap_idx,
+                        gap_height,
+                        edit_card,
+                        edit_draft,
+                        &mut actions,
+                        &mut card_rects,
+                    );
                 });
             } else {
                 egui::ScrollArea::vertical()
@@ -236,55 +203,17 @@ pub fn show_column(
                     // content exceeds max_body it caps and scrolls instead.
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        let mut rendered = 0usize;
-                        for card in &column.cards {
-                            if Some(card.id.as_str()) == dragging_card_id {
-                                continue;
-                            }
-                            if gap_idx == Some(rendered) {
-                                anim::gap_slot(ui, gap_height);
-                            }
-                            let editing = edit_card == Some(card.id.as_str());
-                            let chip = card_chip(
-                                ui,
-                                card,
-                                None,
-                                anim::stagger_order(gap_idx, rendered),
-                                if editing {
-                                    Some(&mut *edit_draft)
-                                } else {
-                                    None
-                                },
-                                true,
-                            );
-                            if chip.response.clicked() {
-                                actions.open_card = Some(card.id.clone());
-                            }
-                            if chip.edit_clicked {
-                                actions.edit_card = Some(card.id.clone());
-                            }
-                            if chip.edit_commit {
-                                actions.edit_commit = Some(card.id.clone());
-                            }
-                            if chip.edit_cancel {
-                                actions.edit_cancel = Some(card.id.clone());
-                            }
-                            match card_context_menu(&chip.response) {
-                                Some(CardMenuAction::Archive) => {
-                                    actions.archive_card = Some(card.id.clone());
-                                }
-                                Some(CardMenuAction::Delete) => {
-                                    actions.delete_card = Some(card.id.clone());
-                                }
-                                None => {}
-                            }
-                            card_rects.push((card.id.clone(), chip.response.rect));
-                            rendered += 1;
-                        }
-                        if gap_idx == Some(rendered) {
-                            anim::gap_slot(ui, gap_height);
-                        }
-                        mirrored_cards(ui, column, edit_card, edit_draft, &mut actions);
+                        render_cards(
+                            ui,
+                            &ordered,
+                            dragging_card_id,
+                            gap_idx,
+                            gap_height,
+                            edit_card,
+                            edit_draft,
+                            &mut actions,
+                            &mut card_rects,
+                        );
                     });
             }
             let body_bottom = ui.cursor().top();
@@ -373,41 +302,44 @@ pub fn show_column(
     actions
 }
 
-/// Render project cards filed to this area board after the column's own
-/// cards. Mirrored cards can be opened, renamed inline and archived, but they
-/// are not drag sources and never become drop anchors: their position is
-/// owned by their project board.
-fn mirrored_cards(
+/// Render the column's cards in the board's unified display order.
+///
+/// Native cards and mirrored project cards are the same chip here: both are
+/// clickable, editable, draggable and collect a rect in `card_rects`, so the
+/// drop zone accepts gaps between any two cards (and before the first /
+/// after the last) regardless of which kind they are.
+#[allow(clippy::too_many_arguments)]
+fn render_cards(
     ui: &mut Ui,
-    column: &Column,
+    cards: &[&Card],
+    dragging_card_id: Option<&str>,
+    gap_idx: Option<usize>,
+    gap_height: f32,
     edit_card: Option<&str>,
     edit_draft: &mut String,
     actions: &mut ColumnActions,
+    card_rects: &mut Vec<(String, Rect)>,
 ) {
-    if column.mirrored.is_empty() {
-        return;
-    }
-    let t = Tokens::get(ui.ctx());
-    ui.add_space(4.0);
-    let (rule, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
-    ui.painter()
-        .rect_filled(rule, egui::CornerRadius::ZERO, t.divider);
-    ui.add_space(4.0);
-
-    for card in &column.mirrored {
+    let mut rendered = 0usize;
+    for card in cards {
+        if dragging_card_id == Some(card.id.as_str()) {
+            continue;
+        }
+        if gap_idx == Some(rendered) {
+            anim::gap_slot(ui, gap_height);
+        }
         let editing = edit_card == Some(card.id.as_str());
         let chip = card_chip(
             ui,
             card,
             None,
-            0,
+            anim::stagger_order(gap_idx, rendered),
             if editing {
                 Some(&mut *edit_draft)
             } else {
                 None
             },
-            false,
+            true,
         );
         if chip.response.clicked() {
             actions.open_card = Some(card.id.clone());
@@ -430,6 +362,11 @@ fn mirrored_cards(
             }
             None => {}
         }
+        card_rects.push((card.id.clone(), chip.response.rect));
+        rendered += 1;
+    }
+    if gap_idx == Some(rendered) {
+        anim::gap_slot(ui, gap_height);
     }
 }
 

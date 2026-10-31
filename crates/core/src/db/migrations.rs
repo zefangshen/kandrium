@@ -1,145 +1,58 @@
-//! Database open/path resolution, schema runner, and id generation.
+//! Schema migration definitions and runner.
 //!
-//! Port of `src/main/services/database-service.ts` (minus the Drizzle runner —
-//! the fresh Rust database is versioned by `rusqlite_migration` via
-//! `PRAGMA user_version` instead).
+//! The SQL files live at the workspace root (`migrations/000X_*.sql`) and are
+//! embedded at compile time. `rusqlite_migration` tracks the applied version in
+//! `PRAGMA user_version`, so v1 databases upgrade through only the missing
+//! steps and a database from a future schema is rejected.
 
-use std::path::PathBuf;
-use std::time::Duration;
-
-use rand::Rng;
 use rusqlite::Connection;
 use rusqlite_migration::{HookError, M, Migrations};
 
 use crate::error::{KandriumError, Result};
 
 /// Embedded schema, applied idempotently.
-pub const SCHEMA_SQL: &str = include_str!("schema.sql");
+pub const SCHEMA_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../migrations/0001_initial_schema.sql"
+));
 /// Additive v2 step (Projects). Separate from `SCHEMA_SQL` so the v1 shape
 /// stays byte-identical to the legacy Drizzle schema.
-pub const SCHEMA_V2_SQL: &str = include_str!("schema_v2.sql");
+pub const SCHEMA_V2_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../migrations/0002_add_projects.sql"
+));
 /// Additive v3 step (project identifiers + card ↔ project links).
-pub const SCHEMA_V3_SQL: &str = include_str!("schema_v3.sql");
+pub const SCHEMA_V3_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../migrations/0003_add_project_identifiers.sql"
+));
 /// v4 step: normalize project identifiers to their canonical lowercase form.
-pub const SCHEMA_V4_SQL: &str = include_str!("schema_v4.sql");
+pub const SCHEMA_V4_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../migrations/0004_lowercase_identifiers.sql"
+));
+/// Additive v5 step (unified display order for non-project boards).
+pub const SCHEMA_V5_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../migrations/0005_area_card_order.sql"
+));
+/// Additive v6 step (archived projects).
+pub const SCHEMA_V6_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../migrations/0006_archive_projects.sql"
+));
+/// Additive v7 step (project source reference).
+pub const SCHEMA_V7_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../migrations/0007_project_source.sql"
+));
 /// Latest schema version. Must match the number of entries in the migration set.
-pub const SCHEMA_VERSION: i64 = 4;
-
-/// Generate an id in the same format as the TS app: 12 random bytes as hex
-/// (`crypto.randomBytes(12).toString('hex')` → 24 lowercase hex chars).
-pub fn uid() -> String {
-    let mut bytes = [0u8; 12];
-    rand::rng().fill_bytes(&mut bytes);
-    let mut s = String::with_capacity(24);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
-
-/// Resolve the Kandrium database path:
-/// 1. `KANDRIUM_DB` env var (explicit override)
-/// 2. `<data_dir>/kandrium/kandrium.db`
-pub fn resolve_db_path() -> PathBuf {
-    if let Some(p) = std::env::var_os("KANDRIUM_DB") {
-        return PathBuf::from(p);
-    }
-    data_dir().join("kandrium").join("kandrium.db")
-}
-
-/// Resolve the legacy Electron app database path (read source for the importer):
-/// 1. `KANDRIUM_OLD_DB` env var
-/// 2. `<data_dir>/planly/planly.db` (same default the Electron app uses)
-pub fn resolve_old_db_path() -> PathBuf {
-    if let Some(p) = std::env::var_os("KANDRIUM_OLD_DB") {
-        return PathBuf::from(p);
-    }
-    data_dir().join("planly").join("planly.db")
-}
-
-fn data_dir() -> PathBuf {
-    dirs::data_dir().unwrap_or_else(|| PathBuf::from("."))
-}
-
-/// If the Kandrium database does not exist yet but the pre-rebrand database
-/// (`<data_dir>/planly-rs/planly.db`) does, snapshot the old database into the
-/// new location so existing boards and cards carry over after the rename.
-/// Returns the path migrated from when a migration happened.
-///
-/// Only the default location participates — a `KANDRIUM_DB` override is left
-/// untouched. The source is staged in a scratch directory (the same approach
-/// as the legacy importer) and copied with `VACUUM INTO`, which folds the WAL
-/// into one consistent file and never writes to the user's original database.
-pub fn migrate_legacy_db() -> Result<Option<PathBuf>> {
-    if std::env::var_os("KANDRIUM_DB").is_some() {
-        return Ok(None);
-    }
-    let target = resolve_db_path();
-    if target.exists() {
-        return Ok(None);
-    }
-    let legacy = data_dir().join("planly-rs").join("planly.db");
-    if !legacy.exists() {
-        return Ok(None);
-    }
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let scratch = std::env::temp_dir().join(format!("kandrium-migrate-{}", uid()));
-    std::fs::create_dir_all(&scratch)?;
-    let staged = scratch.join("old.db");
-    let result = (|| {
-        std::fs::copy(&legacy, &staged)?;
-        for suffix in ["-wal", "-shm"] {
-            let side = legacy.with_extension(format!("db{suffix}"));
-            if side.exists() {
-                std::fs::copy(side, staged.with_extension(format!("db{suffix}")))?;
-            }
-        }
-        let src = Connection::open(&staged)?;
-        // Escape single quotes for the SQLite filename string literal.
-        let target_sql = target.to_string_lossy().replace('\'', "''");
-        src.execute_batch(&format!("VACUUM INTO '{target_sql}'"))?;
-        Ok::<(), KandriumError>(())
-    })();
-
-    std::fs::remove_dir_all(&scratch).ok();
-    if result.is_err() {
-        // VACUUM INTO writes the target incrementally and leaves the partial
-        // file behind on failure. Remove it (and any WAL sidecars) so the next
-        // boot doesn't mistake the half-written file for a completed migration
-        // and initialize an empty schema over it.
-        for path in [
-            target.clone(),
-            target.with_extension("db-wal"),
-            target.with_extension("db-shm"),
-        ] {
-            std::fs::remove_file(path).ok();
-        }
-    }
-    result?;
-    Ok(Some(legacy))
-}
-
-/// Open a Kandrium SQLite database with the standard pragmas.
-/// WAL + busy_timeout allow the app and MCP server processes to share one DB.
-pub fn open_db(path: &std::path::Path) -> Result<Connection> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let db = Connection::open(path)?;
-    // journal_mode returns a row, so it must be queried, not just executed.
-    let _: String = db.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
-    db.pragma_update(None, "foreign_keys", "ON")?;
-    db.busy_timeout(Duration::from_millis(5000))?;
-    Ok(db)
-}
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// The ordered migration set. `rusqlite_migration` tracks the applied version
 /// in `PRAGMA user_version`, so v1 databases upgrade through only the missing
 /// steps and a database from a future schema is rejected.
-fn migrations() -> Migrations<'static> {
+pub(crate) fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(SCHEMA_SQL),
         M::up(SCHEMA_V2_SQL),
@@ -147,6 +60,9 @@ fn migrations() -> Migrations<'static> {
             backfill_v3(tx).map_err(|e| HookError::Hook(e.0))
         }),
         M::up(SCHEMA_V4_SQL),
+        M::up(SCHEMA_V5_SQL),
+        M::up(SCHEMA_V6_SQL),
+        M::up(SCHEMA_V7_SQL),
     ])
 }
 
@@ -207,50 +123,10 @@ fn backfill_v3(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// True when the database has at least one board (i.e. seed/import already ran).
-pub fn has_boards(db: &Connection) -> Result<bool> {
-    let count: i64 = db.query_row("SELECT COUNT(*) FROM boards", [], |r| r.get(0))?;
-    Ok(count > 0)
-}
-
-/// Convenience: open + schema + (conditionally) seed, the standard bootstrap
-/// shared by the app and MCP binaries.
-pub fn bootstrap(db: &mut Connection) -> Result<()> {
-    run_schema(db)?;
-    crate::seed::seed(db)
-}
-
-/// Parse a `labels` JSON column into a vector, defaulting to empty on null-ish
-/// input (mirrors `JSON.parse(r.labels || '[]')`).
-pub fn parse_labels(json: &str) -> Result<Vec<i64>> {
-    if json.trim().is_empty() {
-        return Ok(vec![]);
-    }
-    serde_json::from_str(json).map_err(|e| KandriumError(format!("invalid labels JSON: {e}")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn uid_format() {
-        let id = uid();
-        assert_eq!(id.len(), 24);
-        assert!(
-            id.chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-        );
-        assert_ne!(uid(), uid());
-    }
-
-    #[test]
-    fn parse_labels_cases() {
-        assert_eq!(parse_labels("[]").unwrap(), vec![] as Vec<i64>);
-        assert_eq!(parse_labels("[1,4]").unwrap(), vec![1, 4]);
-        assert_eq!(parse_labels("").unwrap(), vec![] as Vec<i64>);
-        assert!(parse_labels("nope").is_err());
-    }
+    use crate::db::connection::open_db;
 
     #[test]
     fn migrations_validate() {
@@ -285,6 +161,49 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION + 1);
     }
 
+    /// A v4 database only gains the additive v5 table; existing rows are
+    /// untouched (the step is `CREATE TABLE IF NOT EXISTS` plus indexes).
+    #[test]
+    fn v4_database_gains_the_area_order_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open_db(&dir.path().join("t.db")).unwrap();
+        Migrations::new(vec![
+            M::up(SCHEMA_SQL),
+            M::up(SCHEMA_V2_SQL),
+            M::up(SCHEMA_V3_SQL),
+            M::up(SCHEMA_V4_SQL),
+        ])
+        .to_latest(&mut db)
+        .unwrap();
+        db.execute(
+            "INSERT INTO boards (id, title, position) VALUES ('b1', 'Board', 0)",
+            [],
+        )
+        .unwrap();
+
+        run_schema(&mut db).unwrap();
+
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let tables: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'area_card_order'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 1);
+        let boards: i64 = db
+            .query_row("SELECT COUNT(*) FROM boards WHERE id = 'b1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(boards, 1);
+    }
+
     /// A v1 database (user_version = 1, only the v1 tables) upgrades through
     /// the additive batches without touching existing rows.
     #[test]
@@ -307,7 +226,7 @@ mod tests {
         let version: i64 = db
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, SCHEMA_VERSION);
         // New tables exist.
         let tables: i64 = db
             .query_row(
@@ -361,7 +280,7 @@ mod tests {
         let version: i64 = db
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, SCHEMA_VERSION);
 
         let ident = |db: &Connection, id: &str| -> String {
             db.query_row("SELECT identifier FROM projects WHERE id = ?", [id], |r| {
@@ -427,7 +346,7 @@ mod tests {
         let version: i64 = db
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, SCHEMA_VERSION);
         let (identifier, locked): (String, i64) = db
             .query_row(
                 "SELECT identifier, identifier_locked FROM projects WHERE id = 'p1'",

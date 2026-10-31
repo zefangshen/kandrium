@@ -19,8 +19,7 @@ use egui::Rect;
 use egui_commonmark::CommonMarkCache;
 use kandrium_core::fsutil::FsEntry;
 use kandrium_core::projects::{
-    self, PROJECT_STATUSES, Project, ProjectChoice, ProjectNode, ProjectSummary, TEMPLATES,
-    project_dir,
+    self, PROJECT_STATUSES, Project, ProjectChoice, ProjectNode, ProjectSummary, project_dir,
 };
 use rusqlite::Connection;
 
@@ -278,7 +277,17 @@ pub struct ProjectsState {
     /// Folder new items are created into (`None` = tree root).
     selected_folder: Option<String>,
     renaming: Option<Rename>,
+    /// Project id currently being dragged in the tree (drag-and-drop reorder).
+    drag_project: Option<String>,
+    /// Hovered drop slot: `(sibling project id, insert after it?)`.
+    drop_target: Option<(String, bool)>,
     filter: String,
+    /// Show archived projects in the left panel instead of the active tree.
+    show_archived: bool,
+    /// Archived projects for the left panel (newest archive first).
+    archived: Vec<Project>,
+    /// Force the next reload to land on the Overview tab (archived selection).
+    open_overview: bool,
     files: Vec<FsEntry>,
     summary: Option<ProjectSummary>,
     detail: Option<Project>,
@@ -307,6 +316,10 @@ pub struct ProjectsState {
     identifier_draft: String,
     identifier_for: Option<String>,
     identifier_error: Option<String>,
+    /// Live buffer for the Overview source field. `source_for` ties it to a
+    /// project id so switching selection re-seeds it.
+    source_draft: String,
+    source_for: Option<String>,
 }
 
 /// A tree row asked to delete something; the app routes it to the confirm
@@ -345,6 +358,19 @@ enum Mutation {
         id: String,
         name: String,
     },
+    /// Move a project to `index` among its siblings in the tree.
+    ReorderProject {
+        id: String,
+        index: usize,
+    },
+    /// Hide a project from the tree/pickers; board and files stay intact.
+    ArchiveProject {
+        id: String,
+    },
+    /// Restore an archived project to the active tree.
+    UnarchiveProject {
+        id: String,
+    },
     SetStatus {
         id: String,
         status: String,
@@ -356,6 +382,10 @@ enum Mutation {
     SetIdentifier {
         id: String,
         identifier: String,
+    },
+    SetSource {
+        id: String,
+        source: String,
     },
 }
 
@@ -381,7 +411,12 @@ impl ProjectsState {
             selected: None,
             selected_folder: None,
             renaming: None,
+            drag_project: None,
+            drop_target: None,
             filter: String::new(),
+            show_archived: false,
+            archived: Vec::new(),
+            open_overview: false,
             files: Vec::new(),
             summary: None,
             detail: None,
@@ -398,6 +433,8 @@ impl ProjectsState {
             identifier_draft: String::new(),
             identifier_for: None,
             identifier_error: None,
+            source_draft: String::new(),
+            source_for: None,
         }
     }
 
@@ -409,6 +446,13 @@ impl ProjectsState {
     /// Selected project id (persisted session).
     pub fn selected_id(&self) -> Option<String> {
         self.selected.clone()
+    }
+
+    /// True when the selected project is in the archive list.
+    pub fn selected_is_archived(&self) -> bool {
+        self.selected
+            .as_ref()
+            .is_some_and(|id| self.archived.iter().any(|project| &project.id == id))
     }
 
     /// Board owned by the selected project, if any. Falls back to the tree
@@ -443,7 +487,9 @@ impl ProjectsState {
     /// True when the detail pane is showing the embedded board, i.e. the app
     /// should load/render the selected project's board.
     pub fn detail_tab_is_board(&self) -> bool {
-        self.detail.is_some() && self.tabs.active_kind() == DetailKind::Board
+        self.detail.is_some()
+            && !self.selected_is_archived()
+            && self.tabs.active_kind() == DetailKind::Board
     }
 
     /// Expanded folder ids (persisted session).
@@ -472,6 +518,10 @@ impl ProjectsState {
     /// Detail is left untouched while a description save is pending so an
     /// in-flight edit is never clobbered.
     pub fn reload(&mut self, db: &Connection) {
+        // A reload can happen mid-drag (external sync or a dropped row);
+        // never carry a stale drag across it.
+        self.drag_project = None;
+        self.drop_target = None;
         match projects::list_tree(db) {
             Ok(tree) => {
                 self.tree = tree;
@@ -481,6 +531,11 @@ impl ProjectsState {
                 self.error = Some(format!("Cannot load projects: {e}"));
                 return;
             }
+        }
+
+        match projects::list_archived_projects(db) {
+            Ok(archived) => self.archived = archived,
+            Err(e) => self.error = Some(format!("Cannot load archived projects: {e}")),
         }
 
         // Refresh the inline document trees shown in the left panel. Entries
@@ -504,7 +559,9 @@ impl ProjectsState {
             self.clear_doc_tree();
             return;
         };
-        if projects::find_project(&self.tree, &id).is_none() {
+        if projects::find_project(&self.tree, &id).is_none()
+            && !self.archived.iter().any(|project| project.id == id)
+        {
             self.selected = None;
             // The project vanished; drop the tab strip rather than retrying a
             // save against a folder that no longer exists.
@@ -803,6 +860,12 @@ pub fn detail_tab_strip(
 ) -> Option<DetailKind> {
     state.detail.as_ref()?;
     state.tabs.sync_theme(dark);
+    // Archived projects are management-only: they expose the Overview page,
+    // never the embedded Tasks board.
+    let archived = state.selected_is_archived();
+    if archived && state.tabs.active == 1 {
+        state.tabs.active = 0;
+    }
 
     let mut focus: Option<usize> = None;
     let mut close: Option<usize> = None;
@@ -816,7 +879,12 @@ pub fn detail_tab_strip(
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         // Pinned tabs: no close buttons.
-                        for (idx, label) in [(0, "Overview"), (1, "Tasks")] {
+                        let pinned: &[(usize, &str)] = if archived {
+                            &[(0, "Overview")]
+                        } else {
+                            &[(0, "Overview"), (1, "Tasks")]
+                        };
+                        for &(idx, label) in pinned {
                             if theme::tab_button(
                                 ui,
                                 label,
@@ -911,13 +979,31 @@ fn tree_panel(
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.add_space(4.0);
+        new_project_button(ui, state, mutations);
         if theme::icon_button(ui, "folder-plus", 26.0, false, "New folder").clicked() {
             mutations.push(Mutation::CreateFolder {
                 parent: state.selected_folder.clone(),
                 name: "New Folder".to_string(),
             });
         }
-        new_project_menu(ui, state, mutations);
+        // Files live inside a project's Documents folder, so this needs a
+        // selected project; dim the button (and explain why) otherwise.
+        let file_enabled = state.selected.is_some();
+        let file = ui.add_enabled_ui(file_enabled, |ui| {
+            theme::icon_button(ui, "file-plus", 26.0, false, "New file")
+        });
+        let file_clicked = file.inner.clicked();
+        if !file_enabled {
+            file.inner
+                .on_disabled_hover_text("Select a project to add files");
+        }
+        if file_clicked {
+            // The inline create row lives in the Overview tab's Documents
+            // section — show both so the new row is visible and focused.
+            state.tabs.active = 0;
+            state.docs_open = true;
+            state.begin_doc_create(DocCreateKind::File);
+        }
         if theme::icon_button(ui, "rotate-cw", 26.0, false, "Refresh").clicked() {
             mutations.push(Mutation::Refresh);
         }
@@ -925,13 +1011,26 @@ fn tree_panel(
             if widgets::collapse_button(ui) {
                 state.tree_open = false;
             }
+            let (tooltip, show_archived) = if state.show_archived {
+                ("Show active projects", false)
+            } else {
+                ("Archived projects", true)
+            };
+            if theme::icon_button(ui, "archive", 26.0, state.show_archived, tooltip).clicked() {
+                state.show_archived = show_archived;
+            }
         });
     });
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.add_space(4.0);
         let w = (ui.available_width() - 4.0).max(80.0);
-        theme::search_field(ui, &mut state.filter, "Filter projects", w);
+        let hint = if state.show_archived {
+            "Filter archived"
+        } else {
+            "Filter projects"
+        };
+        theme::search_field(ui, &mut state.filter, hint, w);
     });
     ui.add_space(4.0);
 
@@ -947,9 +1046,23 @@ fn tree_panel(
         .id_salt("projects-tree-scroll")
         .auto_shrink([false; 2])
         .show(ui, |ui| {
+            if state.show_archived {
+                archived_entries(ui, state, mutations);
+                return;
+            }
             let tree = state.tree.clone();
             let needle = state.filter.trim().to_lowercase();
-            if needle.is_empty() {
+            // Drag-and-drop only makes sense against the real tree: the
+            // filtered list is a flat set of matches with no sibling order.
+            let draggable = needle.is_empty();
+            if !draggable {
+                state.drag_project = None;
+                state.drop_target = None;
+            } else if state.drag_project.is_some() {
+                // Recomputed by the rows below on every frame.
+                state.drop_target = None;
+            }
+            if draggable {
                 tree_entries(ui, state, &tree, 0, None, actions, mutations);
             } else {
                 let mut matches: Vec<&Project> = Vec::new();
@@ -972,32 +1085,28 @@ fn tree_panel(
                         project.folder_id.as_deref(),
                         0,
                         false,
+                        false,
                         actions,
                         mutations,
                     );
                 }
             }
+            commit_drag(ui, state, mutations);
         });
 }
 
-/// "New project" button: a popup menu of the built-in templates. The project
-/// is created with a default name and immediately opened for inline rename.
-fn new_project_menu(ui: &mut egui::Ui, state: &mut ProjectsState, mutations: &mut Vec<Mutation>) {
-    let resp = theme::icon_button(ui, "file-plus", 26.0, false, "New project");
-    let parent = state.selected_folder.clone();
-    let _ = egui::Popup::menu(&resp)
-        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-        .show(|ui| {
-            for tpl in TEMPLATES.iter() {
-                if theme::menu_item(ui, "briefcase", tpl.label, false).clicked() {
-                    mutations.push(Mutation::CreateProject {
-                        folder: parent.clone(),
-                        name: "New Project".to_string(),
-                        template: tpl.id,
-                    });
-                }
-            }
+/// "New project" button: creates a blank project immediately in the selected
+/// folder (or at the root) and focuses the Overview title field. `folder-kanban`
+/// is the project marker (same glyph as the Projects section segment), which
+/// keeps `file-plus` free for "New file" everywhere.
+fn new_project_button(ui: &mut egui::Ui, state: &mut ProjectsState, mutations: &mut Vec<Mutation>) {
+    if theme::icon_button(ui, "folder-kanban", 26.0, false, "New project").clicked() {
+        mutations.push(Mutation::CreateProject {
+            folder: state.selected_folder.clone(),
+            name: "New Project".to_string(),
+            template: "blank",
         });
+    }
 }
 
 fn tree_entries(
@@ -1013,7 +1122,7 @@ fn tree_entries(
         match node {
             ProjectNode::Folder { id, name, children } => {
                 entity_row(
-                    ui, state, id, name, true, None, None, depth, true, actions, mutations,
+                    ui, state, id, name, true, None, None, depth, true, false, actions, mutations,
                 );
                 if state.expanded.contains(id) {
                     tree_entries(ui, state, children, depth + 1, Some(id), actions, mutations);
@@ -1029,6 +1138,7 @@ fn tree_entries(
                     Some(project),
                     parent,
                     depth,
+                    true,
                     true,
                     actions,
                     mutations,
@@ -1054,6 +1164,85 @@ fn tree_entries(
     }
 }
 
+/// Children (`ProjectNode`s) of `folder` (`None` = tree root), or `None` when
+/// the folder is gone. Used to look up a row's real sibling projects.
+fn children_in<'a>(nodes: &'a [ProjectNode], folder: Option<&str>) -> Option<&'a [ProjectNode]> {
+    let Some(id) = folder else {
+        return Some(nodes);
+    };
+    for node in nodes {
+        if let ProjectNode::Folder {
+            id: folder_id,
+            children,
+            ..
+        } = node
+        {
+            if folder_id == id {
+                return Some(children);
+            }
+            if let Some(found) = children_in(children, folder) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Direct project children of `parent` (`None` = root), in tree order.
+fn siblings_of<'a>(tree: &'a [ProjectNode], parent: Option<&str>) -> Vec<&'a Project> {
+    children_in(tree, parent)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|node| match node {
+            ProjectNode::Project(project) => Some(project),
+            ProjectNode::Folder { .. } => None,
+        })
+        .collect()
+}
+
+/// Index the dragged project lands on when dropped around `target`.
+///
+/// `siblings` still contains the dragged row; the result is expressed for the
+/// list without it (what [`projects::reorder_project`] expects). Returns
+/// `None` when either id vanished from the tree, which makes stale drags a
+/// silent no-op.
+fn drop_index(siblings: &[&Project], dragged: &str, target: &str, after: bool) -> Option<usize> {
+    let dragged_at = siblings.iter().position(|p| p.id == dragged)?;
+    let target_at = siblings.iter().position(|p| p.id == target)?;
+    let mut index = target_at + usize::from(after);
+    if dragged_at < index {
+        index -= 1;
+    }
+    Some(index.min(siblings.len().saturating_sub(1)))
+}
+
+/// Commit a finished drag once the whole tree has been laid out: rows below
+/// the dragged one are visited after it, so the hovered slot is only final
+/// after every row has run.
+fn commit_drag(ui: &egui::Ui, state: &mut ProjectsState, mutations: &mut Vec<Mutation>) {
+    let Some(dragged) = state.drag_project.clone() else {
+        return;
+    };
+    if !ui.ctx().input(|i| i.pointer.any_released()) {
+        return;
+    }
+    let target = state.drop_target.take();
+    state.drag_project = None;
+    let Some((target_id, after)) = target else {
+        return; // dropped outside a valid slot: cancel
+    };
+    let parent =
+        projects::find_project(&state.tree, &dragged).and_then(|project| project.folder_id.clone());
+    let siblings = siblings_of(&state.tree, parent.as_deref());
+    let Some(index) = drop_index(&siblings, &dragged, &target_id, after) else {
+        return;
+    };
+    let current = siblings.iter().position(|project| project.id == dragged);
+    if current != Some(index) {
+        mutations.push(Mutation::ReorderProject { id: dragged, index });
+    }
+}
+
 fn collect_matching<'a>(nodes: &'a [ProjectNode], needle: &str, out: &mut Vec<&'a Project>) {
     for node in nodes {
         match node {
@@ -1069,6 +1258,141 @@ fn collect_matching<'a>(nodes: &'a [ProjectNode], needle: &str, out: &mut Vec<&'
     }
 }
 
+/// Archived projects replace the tree while the archive toggle is on. Rows
+/// mirror project rows (identifier label, accent selection) and open the
+/// Overview page on click; restoring stays a one-click action.
+fn archived_entries(ui: &mut egui::Ui, state: &mut ProjectsState, mutations: &mut Vec<Mutation>) {
+    let t = Tokens::get(ui.ctx());
+    let needle = state.filter.trim().to_lowercase();
+    let archived = state.archived.clone();
+    let matches: Vec<&Project> = archived
+        .iter()
+        .filter(|project| {
+            needle.is_empty()
+                || project.name.to_lowercase().contains(&needle)
+                || project.identifier.to_lowercase().contains(&needle)
+        })
+        .collect();
+
+    if matches.is_empty() {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.weak(if archived.is_empty() {
+                "No archived projects"
+            } else {
+                "No matching archived projects"
+            });
+        });
+        return;
+    }
+
+    for project in matches {
+        ui.push_id(("archived-project", project.id.as_str()), |ui| {
+            let (rect, resp) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), ROW_H),
+                egui::Sense::click(),
+            );
+            let resp = resp.on_hover_text(&project.name);
+            let press = Press::track(ui, &resp);
+            let is_selected = state.selected.as_deref() == Some(project.id.as_str());
+            press.wash(ui, rect, egui::CornerRadius::same(t.radius), is_selected);
+
+            let cy = rect.center().y;
+            crate::icons::paint(
+                ui,
+                Rect::from_center_size(egui::pos2(rect.left() + 16.0, cy), egui::Vec2::splat(14.0)),
+                "archive",
+                14.0,
+                if is_selected {
+                    t.accent_text
+                } else {
+                    t.text_faint
+                },
+            );
+
+            // Same label treatment as the active tree: identifier, truncated
+            // so it never runs under the restore button.
+            let display = if project.identifier.is_empty() {
+                project.name.as_str()
+            } else {
+                project.identifier.as_str()
+            };
+            let text_rect = Rect::from_min_max(
+                egui::pos2(rect.left() + 28.0, rect.top()),
+                egui::pos2(rect.right() - 34.0, rect.bottom()),
+            );
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(text_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(display)
+                                .text_style(egui::TextStyle::Small)
+                                .color(if is_selected { t.accent_text } else { t.text }),
+                        )
+                        .wrap_mode(egui::TextWrapMode::Truncate)
+                        .selectable(false),
+                    );
+                },
+            );
+
+            let restore_rect = Rect::from_center_size(
+                egui::pos2(rect.right() - 16.0, cy),
+                egui::Vec2::splat(22.0),
+            );
+            let restore = ui
+                .interact(
+                    restore_rect,
+                    ui.id().with(("restore-project", project.id.as_str())),
+                    egui::Sense::click(),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("Restore project");
+            let tint = if restore.hovered() {
+                t.accent_text
+            } else {
+                t.icon
+            };
+            crate::icons::paint(ui, restore_rect, "rotate-ccw", 14.0, tint);
+
+            if restore.clicked() {
+                mutations.push(Mutation::UnarchiveProject {
+                    id: project.id.clone(),
+                });
+            } else if resp.clicked() && !is_selected {
+                // Same flow as selecting a project in the active tree, but the
+                // archived project always lands on its Overview page.
+                if state.desc_dirty.is_some()
+                    && let Some(prev) = &state.detail
+                {
+                    mutations.push(Mutation::SetDescription {
+                        id: prev.id.clone(),
+                        description: prev.description.clone(),
+                    });
+                }
+                state.selected = Some(project.id.clone());
+                state.selected_folder = project.folder_id.clone();
+                state.detail = None;
+                state.desc_dirty = None;
+                state.open_overview = true;
+                mutations.push(Mutation::Refresh);
+            }
+
+            resp.context_menu(|ui| {
+                if theme::menu_item(ui, "rotate-ccw", "Restore", false).clicked() {
+                    ui.close();
+                    mutations.push(Mutation::UnarchiveProject {
+                        id: project.id.clone(),
+                    });
+                }
+            });
+        });
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn entity_row(
     ui: &mut egui::Ui,
@@ -1080,18 +1404,21 @@ fn entity_row(
     parent: Option<&str>,
     depth: usize,
     show_docs_toggle: bool,
+    draggable: bool,
     actions: &mut ProjectsActions,
     mutations: &mut Vec<Mutation>,
 ) {
     let t = Tokens::get(ui.ctx());
     ui.push_id(("project-row", is_folder, id), |ui| {
-        let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), ROW_H),
-            egui::Sense::click(),
-        );
+        let sense = if draggable {
+            egui::Sense::click_and_drag()
+        } else {
+            egui::Sense::click()
+        };
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), sense);
         // Project rows are labelled with their short identifier; keep the full
         // name available as a tooltip.
-        let resp = if project.is_some() {
+        let mut resp = if project.is_some() {
             resp.on_hover_text(label)
         } else {
             resp
@@ -1099,6 +1426,34 @@ fn entity_row(
         let press = Press::track(ui, &resp);
         let is_selected = !is_folder && state.selected.as_deref() == Some(id);
         press.wash(ui, rect, egui::CornerRadius::same(t.radius), is_selected);
+
+        // Drag-and-drop reorder: only projects (never folders) whose parent
+        // matches the dragged row's parent take part.
+        let dragging_this = draggable && state.drag_project.as_deref() == Some(id);
+        if draggable {
+            resp = resp.on_hover_cursor(if dragging_this {
+                egui::CursorIcon::Grabbing
+            } else {
+                egui::CursorIcon::Grab
+            });
+        }
+        if dragging_this {
+            ui.painter()
+                .rect_filled(rect, egui::CornerRadius::same(t.radius), t.accent_soft);
+        }
+        if draggable && !dragging_this {
+            let same_parent = state
+                .drag_project
+                .as_ref()
+                .and_then(|dragged| projects::find_project(&state.tree, dragged))
+                .is_some_and(|dragged| dragged.folder_id.as_deref() == parent);
+            if same_parent
+                && let Some(pos) = ui.ctx().pointer_interact_pos()
+                && rect.contains(pos)
+            {
+                state.drop_target = Some((id.to_string(), pos.y > rect.center().y));
+            }
+        }
 
         // Folders show their name; projects show their identifier.
         let display = match project {
@@ -1211,6 +1566,23 @@ fn entity_row(
             );
         }
 
+        // Drag start: remember the row; the hovered slot is recomputed each
+        // frame while the drag is live.
+        if draggable && resp.drag_started() {
+            state.drag_project = Some(id.to_string());
+            state.drop_target = None;
+        }
+
+        // Insertion indicator for the slot the pointer is currently over.
+        if draggable
+            && let Some((target, after)) = state.drop_target.clone()
+            && target == id
+        {
+            let y = if after { rect.bottom() } else { rect.top() };
+            ui.painter()
+                .hline(rect.x_range(), y, egui::Stroke::new(2.0, t.accent));
+        }
+
         if resp.clicked() && !chevron_clicked {
             if is_folder {
                 state.selected_folder = Some(id.to_string());
@@ -1237,7 +1609,7 @@ fn entity_row(
 
         resp.context_menu(|ui| {
             if is_folder {
-                if theme::menu_item(ui, "file-plus", "New project here", false).clicked() {
+                if theme::menu_item(ui, "folder-kanban", "New project here", false).clicked() {
                     ui.close();
                     mutations.push(Mutation::CreateProject {
                         folder: Some(id.to_string()),
@@ -1278,6 +1650,10 @@ fn entity_row(
                 if theme::menu_item(ui, "folder-open", "Reveal in Finder", false).clicked() {
                     ui.close();
                     reveal_in_finder(&project_dir(&state.root, &project.id), true);
+                }
+                if theme::menu_item(ui, "archive", "Archive", false).clicked() {
+                    ui.close();
+                    mutations.push(Mutation::ArchiveProject { id: id.to_string() });
                 }
             }
             if theme::menu_item(ui, "pencil", "Rename", false).clicked() {
@@ -1547,6 +1923,9 @@ fn overview_panel(
             documents_section(ui, state, detail);
             ui.add_space(14.0);
 
+            source_field(ui, state, detail, mutations);
+            ui.add_space(14.0);
+
             metadata(ui, detail, &summary);
             ui.add_space(8.0);
         });
@@ -1679,6 +2058,71 @@ fn identifier_field(
         ui.add_space(2.0);
         ui.colored_label(ui.visuals().error_fg_color, err);
     }
+}
+
+/// Source-code reference editor: a local folder path or `http(s)` URL with an
+/// adjacent open button (Finder / browser). Commits on Enter or focus loss.
+fn source_field(
+    ui: &mut egui::Ui,
+    state: &mut ProjectsState,
+    detail: &Project,
+    mutations: &mut Vec<Mutation>,
+) {
+    let t = Tokens::get(ui.ctx());
+    if state.source_for.as_deref() != Some(detail.id.as_str()) {
+        state.source_for = Some(detail.id.clone());
+        state.source_draft = detail.source.clone();
+    }
+
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("Source")
+                .text_style(theme::small_strong())
+                .color(t.text_muted),
+        );
+        ui.add_space(6.0);
+        let width = (ui.available_width() - 34.0).max(120.0);
+        let resp = ui.add_sized(
+            egui::vec2(width, ui.spacing().interact_size.y),
+            egui::TextEdit::singleline(&mut state.source_draft)
+                .hint_text("Path or URL to source code"),
+        );
+
+        let trimmed = state.source_draft.trim().to_string();
+        let url = is_url(&trimmed);
+        let existing_dir = !url && !trimmed.is_empty() && expand_home(&trimmed).is_dir();
+        let (icon, tooltip) = if url {
+            ("external-link", "Open source URL")
+        } else if existing_dir {
+            ("folder-open", "Open source folder")
+        } else {
+            ("folder-open", "Choose source folder")
+        };
+        let button = theme::icon_button(ui, icon, 24.0, false, tooltip);
+        if button.clicked() {
+            if url {
+                let _ = std::process::Command::new("open").arg(&trimmed).spawn();
+            } else if existing_dir {
+                reveal_in_finder(&expand_home(&trimmed), true);
+            } else if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                // Picking a folder sets the reference directly, without
+                // waiting for the field's Enter / focus-loss commit.
+                state.source_draft = dir.display().to_string();
+                mutations.push(Mutation::SetSource {
+                    id: detail.id.clone(),
+                    source: state.source_draft.clone(),
+                });
+            }
+        }
+
+        let enter = resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if (enter || resp.lost_focus()) && trimmed != detail.source {
+            mutations.push(Mutation::SetSource {
+                id: detail.id.clone(),
+                source: trimmed,
+            });
+        }
+    });
 }
 
 fn status_picker(ui: &mut egui::Ui, current: &str, id: &str, mutations: &mut Vec<Mutation>) {
@@ -2096,6 +2540,28 @@ fn reveal_in_finder(path: &Path, is_dir: bool) {
     let _ = cmd.arg(path).spawn();
 }
 
+/// Open a project source reference: `http(s)` URLs go to the browser, while
+/// local folders are revealed in Finder. The Overview button also offers a
+/// native folder picker when no valid folder is set.
+fn is_url(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// Expand a leading `~` against `$HOME` (the app crate has no `dirs` dep).
+fn expand_home(value: &str) -> PathBuf {
+    let Some(home) = std::env::var_os("HOME") else {
+        return PathBuf::from(value);
+    };
+    if let Some(rest) = value.strip_prefix("~/") {
+        return PathBuf::from(home).join(rest);
+    }
+    if value == "~" {
+        return PathBuf::from(home);
+    }
+    PathBuf::from(value)
+}
+
 /// Relative time from a unix-seconds timestamp (pure arithmetic; no `chrono`).
 fn relative_time(unix: i64) -> String {
     if unix <= 0 {
@@ -2139,6 +2605,7 @@ fn apply_mutations(
 
     let mut error: Option<String> = None;
     let mut identifier_error: Option<String> = None;
+    let mut created_project = false;
     for mutation in mutations {
         let outcome: kandrium_core::Result<()> = (|| {
             match mutation {
@@ -2173,10 +2640,14 @@ fn apply_mutations(
                     }
                     state.selected = Some(project.id.clone());
                     state.selected_folder = project.folder_id.clone();
-                    state.renaming = Some(Rename {
-                        is_folder: false,
-                        id: project.id,
+                    created_project = true;
+                    // Name the project in the Overview title field, not the
+                    // tree row: the tree label stays a plain, non-editable
+                    // entry and the focused field matches where renames live.
+                    state.title_edit = Some(TitleEdit {
+                        project_id: project.id,
                         draft: name,
+                        focus: true,
                     });
                 }
                 Mutation::RenameFolder { id, name } => {
@@ -2199,11 +2670,53 @@ fn apply_mutations(
                     state.identifier_for = None;
                     state.identifier_error = None;
                 }
+                Mutation::ReorderProject { id, index } => {
+                    projects::reorder_project(&guard, &id, index)?;
+                }
+                Mutation::ArchiveProject { id } => {
+                    // Persist a pending description edit before the row leaves
+                    // the tree, then hide the project. Its board, cards, and
+                    // on-disk folder are never touched.
+                    if state.desc_dirty.is_some()
+                        && let Some(detail) = state.detail.as_ref().filter(|d| d.id == id)
+                    {
+                        let description = detail.description.clone();
+                        projects::update_project(&guard, &id, Some(&description), None)?;
+                        state.desc_dirty = None;
+                    }
+                    projects::archive_project(&guard, &id)?;
+                    if state.selected.as_deref() == Some(id.as_str()) {
+                        state.selected = None;
+                        state.detail = None;
+                        state.title_edit = None;
+                    }
+                    if state
+                        .renaming
+                        .as_ref()
+                        .is_some_and(|r| !r.is_folder && r.id == id)
+                    {
+                        state.renaming = None;
+                    }
+                    state.identifier_for = None;
+                    state.identifier_error = None;
+                }
+                Mutation::UnarchiveProject { id } => {
+                    projects::unarchive_project(&guard, &id)?;
+                }
                 Mutation::SetStatus { id, status } => {
                     projects::update_project(&guard, &id, None, Some(&status))?;
                 }
                 Mutation::SetDescription { id, description } => {
                     projects::update_project(&guard, &id, Some(&description), None)?;
+                }
+                Mutation::SetSource { id, source } => {
+                    let updated = projects::set_source(&guard, &id, &source)?;
+                    if let Some(detail) = state.detail.as_mut()
+                        && detail.id == id
+                    {
+                        detail.source = updated.source;
+                    }
+                    state.source_for = None;
                 }
                 Mutation::SetIdentifier { id, identifier } => {
                     match projects::set_identifier(&guard, &id, &identifier) {
@@ -2233,6 +2746,18 @@ fn apply_mutations(
     }
 
     state.reload(&guard);
+    // A brand-new project always opens on the pinned Overview tab so its
+    // focused title field is visible. `reload`/`enter_project` otherwise
+    // carries the Tasks tab over from the previously selected project.
+    if created_project || state.open_overview {
+        state.tabs.active = 0;
+        state.open_overview = false;
+    }
+    if created_project {
+        // Creation always produces an active project, so leave the archive
+        // list and show it in the tree immediately.
+        state.show_archived = false;
+    }
     drop(guard);
     if let Some(e) = identifier_error {
         state.identifier_error = Some(e);
@@ -2772,6 +3297,158 @@ mod tests {
         (tmp, db, state)
     }
 
+    /// The Overview renders the Source row, and a `SetSource` mutation persists
+    /// the trimmed value through the core setter.
+    #[test]
+    fn overview_source_field_renders_and_persists() {
+        let (_tmp, db, mut state) = overview_fixture("Alpha");
+        let id = state.selected.clone().unwrap();
+
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply_visuals(&ctx, true);
+        let mut output = ctx.run_ui(Default::default(), |ctx| {
+            let mut ui = egui::Ui::new(
+                ctx.clone(),
+                egui::Id::new("root"),
+                egui::UiBuilder::new().max_rect(Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1000.0, 700.0),
+                )),
+            );
+            detail_body(&mut ui, &mut state, &db, true);
+        });
+        let text = shapes_text(&output);
+        assert!(text.contains("Source"), "source row missing:\n{text}");
+        assert!(!text.contains("use of"), "duplicate-ID warning:\n{text}");
+        output.textures_delta.clear();
+
+        apply_mutations(
+            &mut state,
+            &db,
+            vec![Mutation::SetSource {
+                id: id.clone(),
+                source: "  https://github.com/example/repo  ".to_string(),
+            }],
+        );
+        assert_eq!(
+            state.detail.as_ref().unwrap().source,
+            "https://github.com/example/repo"
+        );
+        assert_eq!(
+            kandrium_core::get_project(&db.lock().unwrap(), &id)
+                .unwrap()
+                .source,
+            "https://github.com/example/repo"
+        );
+    }
+
+    #[test]
+    fn create_project_opens_overview_with_focused_title() {
+        let (_tmp, db, mut state) = overview_fixture("Alpha");
+        // Pretend the user is looking at the Tasks tab when they create.
+        state.tabs.active = 1;
+        assert_eq!(state.tabs.active_kind(), DetailKind::Board);
+
+        apply_mutations(
+            &mut state,
+            &db,
+            vec![Mutation::CreateProject {
+                folder: None,
+                name: "New Project".to_string(),
+                template: "blank",
+            }],
+        );
+
+        assert_eq!(state.tabs.active_kind(), DetailKind::Overview);
+        let edit = state
+            .title_edit
+            .as_ref()
+            .expect("creation should focus the overview title");
+        assert_eq!(Some(edit.project_id.as_str()), state.selected.as_deref());
+        assert!(edit.focus);
+        assert_eq!(edit.draft, "New Project");
+    }
+
+    #[test]
+    fn archiving_the_selected_project_clears_it_and_lists_it() {
+        let (_tmp, db, mut state) = overview_fixture("Alpha");
+        let id = state.selected.clone().unwrap();
+        let dir = projects::project_dir(&state.root, &id);
+
+        apply_mutations(
+            &mut state,
+            &db,
+            vec![Mutation::ArchiveProject { id: id.clone() }],
+        );
+
+        assert!(state.selected.is_none());
+        assert!(state.detail.is_none());
+        assert_eq!(state.archived.len(), 1);
+        assert_eq!(state.archived[0].id, id);
+        // The project is gone from the active tree, but its folder survives.
+        assert!(projects::find_project(&state.tree, &id).is_none());
+        assert!(dir.is_dir());
+
+        apply_mutations(
+            &mut state,
+            &db,
+            vec![Mutation::UnarchiveProject { id: id.clone() }],
+        );
+        assert!(state.archived.is_empty());
+        assert!(projects::find_project(&state.tree, &id).is_some());
+    }
+
+    #[test]
+    fn selecting_an_archived_project_opens_its_overview() {
+        let (_tmp, db, mut state) = overview_fixture("Alpha");
+        let id = state.selected.clone().unwrap();
+        apply_mutations(
+            &mut state,
+            &db,
+            vec![Mutation::ArchiveProject { id: id.clone() }],
+        );
+        assert!(state.selected.is_none());
+
+        // Simulate clicking the archived row: select it and request a reload.
+        state.selected = Some(id.clone());
+        state.detail = None;
+        state.open_overview = true;
+        apply_mutations(&mut state, &db, vec![Mutation::Refresh]);
+
+        assert_eq!(state.selected.as_deref(), Some(id.as_str()));
+        assert_eq!(
+            state.detail.as_ref().map(|d| d.id.as_str()),
+            Some(id.as_str())
+        );
+        assert_eq!(state.tabs.active_kind(), DetailKind::Overview);
+        assert!(!state.open_overview);
+    }
+
+    #[test]
+    fn archived_project_shows_only_the_overview_tab() {
+        let (_tmp, db, mut state) = overview_fixture("Alpha");
+        let id = state.selected.clone().unwrap();
+        apply_mutations(
+            &mut state,
+            &db,
+            vec![Mutation::ArchiveProject { id: id.clone() }],
+        );
+        state.selected = Some(id.clone());
+        state.detail = None;
+        state.open_overview = true;
+        apply_mutations(&mut state, &db, vec![Mutation::Refresh]);
+        assert!(state.selected_is_archived());
+
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply_visuals(&ctx, false);
+        let output = render_overview(&ctx, &mut state, &db, egui::RawInput::default());
+        let text = shapes_text(&output);
+        assert!(text.contains("Overview"), "missing Overview tab: {text}");
+        assert!(!text.contains("Tasks"), "Tasks tab must be hidden: {text}");
+    }
+
     fn render_overview(
         ctx: &egui::Context,
         state: &mut ProjectsState,
@@ -2979,5 +3656,65 @@ mod tests {
                 .name,
             "Alpha"
         );
+    }
+
+    fn drag_project(id: &str, folder: Option<&str>) -> Project {
+        Project {
+            id: id.to_string(),
+            folder_id: folder.map(str::to_string),
+            name: id.to_uppercase(),
+            identifier: id.to_string(),
+            description: String::new(),
+            source: String::new(),
+            status: "active".to_string(),
+            board_id: String::new(),
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn drop_index_lands_on_the_hovered_slot() {
+        let a = drag_project("a", None);
+        let b = drag_project("b", None);
+        let c = drag_project("c", None);
+        let siblings = vec![&a, &b, &c];
+
+        // Dropping below the last row appends; above the first row prepends.
+        assert_eq!(drop_index(&siblings, "a", "c", true), Some(2));
+        assert_eq!(drop_index(&siblings, "c", "a", false), Some(0));
+        // Dropping onto your own slot is a no-op that maps to the same index.
+        assert_eq!(drop_index(&siblings, "a", "b", true), Some(1));
+        assert_eq!(drop_index(&siblings, "b", "a", true), Some(1));
+        assert_eq!(drop_index(&siblings, "b", "b", false), Some(1));
+        // Stale ids (project deleted elsewhere) cancel the drop.
+        assert_eq!(drop_index(&siblings, "a", "gone", true), None);
+        assert_eq!(drop_index(&siblings, "gone", "a", true), None);
+    }
+
+    #[test]
+    fn siblings_are_scoped_to_their_folder() {
+        let root_a = drag_project("root-a", None);
+        let root_b = drag_project("root-b", None);
+        let inside = drag_project("inside", Some("f1"));
+        let tree = vec![
+            ProjectNode::Folder {
+                id: "f1".to_string(),
+                name: "Folder".to_string(),
+                children: vec![ProjectNode::Project(inside)],
+            },
+            ProjectNode::Project(root_a),
+            ProjectNode::Project(root_b),
+        ];
+
+        let ids = |projects: Vec<&Project>| {
+            projects
+                .iter()
+                .map(|project| project.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(siblings_of(&tree, None)), ["root-a", "root-b"]);
+        assert_eq!(ids(siblings_of(&tree, Some("f1"))), ["inside"]);
+        assert!(siblings_of(&tree, Some("gone")).is_empty());
     }
 }

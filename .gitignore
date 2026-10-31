@@ -4,3 +4,4 @@ Kandrium_*.dmg
 Planly.app/
 .cargo-packager/
 .trae/
+.DS_Store
