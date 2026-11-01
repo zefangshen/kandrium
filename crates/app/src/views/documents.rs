@@ -26,6 +26,7 @@ use crate::views::notes_highlight::MarkdownHighlighter;
 use crate::widgets;
 use crate::widgets::markdown::{self, NoteMode};
 use crate::widgets::tabs::TAB_H;
+use crate::widgets::vim::ExCommand;
 
 const AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 const TREE_DEFAULT_W: f32 = 240.0;
@@ -576,6 +577,14 @@ impl DocumentsState {
             return;
         }
         self.remove_tab(idx);
+    }
+
+    /// Execute a `:` command typed in the editor.
+    fn run_ex(&mut self, idx: usize, cmd: ExCommand) {
+        match cmd {
+            ExCommand::Write => self.flush(idx),
+            ExCommand::Close => self.close_tab(idx),
+        }
     }
 
     /// Drop a tab and keep the active index valid, without flushing. Used
@@ -1194,8 +1203,12 @@ fn markdown_viewer(ui: &mut egui::Ui, state: &mut DocumentsState, idx: usize) {
     };
     let doc = &mut open[idx];
     let id = egui::Id::new(("doc-markdown", doc.path.as_os_str()));
-    if markdown::body(ui, id, &mut doc.text, doc.mode, highlighter, preview_cache) {
+    let (changed, ex) = markdown::body(ui, id, &mut doc.text, doc.mode, highlighter, preview_cache);
+    if changed {
         doc.dirty_since = Some(Instant::now());
+    }
+    if let Some(cmd) = ex {
+        state.run_ex(idx, cmd);
     }
 }
 
@@ -1833,6 +1846,48 @@ mod tests {
             "# Two\n"
         );
         assert!(state.open[0].dirty_since.is_none());
+    }
+
+    #[test]
+    fn run_ex_write_flushes_the_tab() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("documents");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("notes.md"), "# One\n").unwrap();
+
+        let mut state = test_state(&root);
+        state.open_file(root.join("notes.md"));
+        state.open[0].text = "# Two\n".into();
+        state.open[0].dirty_since = Some(Instant::now());
+
+        state.run_ex(0, ExCommand::Write);
+        assert!(state.open[0].dirty_since.is_none());
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes.md")).unwrap(),
+            "# Two\n"
+        );
+        assert_eq!(state.open.len(), 1, "`:w` keeps the tab open");
+    }
+
+    #[test]
+    fn run_ex_close_flushes_and_removes_the_tab() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("documents");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("notes.md"), "# One\n").unwrap();
+
+        let mut state = test_state(&root);
+        state.open_file(root.join("notes.md"));
+        state.open[0].text = "# Two\n".into();
+        state.open[0].dirty_since = Some(Instant::now());
+
+        state.run_ex(0, ExCommand::Close);
+        assert!(state.open.is_empty(), "`:q` closes the tab");
+        assert_eq!(state.active, None);
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes.md")).unwrap(),
+            "# Two\n"
+        );
     }
 
     #[test]

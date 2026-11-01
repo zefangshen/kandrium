@@ -18,6 +18,7 @@ use crate::views::notes_highlight::MarkdownHighlighter;
 use crate::widgets;
 use crate::widgets::markdown::{self, NoteMode};
 use crate::widgets::tabs::TAB_H;
+use crate::widgets::vim::ExCommand;
 
 const AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 const TREE_DEFAULT_W: f32 = 240.0;
@@ -196,6 +197,14 @@ impl NotesState {
             Some(a) if a >= idx => Some(a.saturating_sub(1).min(self.open.len() - 1)),
             other => other,
         };
+    }
+
+    /// Execute a `:` command typed in the editor.
+    fn run_ex(&mut self, idx: usize, cmd: ExCommand) {
+        match cmd {
+            ExCommand::Write => self.flush(idx),
+            ExCommand::Close => self.close_tab(idx),
+        }
     }
 
     /// Persisted session: open tabs as root-relative paths + active index.
@@ -553,8 +562,12 @@ fn editor_panel(ui: &mut egui::Ui, state: &mut NotesState) {
 
     let id = egui::Id::new(("note-editor", note.path.as_os_str()));
     let hl = highlighter.as_ref().expect("highlighter set in show()");
-    if markdown::body(ui, id, &mut note.text, note.mode, hl, preview_cache) {
+    let (changed, ex) = markdown::body(ui, id, &mut note.text, note.mode, hl, preview_cache);
+    if changed {
         note.dirty_since = Some(Instant::now());
+    }
+    if let Some(cmd) = ex {
+        state.run_ex(idx, cmd);
     }
 }
 

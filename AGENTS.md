@@ -118,8 +118,10 @@ Workspace, edition 2024. All comments, identifiers, and docs are in English.
   module's own snapshot stack (`u` / `Ctrl-r`). Supported: `h j k l w W b B e E
   0 ^ $ gg G { }`, counts, `f F t T ; ,`, `i I a A o O`, `v V`, `.` repeat,
   `x X dd D yy Y cc C S p P J r ~ u Ctrl-r`, text objects (`iw aw`, `i" a"`,
-  `i( a(`, `i[ a[`, `i{ a{`, `ip ap`), `Esc`. Not implemented: `/` search, `:`
-  commands, marks, named registers, `%`, `>>`/`<<`, `.` repeat of Visual ops.
+  `i( a(`, `i[ a[`, `i{ a{`, `ip ap`), `Esc`, and the ex commands `:w` (flush)
+  / `:q`, `:wq`, `:x` (flush and close; closing already saves, so `:q!` is
+  rejected). Not implemented: `/` search, marks, named registers, `%`,
+  `>>`/`<<`, `.` repeat of Visual ops.
 - IDs are 24 lowercase hex chars (`db::uid()`), matching the old app. Seed data
   uses fixed string ids (`board_career`, `col_work_todo`, ...).
 - **Logging**: `kandrium_core::logging::init(component)` +
@@ -157,7 +159,10 @@ cargo packager --release           # build Kandrium.app + DMG (packager.json)
 ```
 
 Before finishing a change: run `cargo fmt`, `cargo clippy --workspace`, and
-`cargo test --workspace`. All three are expected to pass cleanly.
+`cargo test --workspace`. All three are expected to pass cleanly. After any
+code change to `kandrium-app`, rebuild and restart the dev app
+(`killall kandrium-app; open -n target/Kandrium-dev.app`) so the user can see
+the result — never leave the running app on stale code.
 
 ### macOS sandbox note for agent shells
 

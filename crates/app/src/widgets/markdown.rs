@@ -9,6 +9,7 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
 use crate::theme::{self, Tokens};
 use crate::views::notes_highlight::MarkdownHighlighter;
+use crate::widgets::vim::ExCommand;
 
 /// How a markdown tab renders its buffer.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -19,7 +20,7 @@ pub enum NoteMode {
 
 /// Render `text` as a framed source editor or a rendered preview, filling the
 /// remaining height of `ui`. `id` must be unique per open document. Returns
-/// true when the buffer changed.
+/// whether the buffer changed and the `:` command completed this frame.
 pub fn body(
     ui: &mut egui::Ui,
     id: egui::Id,
@@ -27,13 +28,14 @@ pub fn body(
     mode: NoteMode,
     highlighter: &MarkdownHighlighter,
     cache: &mut CommonMarkCache,
-) -> bool {
+) -> (bool, Option<ExCommand>) {
     match mode {
         NoteMode::Edit => {
             let avail = ui.available_size();
             let outer_h = avail.y.max(80.0);
             let t = Tokens::get(ui.ctx());
             let mut changed = false;
+            let mut ex = None;
             // Pinned widget id so the vim layer can load the same
             // `TextEditState` from outside the scroll area.
             let editor_id = ui.make_persistent_id(("markdown-editor", id));
@@ -56,17 +58,37 @@ pub fn body(
                                     job.wrap.max_width = wrap;
                                     ui.fonts_mut(|f| f.layout_job(job))
                                 };
-                            if crate::widgets::vim::pre_edit(ui.ctx(), editor_id, text) {
+                            let (edit_changed, ex_cmd) =
+                                crate::widgets::vim::pre_edit(ui.ctx(), editor_id, text);
+                            if edit_changed {
                                 changed = true;
                             }
-                            let output = egui::TextEdit::multiline(text)
+                            ex = ex.or(ex_cmd);
+                            // Normal/Visual modes draw a vim block caret;
+                            // hide egui's line caret for this widget only.
+                            let saved_stroke =
+                                crate::widgets::vim::block_cursor(ui.ctx(), editor_id).then(|| {
+                                    let stroke = ui.visuals().text_cursor.stroke;
+                                    ui.visuals_mut().text_cursor.stroke = egui::Stroke::NONE;
+                                    stroke
+                                });
+                            let mut editor = egui::TextEdit::multiline(text)
                                 .id(editor_id)
                                 .frame(egui::Frame::new())
                                 .desired_width(f32::INFINITY)
                                 .font(egui::TextStyle::Monospace)
                                 .layouter(&mut layouter)
-                                .min_size(egui::vec2(ui.available_width(), inner_h))
-                                .show(ui);
+                                .min_size(egui::vec2(ui.available_width(), inner_h));
+                            // Keep keyboard focus on Esc so the vim layer
+                            // can switch back to Normal mode (egui's focus
+                            // pass would otherwise defocus at frame start).
+                            if let Some(filter) = crate::widgets::vim::event_filter(ui.ctx()) {
+                                editor = editor.event_filter(filter);
+                            }
+                            let output = editor.show(ui);
+                            if let Some(stroke) = saved_stroke {
+                                ui.visuals_mut().text_cursor.stroke = stroke;
+                            }
                             if output.response.response.changed() {
                                 changed = true;
                             }
@@ -74,7 +96,7 @@ pub fn body(
                         });
                     crate::widgets::vim::status_bar(ui, editor_id);
                 });
-            changed
+            (changed, ex)
         }
         NoteMode::Preview => {
             egui::ScrollArea::vertical()
@@ -84,7 +106,7 @@ pub fn body(
                     ui.add_space(4.0);
                     CommonMarkViewer::new().show(ui, cache, text.as_str());
                 });
-            false
+            (false, None)
         }
     }
 }

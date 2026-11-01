@@ -5,13 +5,30 @@
 //! commands, and moves the caret through [`egui::TextEditState`]. Insert mode
 //! is plain egui editing, so IME, selection, and clipboard keep working.
 //!
+//! Normal/Visual modes paint a glyph-wide block caret (the caller suppresses
+//! egui's line caret while [`block_cursor`] is true); Insert mode keeps the
+//! native blinking line caret. Mouse clicks reposition the caret but never
+//! switch modes.
+//!
+//! The visual-selection end is the vim cursor (inclusive), so it is persisted
+//! in [`VimState`] rather than read back from egui, which stores range ends as
+//! exclusive boundaries. Mouse drag and arrow keys are the only inputs that
+//! adopt egui's caret.
+//!
+//! The `:` command line is an overlay on Normal mode, not a mode of its own:
+//! its text lives in `VimState::ex`, it consumes input before the editor, and
+//! the resulting [`ExCommand`] is returned from [`pre_edit`] so the calling
+//! view can flush or close the tab.
+//!
 //! Supported: `h j k l w W b B e E 0 ^ $ gg G { }`, counts,
 //! `f F t T ; ,`, `i I a A o O`, `v V`, `.` repeat,
 //! `x X dd D yy Y cc C S p P J r ~ u Ctrl-r`, text objects
-//! (`iw aw`, `i" a"`, `i( a(`, `i[ a[`, `i{ a{`, `ip ap`), and `Esc`.
-//! Deliberately absent for now: `/` search, `:` ex-commands, marks,
-//! registers beyond the unnamed one, `%`, `>>`/`<<`, `s`, and `.` repeat of
-//! Visual-mode operations.
+//! (`iw aw`, `i" a"`, `i( a(`, `i[ a[`, `i{ a{`, `ip ap`), `Esc`, and the
+//! ex commands `:w` (flush) / `:q`, `:wq`, `:x` (flush and close; closing
+//! already saves, so `:q!` is unsupported and reported as unknown).
+//! Deliberately absent for now: `/` search, marks, registers beyond the
+//! unnamed one, `%`, `>>`/`<<`, `s`, and `.` repeat of Visual-mode
+//! operations.
 //!
 //! Text is manipulated as a `Vec<char>` per frame; markdown files are small
 //! enough that byte/char bookkeeping is not worth the extra risk.
@@ -37,6 +54,26 @@ pub fn set_enabled(ctx: &egui::Context, on: bool) {
     ctx.data_mut(|d| d.insert_temp(pref_id(), on));
 }
 
+/// Whether the vim block caret replaces egui's line caret for this editor
+/// (vim enabled and not in Insert mode; no state yet means Normal mode).
+pub fn block_cursor(ctx: &egui::Context, id: Id) -> bool {
+    enabled(ctx) && ctx_state(ctx, id).is_none_or(|s| s.mode != VimMode::Insert)
+}
+
+/// Event filter the editor needs while vim keys are on. egui's
+/// `Focus::begin_pass` surrenders keyboard focus on an unmodified `Escape`
+/// before any widget runs, unless the focused widget's filter opts in —
+/// which would drop the key press before `pre_edit` can switch modes.
+/// The arrow flags mirror `TextEdit`'s own defaults.
+pub fn event_filter(ctx: &egui::Context) -> Option<egui::EventFilter> {
+    enabled(ctx).then_some(egui::EventFilter {
+        tab: false,
+        horizontal_arrows: true,
+        vertical_arrows: true,
+        escape: true,
+    })
+}
+
 /// Modal state of one editor.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum VimMode {
@@ -55,6 +92,27 @@ impl VimMode {
             Self::Visual => "VISUAL",
             Self::VisualLine => "V-LINE",
         }
+    }
+}
+
+/// What a `:` command asks the view to do. It carries no paths or text:
+/// closing is the view's existing "flush, then remove" path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExCommand {
+    /// Flush the current buffer to disk now (`:w`).
+    Write,
+    /// Flush and close the current tab (`:q`, `:wq`, `:x`).
+    Close,
+}
+
+/// Parse the text typed after `:`. Closing always flushes first, so `wq`,
+/// `x` and `xit` are the same intent as `q`. The error text is what the strip
+/// shows for an unknown command.
+fn parse_ex(input: &str) -> Result<ExCommand, String> {
+    match input.trim() {
+        "w" | "write" => Ok(ExCommand::Write),
+        "q" | "quit" | "wq" | "x" | "xit" => Ok(ExCommand::Close),
+        other => Err(format!("Not a command: :{other}")),
     }
 }
 
@@ -108,6 +166,16 @@ struct VimState {
     keep_goal: bool,
     /// Visual-mode anchor (character index).
     anchor: usize,
+    /// Moving end of the visual selection as a vim character index. `None`
+    /// outside Visual/VisualLine: egui stores the selection end as an
+    /// exclusive boundary, so it cannot be read back from `TextEditState`.
+    visual_cursor: Option<usize>,
+    /// Text typed after `:`. `Some` exactly while the command line is open;
+    /// it can only become `Some` from Normal mode, so it never coexists with
+    /// Insert/Visual.
+    ex: Option<String>,
+    /// Unknown-command message shown in the mode strip until the next `:`.
+    ex_error: Option<String>,
     register: String,
     register_linewise: bool,
     /// Text before the current Insert session, so `u` undoes it in one step.
@@ -709,6 +777,13 @@ fn idle(state: &VimState) -> bool {
 }
 
 fn feed(state: &mut VimState, b: &mut Buf, ch: char) {
+    // `:` opens the command line; it is never part of a `.` change.
+    if ch == ':' && state.mode == VimMode::Normal && state.ex.is_none() {
+        cancel_command(state);
+        state.ex = Some(String::new());
+        state.ex_error = None;
+        return;
+    }
     if !state.replaying {
         if state.cmd_start.is_none() {
             state.cmd_start = Some(b.snapshot().text);
@@ -1445,6 +1520,7 @@ fn escape(state: &mut VimState, b: &mut Buf) {
         *stored = typed;
     }
     state.mode = VimMode::Normal;
+    state.ex = None;
     state.reset_pending();
     state.goal_col = None;
     state.cmd_buf.clear();
@@ -1529,22 +1605,97 @@ fn page(b: &mut Buf, down: bool) {
     goto_line(b, target);
 }
 
-/// Intercept keys before the `TextEdit` runs. Returns true when the buffer
-/// changed (so autosave can pick it up).
-pub fn pre_edit(ctx: &egui::Context, id: Id, text: &mut String) -> bool {
+/// Apply one event to the open command line. `Some(cmd)` means Enter closed
+/// it successfully. Returns whether the event was consumed; OS shortcuts
+/// (Cmd-…) stay with the app.
+fn feed_ex_line(
+    ex: &mut Option<String>,
+    error: &mut Option<String>,
+    event: &Event,
+) -> (bool, Option<ExCommand>) {
+    if matches!(event, Event::Key { modifiers, .. } if modifiers.command) {
+        return (false, None);
+    }
+    let Some(line) = ex.as_mut() else {
+        return (true, None);
+    };
+    match event {
+        Event::Text(s) | Event::Paste(s) => line.push_str(s),
+        Event::Key {
+            key: Key::Backspace,
+            pressed: true,
+            ..
+        } => {
+            line.pop();
+        }
+        Event::Key {
+            key: Key::Enter,
+            pressed: true,
+            ..
+        } => {
+            let parsed = parse_ex(line);
+            *ex = None;
+            return match parsed {
+                Ok(cmd) => {
+                    *error = None;
+                    (true, Some(cmd))
+                }
+                Err(msg) => {
+                    *error = Some(msg);
+                    (true, None)
+                }
+            };
+        }
+        _ => {}
+    }
+    (true, None)
+}
+
+/// Intercept keys before the `TextEdit` runs. Returns whether the buffer
+/// changed (so autosave can pick it up) and the `:` command completed this
+/// frame, if any.
+pub fn pre_edit(ctx: &egui::Context, id: Id, text: &mut String) -> (bool, Option<ExCommand>) {
     if !enabled(ctx) || !ctx.memory(|m| m.has_focus(id)) {
-        return false;
+        return (false, None);
     }
     let Some(mut edit_state) = TextEditState::load(ctx, id) else {
-        return false;
+        return (false, None);
     };
     let mut state: VimState = ctx
         .data(|d| d.get_temp::<VimState>(id.with("vim")))
         .unwrap_or_default();
     let range = edit_state.cursor.char_range();
-    let mut cursor = range.map(|r| r.primary.index.0).unwrap_or(0);
+    let egui_cursor = range.map(|r| r.primary.index.0).unwrap_or(0);
+    // egui keeps the selection end as an exclusive boundary, so in Visual
+    // mode the vim cursor is persisted instead of read back from it. Mouse
+    // and arrow input are the only cases where egui moves the caret itself,
+    // so those frames adopt its position.
+    let visual = matches!(state.mode, VimMode::Visual | VimMode::VisualLine);
+    let adopt_egui = visual
+        && ctx.input(|i| {
+            i.pointer.any_down()
+                || i.pointer.any_pressed()
+                || [
+                    Key::ArrowLeft,
+                    Key::ArrowRight,
+                    Key::ArrowUp,
+                    Key::ArrowDown,
+                    Key::Home,
+                    Key::End,
+                    Key::PageUp,
+                    Key::PageDown,
+                ]
+                .iter()
+                .any(|key| i.key_pressed(*key))
+        });
+    let mut cursor = if visual && !adopt_egui {
+        state.visual_cursor.unwrap_or(egui_cursor)
+    } else {
+        egui_cursor
+    };
     let mut buf: Option<Buf> = None;
     let mut changed = false;
+    let mut ex: Option<ExCommand> = None;
 
     let events = ctx.input_mut(|i| std::mem::take(&mut i.events));
     let mut keep: Vec<Event> = Vec::with_capacity(events.len());
@@ -1561,6 +1712,18 @@ pub fn pre_edit(ctx: &egui::Context, id: Id, text: &mut String) -> bool {
             escape(&mut state, b);
             cursor = b.cursor;
             continue;
+        }
+
+        // The open command line swallows every key except Esc (handled above)
+        // and OS shortcuts, so nothing reaches the document.
+        if state.ex.is_some() {
+            let (consumed, cmd) = feed_ex_line(&mut state.ex, &mut state.ex_error, &event);
+            if let Some(cmd) = cmd {
+                ex = Some(cmd);
+            }
+            if consumed {
+                continue;
+            }
         }
 
         if state.mode == VimMode::Insert {
@@ -1660,37 +1823,74 @@ pub fn pre_edit(ctx: &egui::Context, id: Id, text: &mut String) -> bool {
                 h_pos: None,
             }
         }
-        _ => CCursorRange::one(CCursor::new(clamp(cursor))),
+        // Normal mode keeps the caret on a character, even when a mouse
+        // click placed it past the end of the line.
+        VimMode::Normal => CCursorRange::one(CCursor::new(clamp_normal(&chars, cursor))),
+        VimMode::Insert => CCursorRange::one(CCursor::new(clamp(cursor))),
     };
+    // The vim cursor (inclusive) is the source of truth for the visual
+    // selection end; egui's range end (exclusive) is derived from it.
+    state.visual_cursor =
+        matches!(state.mode, VimMode::Visual | VimMode::VisualLine).then_some(cursor);
     if !drag_selecting {
         edit_state.cursor.set_char_range(Some(selection));
         edit_state.store(ctx, id);
     }
     ctx.data_mut(|d| d.insert_temp(id.with("vim"), state));
-    changed
+    (changed, ex)
+}
+
+/// Rect of the block caret: one glyph advance wide, or `fallback_w` at the
+/// end of a row or on an empty row (where there is no glyph to measure).
+fn block_rect(
+    galley: &egui::Galley,
+    primary: CCursor,
+    row_height: f32,
+    fallback_w: f32,
+) -> egui::Rect {
+    let base = egui::text_selection::text_cursor_state::cursor_rect(galley, &primary, row_height);
+    let pos = galley.pos_from_cursor(primary);
+    let next = galley.pos_from_cursor(primary + 1);
+    let width = if (next.min.y - pos.min.y).abs() < 1.0 && next.min.x > pos.min.x {
+        next.min.x - pos.min.x
+    } else {
+        fallback_w
+    };
+    egui::Rect::from_min_max(
+        egui::pos2(pos.min.x, base.min.y),
+        egui::pos2(pos.min.x + width, base.max.y),
+    )
+}
+
+/// Position of the block caret. Visual modes put it on the cursor character
+/// (egui's selection end points one past it); other modes use the caret as is.
+fn visual_block_cursor(state: Option<&VimState>, primary: CCursor, end: CCursor) -> CCursor {
+    match state {
+        Some(state) if matches!(state.mode, VimMode::Visual | VimMode::VisualLine) => CCursor::new(
+            state
+                .visual_cursor
+                .unwrap_or(primary.index.0)
+                .min(end.index.0),
+        ),
+        _ => primary,
+    }
 }
 
 /// Paint the block caret for Normal/Visual modes. Call after the widget.
 pub fn paint(ui: &egui::Ui, id: Id, output: &TextEditOutput) {
-    if !enabled(ui.ctx()) {
-        return;
-    }
-    let Some(state) = ctx_state(ui.ctx(), id) else {
-        return;
-    };
-    if state.mode == VimMode::Insert {
+    if !block_cursor(ui.ctx(), id) || !output.response.has_focus() {
         return;
     }
     let Some(range) = output.cursor_range else {
         return;
     };
+    let state = ctx_state(ui.ctx(), id);
+    let primary = visual_block_cursor(state.as_ref(), range.primary, output.galley.end());
     let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
-    let rect = egui::text_selection::text_cursor_state::cursor_rect(
-        &output.galley,
-        &range.primary,
-        row_height,
-    )
-    .translate(output.galley_pos.to_vec2());
+    let font_id = crate::theme::font_id(ui, egui::TextStyle::Monospace);
+    let fallback_w = ui.fonts_mut(|f| f.glyph_width(&font_id, ' '));
+    let rect = block_rect(&output.galley, primary, row_height, fallback_w)
+        .translate(output.galley_pos.to_vec2());
     let t = Tokens::get(ui.ctx());
     ui.painter()
         .rect_filled(rect, 1.0, t.accent.gamma_multiply(0.35));
@@ -1718,38 +1918,56 @@ pub fn status_bar(ui: &mut egui::Ui, id: Id) {
     ui.allocate_ui(egui::vec2(ui.available_width(), BAR_H), |ui| {
         ui.horizontal(|ui| {
             ui.add_space(2.0);
-            let mode = state.as_ref().map(|s| s.mode).unwrap_or_default();
-            let (label, color) = if on {
-                (
-                    mode.label(),
-                    if mode == VimMode::Insert {
-                        t.accent_text
-                    } else {
-                        t.text_muted
-                    },
-                )
+            let ex_line = state.as_ref().and_then(|s| s.ex.as_deref()).filter(|_| on);
+            if let Some(line) = ex_line {
+                // The `:` prompt replaces the toggle so vim cannot be turned
+                // off mid-command.
+                ui.label(
+                    egui::RichText::new(format!(":{line}"))
+                        .text_style(crate::theme::small_strong())
+                        .color(t.accent_text),
+                );
             } else {
-                ("vim", t.text_faint)
-            };
-            let badge = egui::Label::new(
-                egui::RichText::new(label)
-                    .text_style(crate::theme::small_strong())
-                    .color(color),
-            )
-            .selectable(false)
-            .sense(egui::Sense::click());
-            let resp = ui
-                .add(badge)
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(if on {
-                    "Vim keys are on — click to turn them off"
+                let mode = state.as_ref().map(|s| s.mode).unwrap_or_default();
+                let (label, color) = if on {
+                    (
+                        mode.label(),
+                        if mode == VimMode::Insert {
+                            t.accent_text
+                        } else {
+                            t.text_muted
+                        },
+                    )
                 } else {
-                    "Vim keys are off — click to turn them on"
-                });
-            if resp.clicked() {
-                set_enabled(ui.ctx(), !on);
+                    ("vim", t.text_faint)
+                };
+                let badge = egui::Label::new(
+                    egui::RichText::new(label)
+                        .text_style(crate::theme::small_strong())
+                        .color(color),
+                )
+                .selectable(false)
+                .sense(egui::Sense::click());
+                let resp = ui
+                    .add(badge)
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(if on {
+                        "Vim keys are on — click to turn them off"
+                    } else {
+                        "Vim keys are off — click to turn them on"
+                    });
+                if resp.clicked() {
+                    set_enabled(ui.ctx(), !on);
+                }
             }
             if on {
+                if let Some(msg) = state.as_ref().and_then(|s| s.ex_error.as_deref()) {
+                    ui.label(
+                        egui::RichText::new(msg)
+                            .text_style(egui::TextStyle::Small)
+                            .color(ui.visuals().error_fg_color),
+                    );
+                }
                 if let Some(state) = &state {
                     let mut pending = String::new();
                     if let Some(count) = state.count {
@@ -1810,6 +2028,19 @@ mod tests {
 
     fn text(b: &Buf) -> String {
         b.chars.iter().collect()
+    }
+
+    #[test]
+    fn parse_ex_accepts_the_supported_commands() {
+        for line in ["w", "write", " w "] {
+            assert_eq!(parse_ex(line), Ok(ExCommand::Write), ":{line}");
+        }
+        for line in ["q", "quit", "wq", "x", "xit"] {
+            assert_eq!(parse_ex(line), Ok(ExCommand::Close), ":{line}");
+        }
+        for line in ["", "q!", "foo"] {
+            assert!(parse_ex(line).is_err(), ":{line} must be rejected");
+        }
     }
 
     #[test]
@@ -1968,6 +2199,73 @@ mod tests {
         }
     }
 
+    fn show_editor(ui: &mut egui::Ui, id: Id, text: &mut String) {
+        let mut te = egui::TextEdit::multiline(text).id(id);
+        if let Some(filter) = event_filter(ui.ctx()) {
+            te = te.event_filter(filter);
+        }
+        let _ = te.show(ui);
+    }
+
+    fn shapes_text(output: &egui::FullOutput) -> String {
+        output
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) => Some(t.galley.job.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A live `TextEdit` wired the way `markdown.rs` shows it: `pre_edit`
+    /// runs first, with the vim event filter registered.
+    struct LiveEditor {
+        ctx: egui::Context,
+        id: Id,
+        text: String,
+    }
+
+    impl LiveEditor {
+        fn new(id: &str, text: &str) -> Self {
+            let ctx = egui::Context::default();
+            crate::theme::install_fonts(&ctx);
+            crate::theme::apply_visuals(&ctx, false);
+            set_enabled(&ctx, true);
+            let id = Id::new(id);
+            let mut editor = Self {
+                ctx,
+                id,
+                text: text.to_string(),
+            };
+            // Frame 1: create the widget and its persisted state.
+            let LiveEditor { ctx, id, text } = &mut editor;
+            let mut first = ctx.run_ui(egui::RawInput::default(), |ui| show_editor(ui, *id, text));
+            first.textures_delta.clear();
+            ctx.memory_mut(|m| m.request_focus(*id));
+            editor
+        }
+
+        /// Run one frame with `events`. Returns what `pre_edit` reports.
+        fn frame(&mut self, events: Vec<Event>) -> (bool, Option<ExCommand>) {
+            let LiveEditor { ctx, id, text } = self;
+            let mut result = (false, None);
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    result = pre_edit(ui.ctx(), *id, text);
+                    show_editor(ui, *id, text);
+                },
+            );
+            output.textures_delta.clear();
+            result
+        }
+    }
+
     /// End-to-end: events are intercepted before the `TextEdit`, the buffer
     /// shrinks, and Insert mode still types normally.
     #[test]
@@ -1998,7 +2296,7 @@ mod tests {
         };
         let mut changed = false;
         let mut output = ctx.run_ui(input, |ui| {
-            changed = pre_edit(ui.ctx(), id, &mut text);
+            changed = pre_edit(ui.ctx(), id, &mut text).0;
             let _ = egui::TextEdit::multiline(&mut text).id(id).show(ui);
         });
         output.textures_delta.clear();
@@ -2022,6 +2320,142 @@ mod tests {
         output.textures_delta.clear();
         assert_eq!(ctx_state(&ctx, id).unwrap().mode, VimMode::Insert);
         assert_eq!(text, "xtwo\nthree");
+    }
+
+    /// Regression: egui's focus pass defocuses a `TextEdit` on `Escape`
+    /// before widgets run, unless the widget's `EventFilter` opts in. With
+    /// the filter from [`event_filter`], `Esc` must reach `pre_edit` and
+    /// switch back to Normal while the editor keeps focus.
+    #[test]
+    fn escape_returns_to_normal_in_a_live_text_edit() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply_visuals(&ctx, false);
+        set_enabled(&ctx, true);
+        let id = Id::new("vim-escape-editor");
+        let mut text = String::from("abc");
+
+        // Show the editor with the vim event filter, as markdown.rs does.
+        fn show(ui: &mut egui::Ui, id: Id, text: &mut String) {
+            pre_edit(ui.ctx(), id, text);
+            let mut te = egui::TextEdit::multiline(text).id(id);
+            if let Some(filter) = event_filter(ui.ctx()) {
+                te = te.event_filter(filter);
+            }
+            let _ = te.show(ui);
+        }
+
+        // Frame 1: create the widget + its persisted state.
+        let mut first = ctx.run_ui(egui::RawInput::default(), |ui| show(ui, id, &mut text));
+        first.textures_delta.clear();
+        ctx.memory_mut(|m| m.request_focus(id));
+
+        // Frame 2: `i` enters Insert mode.
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![Event::Text("i".into())],
+                ..Default::default()
+            },
+            |ui| show(ui, id, &mut text),
+        );
+        output.textures_delta.clear();
+        assert_eq!(ctx_state(&ctx, id).unwrap().mode, VimMode::Insert);
+
+        // Frame 3: Escape must not defocus (the filter registered above),
+        // so pre_edit sees the key and switches back to Normal.
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![key(Key::Escape)],
+                ..Default::default()
+            },
+            |ui| show(ui, id, &mut text),
+        );
+        output.textures_delta.clear();
+        assert_eq!(ctx_state(&ctx, id).unwrap().mode, VimMode::Normal);
+        assert!(ctx.memory(|m| m.has_focus(id)), "Esc must keep focus");
+    }
+
+    /// The command line must never reach the document: `:`, the typed text and
+    /// Enter are all consumed by the vim layer.
+    #[test]
+    fn ex_command_line_never_touches_the_buffer() {
+        let mut editor = LiveEditor::new("vim-ex-editor", "abc");
+        editor.frame(vec![Event::Text(":".into())]);
+        assert_eq!(
+            ctx_state(&editor.ctx, editor.id).unwrap().ex.as_deref(),
+            Some("")
+        );
+        editor.frame(vec![Event::Text("w".into())]);
+        assert_eq!(
+            ctx_state(&editor.ctx, editor.id).unwrap().ex.as_deref(),
+            Some("w")
+        );
+        assert_eq!(
+            editor.text, "abc",
+            "the command line must not reach the document"
+        );
+        let (changed, cmd) = editor.frame(vec![key(Key::Enter)]);
+        let state = ctx_state(&editor.ctx, editor.id).unwrap();
+        assert_eq!(state.ex, None);
+        assert_eq!(state.ex_error, None);
+        assert_eq!(editor.text, "abc");
+        assert!(!changed);
+        assert_eq!(cmd, Some(ExCommand::Write));
+    }
+
+    #[test]
+    fn unknown_ex_command_reports_an_error_without_touching_the_buffer() {
+        let mut editor = LiveEditor::new("vim-ex-unknown", "abc");
+        editor.frame(vec![Event::Text(":".into())]);
+        editor.frame(vec![Event::Text("z".into()), Event::Text("z".into())]);
+        editor.frame(vec![key(Key::Enter)]);
+        let state = ctx_state(&editor.ctx, editor.id).unwrap();
+        assert_eq!(state.ex, None);
+        assert_eq!(state.ex_error.as_deref(), Some("Not a command: :zz"));
+        assert_eq!(editor.text, "abc");
+    }
+
+    #[test]
+    fn escape_cancels_the_ex_line() {
+        let mut editor = LiveEditor::new("vim-ex-escape", "abc");
+        editor.frame(vec![Event::Text(":".into()), Event::Text("q".into())]);
+        editor.frame(vec![key(Key::Escape)]);
+        let state = ctx_state(&editor.ctx, editor.id).unwrap();
+        assert_eq!(state.ex, None);
+        assert_eq!(state.mode, VimMode::Normal);
+        assert_eq!(editor.text, "abc");
+    }
+
+    #[test]
+    fn status_bar_shows_the_command_line() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply_visuals(&ctx, false);
+        set_enabled(&ctx, true);
+        let id = Id::new("vim-status-bar");
+        let mut state = VimState::default();
+        state.ex = Some("w".into());
+        ctx.data_mut(|d| d.insert_temp(id.with("vim"), state));
+
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| status_bar(ui, id));
+        let text = shapes_text(&output);
+        output.textures_delta.clear();
+        assert!(
+            text.contains(":w"),
+            "strip shows the command line: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_command_line_is_not_a_dot_repeat_candidate() {
+        let mut editor = LiveEditor::new("vim-ex-dot", "abc");
+        editor.frame(vec![Event::Text("x".into())]);
+        assert_eq!(editor.text, "bc");
+        editor.frame(vec![Event::Text(":".into()), Event::Text("w".into())]);
+        editor.frame(vec![key(Key::Enter)]);
+        assert_eq!(editor.text, "bc", "`:w` is not an edit");
+        editor.frame(vec![Event::Text(".".into())]);
+        assert_eq!(editor.text, "c", "`.` still repeats `x`, not `:w`");
     }
 
     #[test]
@@ -2198,6 +2632,150 @@ mod tests {
         assert_eq!(text, "aQc");
     }
 
+    /// Sorted char range currently stored in egui, as `start..end`.
+    fn live_range(ctx: &egui::Context, id: Id) -> Option<(usize, usize)> {
+        let state = TextEditState::load(ctx, id)?;
+        state.cursor.char_range().map(|range| {
+            let [a, b] = range.sorted_cursors();
+            (a.index.0, b.index.0)
+        })
+    }
+
+    /// Run one frame of a live editor with the vim filter, like `markdown.rs`.
+    fn frame(ctx: &egui::Context, id: Id, text: &mut String, events: Vec<Event>) {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                pre_edit(ui.ctx(), id, text);
+                let mut editor = egui::TextEdit::multiline(text).id(id);
+                if let Some(filter) = event_filter(ui.ctx()) {
+                    editor = editor.event_filter(filter);
+                }
+                let _ = editor.show(ui);
+            },
+        );
+        output.textures_delta.clear();
+    }
+
+    fn focused_editor(ctx: &egui::Context, id: Id, text: &mut String) {
+        frame(ctx, id, text, Vec::new());
+        ctx.memory_mut(|m| m.request_focus(id));
+    }
+
+    /// A Visual selection must not grow while nothing is pressed. The vim
+    /// cursor is an inclusive index, egui's range end is exclusive, so the
+    /// end must be persisted rather than read back from `TextEditState`.
+    #[test]
+    fn visual_selection_does_not_grow_on_idle_frames() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply_visuals(&ctx, false);
+        set_enabled(&ctx, true);
+        let id = Id::new("vim-visual-idle-editor");
+        let mut text = String::from("hello world");
+        focused_editor(&ctx, id, &mut text);
+
+        frame(&ctx, id, &mut text, vec![Event::Text("v".into())]);
+        assert_eq!(live_range(&ctx, id), Some((0, 1)), "`v` selects one char");
+
+        for _ in 0..3 {
+            frame(&ctx, id, &mut text, Vec::new());
+            assert_eq!(
+                live_range(&ctx, id),
+                Some((0, 1)),
+                "an idle frame must not extend the selection"
+            );
+        }
+    }
+
+    /// `w` / `h` / `e` extend and shrink the highlight one character at a
+    /// time instead of starting one char past the cursor.
+    #[test]
+    fn visual_motions_move_one_character_at_a_time() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply_visuals(&ctx, false);
+        set_enabled(&ctx, true);
+        let id = Id::new("vim-visual-motion-editor");
+        let mut text = String::from("hello world");
+        focused_editor(&ctx, id, &mut text);
+
+        frame(
+            &ctx,
+            id,
+            &mut text,
+            vec![Event::Text("v".into()), Event::Text("w".into())],
+        );
+        assert_eq!(live_range(&ctx, id), Some((0, 7)), "`vw` stops on 'w'");
+
+        frame(&ctx, id, &mut text, vec![Event::Text("h".into())]);
+        assert_eq!(live_range(&ctx, id), Some((0, 6)), "`h` shrinks by one");
+
+        let chars: Vec<char> = text.chars().collect();
+        let end = word_end(&chars, 5, false) + 1;
+        frame(&ctx, id, &mut text, vec![Event::Text("e".into())]);
+        assert_eq!(live_range(&ctx, id), Some((0, end)), "`e` ends the word");
+    }
+
+    /// `j` keeps the column, so only the same column of the next row is
+    /// highlighted — not the whole row.
+    #[test]
+    fn visual_line_motion_keeps_the_column() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply_visuals(&ctx, false);
+        set_enabled(&ctx, true);
+        let id = Id::new("vim-visual-line-editor");
+        let mut text = String::from("ab\ncd");
+        focused_editor(&ctx, id, &mut text);
+
+        frame(&ctx, id, &mut text, vec![Event::Text("v".into())]);
+        frame(&ctx, id, &mut text, vec![Event::Text("j".into())]);
+        assert_eq!(
+            live_range(&ctx, id),
+            Some((0, 4)),
+            "`vj` reaches column 0 of row 2, not the end of the row"
+        );
+    }
+
+    /// The block caret sits on the last selected character, not on the
+    /// exclusive boundary one past it.
+    #[test]
+    fn visual_block_sits_on_the_cursor_char() {
+        let mut state = VimState {
+            mode: VimMode::Visual,
+            anchor: 1,
+            visual_cursor: Some(3),
+            ..Default::default()
+        };
+        let end = CCursor::new(9);
+        assert_eq!(
+            visual_block_cursor(Some(&state), CCursor::new(4), end)
+                .index
+                .0,
+            3
+        );
+        // A stale index beyond the text falls back to the galley end.
+        state.visual_cursor = Some(99);
+        assert_eq!(
+            visual_block_cursor(Some(&state), CCursor::new(4), end)
+                .index
+                .0,
+            9
+        );
+        // Outside Visual modes the caret is used unchanged.
+        state.mode = VimMode::Normal;
+        assert_eq!(
+            visual_block_cursor(Some(&state), CCursor::new(4), end)
+                .index
+                .0,
+            4
+        );
+    }
+
     /// The Visual anchor must survive across frames (it lives in `VimState`,
     /// not in the per-frame scratch of `pre_edit`).
     #[test]
@@ -2240,5 +2818,85 @@ mod tests {
         );
         output.textures_delta.clear();
         assert_eq!(text, "a", "selection ran from anchor 1 to cursor 2");
+    }
+
+    #[test]
+    fn escape_returns_to_normal_and_steps_back() {
+        let (mut state, mut b) = run("abc", 1, "i");
+        assert_eq!(state.mode, VimMode::Insert);
+        escape(&mut state, &mut b);
+        assert_eq!(state.mode, VimMode::Normal);
+        assert_eq!(b.cursor, 0);
+    }
+
+    #[test]
+    fn clamp_normal_pulls_past_eol_back_onto_the_last_char() {
+        let chars: Vec<char> = "abc\ndef".chars().collect();
+        assert_eq!(clamp_normal(&chars, 3), 2, "the newline slot clamps to 'c'");
+        assert_eq!(clamp_normal(&chars, 7), 6, "end of buffer clamps to 'f'");
+        let empty: Vec<char> = Vec::new();
+        assert_eq!(clamp_normal(&empty, 0), 0);
+    }
+
+    fn galley(text: &str) -> egui::Galley {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        crate::theme::apply_visuals(&ctx, false);
+        let mut slot = None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let font_id = crate::theme::font_id(ui, egui::TextStyle::Monospace);
+            slot = Some(
+                ui.fonts_mut(|f| {
+                    f.layout(
+                        text.to_string(),
+                        font_id,
+                        egui::Color32::WHITE,
+                        f32::INFINITY,
+                    )
+                })
+                .as_ref()
+                .clone(),
+            );
+        });
+        output.textures_delta.clear();
+        slot.unwrap()
+    }
+
+    #[test]
+    fn block_rect_is_one_glyph_advance_wide() {
+        let g = galley("abcd\nef");
+        let fallback = 8.4;
+        let first = block_rect(&g, CCursor::new(0), 14.0, fallback);
+        let second = block_rect(&g, CCursor::new(1), 14.0, fallback);
+        assert!(first.width() > 3.0, "a real block, not a thin strip");
+        // Glyph positions are pixel-rounded, so advances match within 1 px.
+        assert!(
+            (first.width() - second.width()).abs() <= 1.0,
+            "monospace advance is uniform up to pixel rounding"
+        );
+        assert!(
+            (second.min.x - first.max.x).abs() < 0.01,
+            "blocks tile without gaps"
+        );
+        // The last glyph of a row still gets its advance (next slot is '\n').
+        let last = block_rect(&g, CCursor::new(3), 14.0, fallback);
+        assert!((last.width() - first.width()).abs() <= 1.0);
+    }
+
+    #[test]
+    fn block_rect_falls_back_where_no_glyph_follows() {
+        let fallback = 8.4;
+        let g = galley("a\n\nb");
+        assert_eq!(
+            block_rect(&g, CCursor::new(2), 14.0, fallback).width(),
+            fallback,
+            "empty row"
+        );
+        let end = galley("ab");
+        assert_eq!(
+            block_rect(&end, CCursor::new(2), 14.0, fallback).width(),
+            fallback,
+            "end of buffer"
+        );
     }
 }

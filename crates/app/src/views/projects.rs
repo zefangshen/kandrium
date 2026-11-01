@@ -28,6 +28,7 @@ use crate::views::notes_highlight::MarkdownHighlighter;
 use crate::widgets;
 use crate::widgets::markdown::{self, NoteMode};
 use crate::widgets::tabs::TAB_H;
+use crate::widgets::vim::ExCommand;
 
 const AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 const TREE_DEFAULT_W: f32 = 240.0;
@@ -441,6 +442,16 @@ impl ProjectsState {
     /// Projects root (for delete/create guards and reveal-in-Finder).
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Execute a `:` command typed in a document tab.
+    fn run_ex(&mut self, idx: usize, cmd: ExCommand) {
+        match cmd {
+            ExCommand::Write => {
+                self.tabs.flush_doc(&self.root, idx);
+            }
+            ExCommand::Close => self.tabs.close(&self.root, idx),
+        }
     }
 
     /// Selected project id (persisted session).
@@ -2491,18 +2502,18 @@ fn doc_panel(ui: &mut egui::Ui, state: &mut ProjectsState) {
         .as_ref()
         .expect("highlighter set by detail_body");
 
-    ui.add(
-        egui::Label::new(egui::RichText::new(doc_label(&doc.rel)).text_style(theme::strong()))
-            .wrap_mode(egui::TextWrapMode::Truncate),
-    );
     if let Some(err) = error.as_deref() {
         ui.colored_label(ui.visuals().error_fg_color, err);
+        ui.add_space(6.0);
     }
-    ui.add_space(6.0);
 
     let id = egui::Id::new(("project-doc", doc.rel.as_os_str()));
-    if markdown::body(ui, id, &mut doc.text, doc.mode, hl, preview_cache) {
+    let (changed, ex) = markdown::body(ui, id, &mut doc.text, doc.mode, hl, preview_cache);
+    if changed {
         doc.dirty_since = Some(Instant::now());
+    }
+    if let Some(cmd) = ex {
+        state.run_ex(idx, cmd);
     }
 }
 
