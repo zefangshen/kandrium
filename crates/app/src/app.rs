@@ -87,6 +87,9 @@ struct EditSession {
     area_targets: Vec<Board>,
     /// All projects, for tagging a normal-board card.
     project_targets: Vec<ProjectChoice>,
+    /// Markdown description field state (edit/preview mode + cache), reset
+    /// per session.
+    desc: card_modal::DescState,
 }
 
 /// Persisted UI state.
@@ -512,6 +515,7 @@ impl KandriumApp {
                 is_project_card,
                 area_targets: self.boards.clone(),
                 project_targets: self.projects_state.project_choices(),
+                desc: card_modal::DescState::default(),
             });
         }
     }
@@ -1572,19 +1576,23 @@ impl KandriumApp {
                 .cloned()
                 .collect();
 
+            let targets = card_modal::ModalTargets {
+                move_targets: &move_targets,
+                area_targets: &editing.area_targets,
+                project_targets: &editing.project_targets,
+                is_project_card: editing.is_project_card,
+            };
             match card_modal::show(
                 &ctx,
                 &mut editing.state,
                 archived,
-                &move_targets,
-                &editing.area_targets,
-                &editing.project_targets,
-                editing.is_project_card,
+                &targets,
+                &mut editing.desc,
             ) {
                 card_modal::CardModalOutcome::None => {}
                 card_modal::CardModalOutcome::Closed => self.editing = None,
                 card_modal::CardModalOutcome::Action(actions) => {
-                    if actions.save {
+                    if actions.save || actions.save_keep_open {
                         let body = editing.state.to_body();
                         let project_id = editing.state.project_id.clone();
                         let area_board_id = if editing.state.area_enabled {
@@ -1593,7 +1601,11 @@ impl KandriumApp {
                             None
                         };
                         let is_project_card = editing.is_project_card;
-                        self.editing = None;
+                        // `:w` saves without closing; every other save path
+                        // dismisses the modal.
+                        if actions.save {
+                            self.editing = None;
+                        }
                         self.run("Save failed", |db| {
                             kandrium_core::update_card(db, &card_id, &body)?;
                             if is_project_card {
@@ -1611,6 +1623,9 @@ impl KandriumApp {
                             }
                             Ok(())
                         });
+                        if actions.save_keep_open && !actions.save {
+                            self.set_status("Card saved".to_string(), false);
+                        }
                     }
                     if actions.toggle_archive {
                         self.editing = None;

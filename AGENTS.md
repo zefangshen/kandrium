@@ -107,7 +107,9 @@ Workspace, edition 2024. All comments, identifiers, and docs are in English.
   `projects::read_doc` / `write_doc` (root-guarded, `<projects_root>/<id>/`),
   and the shared markdown editor/preview is `widgets/markdown.rs`.
 - Markdown editing is vim-modal by default (`widgets/vim.rs`, open in Notes,
-  project docs and Documents `.md` tabs). The editor stays an
+  project docs, Documents `.md` tabs, and the card modal's description
+  field — there `:w` saves without closing and Esc stays with vim while the
+  field is focused). The editor stays an
   `egui::TextEdit`: `vim::pre_edit` rewrites the pending input events before
   the widget runs, mutates the buffer for Normal/Visual commands, and moves the
   caret via `TextEditState` (loaded under the pinned `markdown-editor` widget
@@ -231,7 +233,11 @@ shell (screen capture blocked) — ask the user to confirm UI changes.
 - **Fixed-height multiline editor**: outer fixed bordered `Frame` +
   inner `ScrollArea::vertical().max_height(h).auto_shrink([false; 2])` +
   frameless `TextEdit::multiline` (egui 0.36 multiline has no internal scroll).
-  Reference: `description_editor()` in `widgets/card_modal.rs`.
+  Reference: `description_editor()` in `widgets/card_modal.rs`. The card
+  description is a markdown field: `markdown::mode_toggle` (eye/pencil) on the
+  label row switches to `description_preview()` (same fixed-height frame,
+  `CommonMarkViewer`); mode + `CommonMarkCache` live on `EditSession`, reset
+  to Edit per open, not persisted.
 - **egui context lock is not reentrant**: never call `ctx.input()` inside
   `ctx.data_mut()`; read input first.
 - eframe's app-creator closure runs before `applicationDidFinishLaunching`;

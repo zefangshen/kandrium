@@ -12,7 +12,7 @@ use crate::views::notes_highlight::MarkdownHighlighter;
 use crate::widgets::vim::ExCommand;
 
 /// How a markdown tab renders its buffer.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoteMode {
     Edit,
     Preview,
