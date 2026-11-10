@@ -32,6 +32,8 @@ mod pdf_probe;
 mod harness_test;
 
 fn main() {
+    let _ = kandrium_core::logging::init("kandrium-gpui");
+    kandrium_core::logging::install_panic_hook("kandrium-gpui");
     let mode = std::env::args().nth(1).unwrap_or_else(|| "app".into());
     match mode.as_str() {
         "app" => kandrium_app_gpui::run(),
