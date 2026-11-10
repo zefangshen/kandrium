@@ -1,10 +1,11 @@
-//! Kandrium on gpui — Stage 1 foundation.
+//! Kandrium on gpui — Stage 1 foundation plus Stage 2 board interactivity.
 //!
-//! Tenant of the migration: this crate only composes views. Every query and
-//! every derivation lives in `kandrium-core`, and the database handle is
-//! read-only so the egui app and this front-end never contend for the write
-//! lock.
+//! Contract of the migration: this crate only composes views. Every query,
+//! every derivation and every mutation lives in `kandrium-core`. Reads use a
+//! read-only handle; writes go through a handle bootstrapped exactly like the
+//! egui app and the MCP server.
 
+pub mod anim;
 pub mod app;
 pub mod assets;
 pub mod store;
