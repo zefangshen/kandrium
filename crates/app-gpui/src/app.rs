@@ -5,23 +5,32 @@
 //! (read-only); Notes, Documents and Projects state honestly that they have not
 //! been ported yet.
 
+use std::time::Duration;
+
 use gpui_kit::TestSupportExt;
 use gpui_kit::component::input::{InputState, TextareaState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, ClickEvent, Context, Focusable, IntoElement, KeyDownEvent, Render, Window, div, px,
+    AnyElement, ClickEvent, Context, DragMoveEvent, Focusable, IntoElement, KeyDownEvent, Render,
+    Window, div, px,
 };
 use jiff::Timestamp;
+use jiff::civil::Date;
 use kandrium_core::{
-    ALL_BOARD_ID, Board, BoardWithColumns, CardStatus, CreateCardBody, ProjectChoice,
+    ALL_BOARD_ID, Board, BoardWithColumns, CardStatus, CreateCardBody, Person, ProjectChoice,
+    Travel, day_end_seconds, day_start_seconds,
 };
 
 use crate::assets::{Icon, icon};
-use crate::store::{ClockRow, Store};
+use crate::store::Store;
 use crate::theme::{Text, TextStyled, Tokens};
 use crate::views::card_modal::{self, EditSession, ModalContext};
+use crate::views::clocks::{
+    self, ClockDrag, ClockState, ConfirmKind, ConfirmState, DragState, FormKind, FormState,
+    InspectorState, PickerState,
+};
 use crate::views::tasks::DropTarget;
-use crate::views::{clocks, placeholder, tasks};
+use crate::views::{placeholder, tasks};
 use crate::vim;
 
 /// The five top-level sections, in the same order as the egui app.
@@ -96,9 +105,11 @@ pub struct AppShell {
     drop_generation: u64,
     editing: Option<EditSession>,
     project_choices: Vec<ProjectChoice>,
-    clock_rows: Vec<ClockRow>,
-    clock_error: Option<String>,
-    now: Timestamp,
+    pub(crate) clocks: ClockState,
+    /// Bumped to retarget or stop the minute tick.
+    clock_tick: u64,
+    /// Generation of the tick loop currently allowed to run.
+    clock_tick_running: Option<u64>,
 }
 
 impl AppShell {
@@ -123,9 +134,9 @@ impl AppShell {
             drop_generation: 0,
             editing: None,
             project_choices: Vec::new(),
-            clock_rows: Vec::new(),
-            clock_error: None,
-            now: Timestamp::now(),
+            clocks: ClockState::new(),
+            clock_tick: 0,
+            clock_tick_running: None,
         };
         shell.load_tasks();
         shell.load_clocks();
@@ -146,6 +157,9 @@ impl AppShell {
             Section::Tasks => self.load_tasks(),
             Section::Clocks => self.load_clocks(),
             Section::Notes | Section::Documents | Section::Projects => {}
+        }
+        if section != Section::Clocks {
+            self.invalidate_clock_tick();
         }
         cx.notify();
     }
@@ -520,18 +534,799 @@ impl AppShell {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Clocks
+    // -----------------------------------------------------------------------
+
+    /// Read one consistent snapshot of cities, people and trips. Rendering and
+    /// the minute tick work from this cache, so a tick never touches SQLite.
     fn load_clocks(&mut self) {
-        self.now = Timestamp::now();
-        match self.store.clocks(self.now, self.use_24h) {
-            Ok(rows) => {
-                self.clock_rows = rows;
-                self.clock_error = None;
+        match self.store.clock_data() {
+            Ok(data) => {
+                self.clocks.load(data);
+                self.clocks.error = None;
             }
-            Err(e) => {
-                self.clock_rows.clear();
-                self.clock_error = Some(e);
+            Err(error) => {
+                self.clocks.entries.clear();
+                self.clocks.travels.clear();
+                self.clocks.error = Some(error);
             }
         }
+        self.invalidate_clock_tick();
+    }
+
+    fn clock_person(&self, person_id: &str) -> Option<&Person> {
+        self.clocks
+            .entries
+            .iter()
+            .flat_map(|entry| entry.people.iter())
+            .find(|person| person.id == person_id)
+    }
+
+    fn clock_travel(&self, travel_id: &str) -> Option<&Travel> {
+        self.clocks
+            .travels
+            .iter()
+            .find(|travel| travel.id == travel_id)
+    }
+
+    /// Stop the running tick loop. The loop notices the new generation and
+    /// exits; the next render starts a fresh one.
+    fn invalidate_clock_tick(&mut self) {
+        self.clock_tick = self.clock_tick.wrapping_add(1);
+        self.clock_tick_running = None;
+    }
+
+    /// Keep one tick loop alive while Clocks is on screen. It waits for the
+    /// nearer of the next minute and the nearest travel boundary, then
+    /// refreshes `now` from the cached rows only.
+    fn ensure_clock_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let generation = self.clock_tick;
+        if self.clock_tick_running == Some(generation) {
+            return;
+        }
+        self.clock_tick_running = Some(generation);
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                let wait = this.update_in(cx, |this, _window, cx| {
+                    if this.clock_tick_running != Some(generation)
+                        || this.section != Section::Clocks
+                    {
+                        return None;
+                    }
+                    this.clocks.set_now(Timestamp::now());
+                    cx.notify();
+                    Some(this.clocks.next_wait())
+                });
+                let Ok(Some(wait)) = wait else {
+                    break;
+                };
+                cx.background_executor()
+                    .timer(wait.max(Duration::from_millis(50)))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    /// Times are formatted at render time, so the toggle needs no reload.
+    pub(crate) fn toggle_clock_units(&mut self, cx: &mut Context<Self>) {
+        self.use_24h = !self.use_24h;
+        cx.notify();
+    }
+
+    pub(crate) fn open_clock_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.clocks.ensure_zones();
+        let input = cx
+            .new(|cx| InputState::new(window, cx).placeholder("Search city, region or time zone"));
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.clocks.picker = Some(PickerState {
+            input,
+            selected: 0,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn close_clock_picker(&mut self, cx: &mut Context<Self>) {
+        if self.clocks.picker.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn clear_clock_picker_search(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(picker) = &self.clocks.picker else {
+            return;
+        };
+        let input = picker.input.clone();
+        input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+            state.focus(window, cx);
+        });
+        if let Some(picker) = &mut self.clocks.picker {
+            picker.selected = 0;
+            picker.error = None;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn handle_picker_key(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(picker) = &self.clocks.picker else {
+            return;
+        };
+        let query = picker.input.read(cx).value().to_string();
+        let rows = clocks::picker_rows(&self.clocks.zones, &query);
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                cx.stop_propagation();
+                self.close_clock_picker(cx);
+            }
+            "down" | "up" => {
+                cx.stop_propagation();
+                let from = self
+                    .clocks
+                    .picker
+                    .as_ref()
+                    .map(|picker| picker.selected)
+                    .unwrap_or(0);
+                let next = clocks::next_selectable(
+                    &self.clocks.entries,
+                    &rows,
+                    from,
+                    event.keystroke.key == "down",
+                );
+                if let Some(picker) = &mut self.clocks.picker {
+                    picker.selected = next;
+                }
+                cx.notify();
+            }
+            "enter" => {
+                cx.stop_propagation();
+                let selected = self
+                    .clocks
+                    .picker
+                    .as_ref()
+                    .map(|picker| picker.selected)
+                    .unwrap_or(0);
+                if let Some(zone) = rows.get(selected).cloned()
+                    && !clocks::zone_is_added(&self.clocks.entries, &zone)
+                {
+                    self.pick_zone(&zone, cx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Add a zone and keep the picker open, matching the egui picker.
+    pub(crate) fn pick_zone(&mut self, zone: &str, cx: &mut Context<Self>) {
+        match self.store.add_clock(zone) {
+            Ok(()) => {
+                self.load_clocks();
+                if let Some(picker) = &mut self.clocks.picker {
+                    picker.selected = 0;
+                    picker.error = None;
+                }
+            }
+            Err(error) => {
+                if let Some(picker) = &mut self.clocks.picker {
+                    picker.error = Some(error);
+                } else {
+                    self.clocks.error = Some(error);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn clear_clock_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(input) = self.clocks.search_input.clone() {
+            input.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+                state.focus(window, cx);
+            });
+        }
+        self.clocks.search.clear();
+        self.clocks.clear_drag();
+        cx.notify();
+    }
+
+    pub(crate) fn start_clock_drag(&mut self, from: usize, clock_id: &str, cx: &mut Context<Self>) {
+        let same = self
+            .clocks
+            .drag
+            .as_ref()
+            .is_some_and(|drag| drag.clock_id == clock_id);
+        if same {
+            return;
+        }
+        self.clocks.drag = Some(DragState {
+            clock_id: clock_id.to_string(),
+            from,
+        });
+        self.clocks.hover = Some(from);
+        cx.notify();
+    }
+
+    /// Turn the pointer position into a static insertion slot. The geometry
+    /// comes from the grid container's own bounds, so the preview reflow never
+    /// moves the targets.
+    pub(crate) fn hover_clock(&mut self, event: &DragMoveEvent<ClockDrag>, cx: &mut Context<Self>) {
+        if self.clocks.drag.is_none() || !self.clocks.search.trim().is_empty() {
+            return;
+        }
+        let grid = clocks::StaticGrid::new(
+            f32::from(event.bounds.origin.x),
+            f32::from(event.bounds.origin.y),
+            f32::from(event.bounds.size.width),
+            self.clocks.entries.len(),
+        );
+        let hover = grid.slot_at(
+            f32::from(event.event.position.x),
+            f32::from(event.event.position.y),
+        );
+        if hover != self.clocks.hover {
+            self.clocks.hover = hover;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn drop_clock(&mut self, drag: &ClockDrag, cx: &mut Context<Self>) {
+        let hover = self.clocks.hover;
+        self.clocks.clear_drag();
+        let Some(hover) = hover else {
+            cx.notify();
+            return;
+        };
+        if hover == drag.from {
+            cx.notify();
+            return;
+        }
+        let order = clocks::reordered(&self.clocks.order(), drag.from, hover);
+        match self.store.reorder_clocks(&order) {
+            Ok(()) => self.load_clocks(),
+            Err(error) => self.clocks.error = Some(error),
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn ask_remove_clock(&mut self, clock_id: &str, city: &str, cx: &mut Context<Self>) {
+        self.clocks.confirm = Some(ConfirmState {
+            kind: ConfirmKind::RemoveClock {
+                clock_id: clock_id.to_string(),
+            },
+            title: format!("Remove {city}?"),
+            message: "The city leaves your clocks. Trip history is kept.".to_string(),
+            error: None,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn open_inspector(
+        &mut self,
+        clock_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.clocks.entry(clock_id).is_none() {
+            return;
+        }
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Add a person"));
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.clocks.inspector = Some(InspectorState {
+            clock_id: clock_id.to_string(),
+            add: input,
+            rename: None,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn close_inspector(&mut self, cx: &mut Context<Self>) {
+        if self.clocks.inspector.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn handle_inspector_key(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(inspector) = &self.clocks.inspector else {
+            return;
+        };
+        let renaming = inspector.rename.is_some();
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                cx.stop_propagation();
+                if renaming {
+                    self.cancel_person_rename(cx);
+                } else {
+                    self.close_inspector(cx);
+                }
+            }
+            "enter" if renaming => {
+                cx.stop_propagation();
+                self.commit_person_rename(cx);
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn add_person_from_inspector(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(inspector) = &self.clocks.inspector else {
+            return;
+        };
+        let clock_id = inspector.clock_id.clone();
+        let name = inspector.add.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            if let Some(inspector) = &mut self.clocks.inspector {
+                inspector.error = Some("A name is required".to_string());
+            }
+            cx.notify();
+            return;
+        }
+        match self.store.add_person(&clock_id, &name) {
+            Ok(()) => {
+                self.load_clocks();
+                if let Some(inspector) = &self.clocks.inspector {
+                    let input = inspector.add.clone();
+                    input.update(cx, |state, cx| {
+                        state.set_value("", window, cx);
+                        state.focus(window, cx);
+                    });
+                    if let Some(inspector) = &mut self.clocks.inspector {
+                        inspector.error = None;
+                    }
+                }
+            }
+            Err(error) => {
+                if let Some(inspector) = &mut self.clocks.inspector {
+                    inspector.error = Some(error);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn begin_person_rename(
+        &mut self,
+        person_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(person) = self.clock_person(person_id).cloned() else {
+            return;
+        };
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(person.name));
+        input.update(cx, |state, cx| state.focus(window, cx));
+        if let Some(inspector) = &mut self.clocks.inspector {
+            inspector.rename = Some((person_id.to_string(), input));
+        }
+        cx.notify();
+    }
+
+    fn commit_person_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(inspector) = &self.clocks.inspector else {
+            return;
+        };
+        let Some((person_id, input)) = &inspector.rename else {
+            return;
+        };
+        let person_id = person_id.clone();
+        let name = input.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            if let Some(inspector) = &mut self.clocks.inspector {
+                inspector.error = Some("A name is required".to_string());
+            }
+            cx.notify();
+            return;
+        }
+        match self.store.rename_person(&person_id, &name) {
+            Ok(()) => {
+                if let Some(inspector) = &mut self.clocks.inspector {
+                    inspector.rename = None;
+                    inspector.error = None;
+                }
+                self.load_clocks();
+            }
+            Err(error) => {
+                if let Some(inspector) = &mut self.clocks.inspector {
+                    inspector.error = Some(error);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn cancel_person_rename(&mut self, cx: &mut Context<Self>) {
+        if let Some(inspector) = &mut self.clocks.inspector {
+            inspector.rename = None;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn ask_remove_person(&mut self, person_id: &str, cx: &mut Context<Self>) {
+        let Some(person) = self.clock_person(person_id) else {
+            return;
+        };
+        let name = person.name.clone();
+        self.clocks.confirm = Some(ConfirmState {
+            kind: ConfirmKind::RemovePerson {
+                person_id: person_id.to_string(),
+            },
+            title: format!("Remove {name}?"),
+            message: "Their trips are removed with them.".to_string(),
+            error: None,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn ask_remove_travel(&mut self, travel_id: &str, cx: &mut Context<Self>) {
+        self.clocks.confirm = Some(ConfirmState {
+            kind: ConfirmKind::RemoveTravel {
+                travel_id: travel_id.to_string(),
+            },
+            title: "Remove this trip?".to_string(),
+            message: "The trip is deleted from the history.".to_string(),
+            error: None,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_clock_confirm(&mut self, cx: &mut Context<Self>) {
+        if self.clocks.confirm.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Run the confirmed removal. A core rejection (a city with residents, for
+    /// example) keeps the dialog open and shows the exact message.
+    pub(crate) fn confirm_clock_action(&mut self, cx: &mut Context<Self>) {
+        let Some(confirm) = self.clocks.confirm.clone() else {
+            return;
+        };
+        let result = match &confirm.kind {
+            ConfirmKind::RemoveClock { clock_id } => self.store.remove_clock(clock_id),
+            ConfirmKind::RemovePerson { person_id } => self.store.remove_person(person_id),
+            ConfirmKind::RemoveTravel { travel_id } => self.store.remove_travel(travel_id),
+        };
+        match result {
+            Ok(()) => {
+                self.clocks.confirm = None;
+                if matches!(confirm.kind, ConfirmKind::RemoveClock { .. }) {
+                    // The inspector (if it was open) belongs to the removed city.
+                    self.clocks.inspector = None;
+                }
+                self.load_clocks();
+            }
+            Err(error) => {
+                if let Some(confirm) = &mut self.clocks.confirm {
+                    confirm.error = Some(error);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn form_error(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        if let Some(form) = &mut self.clocks.form {
+            form.error = Some(message.into());
+        }
+        cx.notify();
+    }
+
+    fn finish_clock_form(&mut self, result: Result<(), String>, cx: &mut Context<Self>) {
+        match result {
+            Ok(()) => {
+                self.clocks.form = None;
+                self.load_clocks();
+            }
+            Err(error) => {
+                if let Some(form) = &mut self.clocks.form {
+                    form.error = Some(error);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn open_travel_form(
+        &mut self,
+        person_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(person) = self.clock_person(person_id).cloned() else {
+            return;
+        };
+        let Some(home) = self.clocks.entry(&person.home_clock_id) else {
+            return;
+        };
+        let home_city = home.city.clone();
+        let current_city = self
+            .clocks
+            .city_people(&person.home_clock_id)
+            .residents
+            .into_iter()
+            .find(|status| status.person.id == person.id)
+            .and_then(|status| status.away_to);
+        let today = jiff::Zoned::now().date().to_string();
+        let start = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(today.clone())
+                .placeholder("YYYY-MM-DD")
+        });
+        let end = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(today)
+                .placeholder("YYYY-MM-DD")
+        });
+        start.update(cx, |state, cx| state.focus(window, cx));
+        self.clocks.form = Some(FormState {
+            kind: FormKind::Assign,
+            travel_id: None,
+            person_id: person.id,
+            person_name: person.name,
+            home_clock_id: person.home_clock_id,
+            home_city,
+            current_city,
+            destination: None,
+            start,
+            end,
+            open_ended: false,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn open_extend_form(
+        &mut self,
+        travel_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(travel) = self.clock_travel(travel_id).cloned() else {
+            return;
+        };
+        let Some(person) = self.clock_person(&travel.person_id).cloned() else {
+            return;
+        };
+        let Some(home) = self.clocks.entry(&person.home_clock_id) else {
+            return;
+        };
+        let zone = travel
+            .destination_clock_id
+            .as_deref()
+            .and_then(|id| self.clocks.entry(id))
+            .and_then(|entry| entry.zone.clone());
+        let start_date = zone
+            .clone()
+            .and_then(|zone| {
+                Timestamp::from_second(travel.starts_at)
+                    .ok()
+                    .map(|instant| instant.to_zoned(zone).date())
+            })
+            .unwrap_or_else(|| jiff::Zoned::now().date());
+        let end_date = travel
+            .ends_at
+            .and_then(|seconds| {
+                let zone = zone.clone()?;
+                Timestamp::from_second(seconds)
+                    .ok()
+                    .map(|instant| instant.to_zoned(zone).date())
+            })
+            .unwrap_or_else(|| start_date.tomorrow().unwrap_or(start_date));
+        let start = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(start_date.to_string())
+                .placeholder("YYYY-MM-DD")
+        });
+        let end = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(end_date.to_string())
+                .placeholder("YYYY-MM-DD")
+        });
+        end.update(cx, |state, cx| state.focus(window, cx));
+        self.clocks.form = Some(FormState {
+            kind: FormKind::Extend,
+            travel_id: Some(travel.id.clone()),
+            person_id: person.id,
+            person_name: person.name,
+            home_clock_id: person.home_clock_id,
+            home_city: home.city.clone(),
+            current_city: travel
+                .destination_clock_id
+                .as_deref()
+                .and_then(|id| self.clocks.entry(id))
+                .map(|entry| entry.city.clone()),
+            destination: travel.destination_clock_id.clone(),
+            start,
+            end,
+            open_ended: travel.ends_at.is_none(),
+            error: None,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn open_relocate_form(
+        &mut self,
+        person_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(person) = self.clock_person(person_id).cloned() else {
+            return;
+        };
+        let Some(home) = self.clocks.entry(&person.home_clock_id) else {
+            return;
+        };
+        let today = jiff::Zoned::now().date().to_string();
+        let start = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(today.clone())
+                .placeholder("YYYY-MM-DD")
+        });
+        let end = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(today)
+                .placeholder("YYYY-MM-DD")
+        });
+        self.clocks.form = Some(FormState {
+            kind: FormKind::Relocate,
+            travel_id: None,
+            person_id: person.id,
+            person_name: person.name,
+            home_clock_id: person.home_clock_id,
+            home_city: home.city.clone(),
+            current_city: None,
+            destination: None,
+            start,
+            end,
+            open_ended: false,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn close_clock_form(&mut self, cx: &mut Context<Self>) {
+        if self.clocks.form.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn set_form_destination(&mut self, clock_id: &str, cx: &mut Context<Self>) {
+        if let Some(form) = &mut self.clocks.form {
+            form.destination = Some(clock_id.to_string());
+            form.error = None;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_form_open_ended(&mut self, cx: &mut Context<Self>) {
+        if let Some(form) = &mut self.clocks.form {
+            form.open_ended = !form.open_ended;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn handle_form_key(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.key == "escape" {
+            cx.stop_propagation();
+            self.close_clock_form(cx);
+        }
+    }
+
+    /// Write the form. Trip windows are whole days in the destination zone.
+    pub(crate) fn submit_clock_form(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = &self.clocks.form else {
+            return;
+        };
+        let kind = form.kind;
+        let start_raw = form.start.read(cx).value().trim().to_string();
+        let end_raw = form.end.read(cx).value().trim().to_string();
+        let destination = form.destination.clone();
+        let travel_id = form.travel_id.clone();
+        let person_id = form.person_id.clone();
+        let open_ended = form.open_ended;
+
+        if kind == FormKind::Relocate {
+            let Some(destination_id) = destination else {
+                self.form_error("Pick the new home city", cx);
+                return;
+            };
+            let result = self.store.relocate_person(&person_id, &destination_id);
+            self.finish_clock_form(result, cx);
+            return;
+        }
+
+        let Some(destination_id) = destination else {
+            self.form_error("Pick a destination city", cx);
+            return;
+        };
+        let Some(zone) = self
+            .clocks
+            .entry(&destination_id)
+            .and_then(|entry| entry.zone.clone())
+        else {
+            self.form_error("That city has no time zone", cx);
+            return;
+        };
+        let start = match start_raw.parse::<Date>() {
+            Ok(date) => date,
+            Err(_) => {
+                self.form_error("The start date must be YYYY-MM-DD", cx);
+                return;
+            }
+        };
+        let ends_at = if open_ended {
+            None
+        } else {
+            match end_raw.parse::<Date>() {
+                Ok(date) => match day_end_seconds(date, &zone) {
+                    Ok(seconds) => Some(seconds),
+                    Err(error) => {
+                        self.form_error(error.to_string(), cx);
+                        return;
+                    }
+                },
+                Err(_) => {
+                    self.form_error("The end date must be YYYY-MM-DD", cx);
+                    return;
+                }
+            }
+        };
+        let starts_at = match day_start_seconds(start, &zone) {
+            Ok(seconds) => seconds,
+            Err(error) => {
+                self.form_error(error.to_string(), cx);
+                return;
+            }
+        };
+        let result = match kind {
+            FormKind::Assign => {
+                self.store
+                    .start_travel(&person_id, &destination_id, starts_at, ends_at)
+            }
+            _ => match &travel_id {
+                Some(id) => self.store.extend_travel(id, ends_at),
+                None => Err("No trip to extend".to_string()),
+            },
+        };
+        self.finish_clock_form(result, cx);
+    }
+
+    /// Finish the running trip now (`End now`, `Send home`).
+    pub(crate) fn end_travel_now(&mut self, travel_id: &str, cx: &mut Context<Self>) {
+        match self.store.end_travel(travel_id) {
+            Ok(()) => self.load_clocks(),
+            Err(error) => self.clocks.error = Some(error),
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn send_home(&mut self, travel_id: &str, cx: &mut Context<Self>) {
+        self.end_travel_now(travel_id, cx);
     }
 
     fn titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -620,28 +1415,12 @@ impl AppShell {
             }))
     }
 
-    fn body(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = self.tokens;
         match self.section {
             Section::Tasks => self.tasks_body(cx),
-            Section::Clocks => {
-                if let Some(error) = &self.clock_error {
-                    return placeholder::message(
-                        "clocks-error",
-                        Icon::Globe,
-                        "Can't read the clocks",
-                        error.clone(),
-                        &t,
-                    )
-                    .into_any_element();
-                }
-                let toggle = cx.listener(|this, _: &ClickEvent, _window, cx| {
-                    this.use_24h = !this.use_24h;
-                    this.load_clocks();
-                    cx.notify();
-                });
-                clocks::clocks_view(&self.clock_rows, self.use_24h, &t, toggle).into_any_element()
-            }
+            Section::Clocks => clocks::clocks_view(&mut self.clocks, self.use_24h, &t, window, cx)
+                .into_any_element(),
             Section::Notes => placeholder::message(
                 "notes-placeholder",
                 Icon::StickyNote,
@@ -729,7 +1508,14 @@ impl Default for AppShell {
 }
 
 impl Render for AppShell {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // One clock reading per frame; the tick only refreshes this cache.
+        if self.section == Section::Clocks {
+            self.clocks.set_now(Timestamp::now());
+            self.ensure_clock_tick(window, cx);
+        } else if self.clock_tick_running.is_some() {
+            self.invalidate_clock_tick();
+        }
         let t = self.tokens;
         let overlay = self.editing.as_ref().map(|session| {
             card_modal::modal(
@@ -764,7 +1550,7 @@ impl Render for AppShell {
                             .flex_1()
                             .min_h_0()
                             .bg(t.pasteboard)
-                            .child(self.body(cx)),
+                            .child(self.body(window, cx)),
                     ),
             )
             .children(overlay)

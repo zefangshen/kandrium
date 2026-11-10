@@ -25,6 +25,7 @@ fn seeded_db(dir: &Path) -> PathBuf {
 fn every_section_renders_its_body(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let path = seeded_db(dir.path());
+    cx.update(gpui_kit::init);
 
     let (_view, cx) =
         cx.add_window_view(|_window, _cx| AppShell::with_store(Store::open_path(path.clone())));
@@ -92,11 +93,10 @@ fn board_view_draws_real_columns_and_cards(cx: &mut TestAppContext) {
 fn clocks_view_renders_seeded_cities(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let path = seeded_db(dir.path());
+    cx.update(gpui_kit::init);
 
-    let rows = Store::open_path(path.clone())
-        .clocks(jiff::Timestamp::now(), true)
-        .expect("clocks");
-    assert!(!rows.is_empty(), "seed should contain cities");
+    let data = Store::open_path(path.clone()).clock_data().expect("clocks");
+    assert!(!data.clocks.is_empty(), "seed should contain cities");
 
     let (_view, cx) =
         cx.add_window_view(|_window, _cx| AppShell::with_store(Store::open_path(path.clone())));
@@ -106,12 +106,14 @@ fn clocks_view_renders_seeded_cities(cx: &mut TestAppContext) {
 
     cx.update(|window, _cx| {
         assert!(window.find("clocks-view").visible());
-        assert!(window.find("clocks-toggle").visible());
-        for row in &rows {
+        assert!(window.find("clocks-units").visible());
+        assert!(window.find("clocks-add-city").visible());
+        assert!(window.find("clocks-search").visible());
+        for row in &data.clocks {
             assert!(
                 window.find(format!("clock-card-{}", row.id)).visible(),
                 "missing city card for {}",
-                row.city
+                row.tz_identifier
             );
         }
     });
