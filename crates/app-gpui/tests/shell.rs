@@ -431,6 +431,80 @@ fn card_modal_label_toggle_persists(cx: &mut TestAppContext) {
     assert_eq!(saved.labels, expected);
 }
 
+/// The All tab comes first and groups cards by status; dropping a card on a
+/// status bucket moves it on its home board.
+#[gpui::test]
+fn all_board_tab_groups_cards_and_moves_status(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    cx.update(gpui_kit::init);
+
+    let store = Store::open_path(path.clone());
+    let board_id = store.boards().expect("boards")[0].id.clone();
+    let card = store.board(&board_id).expect("board").columns[0].ordered_cards()[0].clone();
+    let card_id = card.id.clone();
+    let home_column = card.column_id.clone();
+
+    let (_view, cx) =
+        cx.add_window_view(|_window, _cx| AppShell::with_store(Store::open_path(path.clone())));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    cx.update(|window, cx| window.click("board-tab-all", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, _cx| {
+        assert!(window.find("board-column-all:todo").visible());
+        assert!(window.find("board-column-all:done").visible());
+        assert!(window.find(format!("board-card-{card_id}")).visible());
+    });
+
+    cx.update(|window, cx| {
+        window.drag_to(format!("board-card-{card_id}"), "board-column-all:done", cx)
+    });
+    cx.update(|window, cx| window.render_frame(cx));
+
+    let reloaded = Store::open_path(path).board(&board_id).expect("board");
+    let done = reloaded
+        .columns
+        .iter()
+        .find(|column| column.title == "Done")
+        .expect("Done column");
+    assert_ne!(done.id, home_column);
+    assert!(
+        done.ordered_cards().iter().any(|card| card.id == card_id),
+        "the card should have moved into the Done column of its home board"
+    );
+}
+
+/// Escape closes the editor without writing.
+#[gpui::test]
+fn card_modal_escape_closes(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    cx.update(gpui_kit::init);
+
+    let store = Store::open_path(path.clone());
+    let board_id = store.boards().expect("boards")[0].id.clone();
+    let card = store.board(&board_id).expect("board").columns[0].ordered_cards()[0].clone();
+    let card_id = card.id.clone();
+
+    let (_view, cx) =
+        cx.add_window_view(|_window, _cx| AppShell::with_store(Store::open_path(path.clone())));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    cx.update(|window, cx| window.click(format!("board-card-{card_id}"), cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, _cx| assert!(window.find("card-modal").visible()));
+    cx.update(|window, cx| window.press("escape", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    cx.update(|window, _cx| {
+        assert!(
+            window.try_find("card-modal").is_none(),
+            "escape should close the modal"
+        );
+    });
+}
+
 /// Cancelling (or a backdrop press) must not write anything.
 #[gpui::test]
 fn card_modal_cancel_discards_changes(cx: &mut TestAppContext) {
