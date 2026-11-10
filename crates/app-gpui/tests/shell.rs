@@ -1,4 +1,4 @@
-//! Headless window tests for the Stage 1 shell.
+//! Headless window tests for the shell and Stage 2 board interactivity.
 //!
 //! They boot the real `AppShell` over a freshly seeded temp database under
 //! `TestAppContext` and assert on laid-out elements. No GPU or visible window
@@ -338,4 +338,134 @@ fn dragging_a_mirror_across_area_statuses_moves_its_project_column(cx: &mut Test
             .any(|card_on_board| card_on_board.id == card.id),
         "the mirror should now render under the area board's In Progress column"
     );
+}
+
+/// Clicking a card opens the editor; editing the title and saving writes it
+/// through `kandrium_core::update_card`.
+#[gpui::test]
+fn card_modal_saves_a_new_title(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    cx.update(gpui_kit::init);
+
+    let store = Store::open_path(path.clone());
+    let board_id = store.boards().expect("boards")[0].id.clone();
+    let card = store.board(&board_id).expect("board").columns[0].ordered_cards()[0].clone();
+    let card_id = card.id.clone();
+    assert_ne!(card.title, "Renamed card");
+
+    let (_view, cx) =
+        cx.add_window_view(|_window, _cx| AppShell::with_store(Store::open_path(path.clone())));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    cx.update(|window, cx| window.click(format!("board-card-{card_id}"), cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, _cx| assert!(window.find("card-modal").visible()));
+
+    // The title field is focused on open, so select all and replace.
+    cx.update(|window, cx| {
+        window.press("cmd-a", cx);
+        window.input("Renamed card", cx);
+    });
+    cx.update(|window, cx| window.click("card-modal-save", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    cx.update(|window, _cx| {
+        assert!(
+            window.try_find("card-modal").is_none(),
+            "save should close the modal"
+        );
+    });
+
+    let reloaded = Store::open_path(path).board(&board_id).expect("board");
+    let saved = reloaded
+        .columns
+        .iter()
+        .flat_map(|column| column.ordered_cards())
+        .find(|card| card.id == card_id)
+        .expect("card after save");
+    assert_eq!(saved.title, "Renamed card");
+}
+
+/// Label chips toggle in the session and persist on save.
+#[gpui::test]
+fn card_modal_label_toggle_persists(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    cx.update(gpui_kit::init);
+
+    let store = Store::open_path(path.clone());
+    let board_id = store.boards().expect("boards")[0].id.clone();
+    let card = store.board(&board_id).expect("board").columns[0].ordered_cards()[0].clone();
+    let card_id = card.id.clone();
+    let mut expected = card.labels.clone();
+    expected.push(3);
+
+    let (_view, cx) =
+        cx.add_window_view(|_window, _cx| AppShell::with_store(Store::open_path(path.clone())));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    cx.update(|window, cx| window.click(format!("board-card-{card_id}"), cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, cx| window.click("card-label-3", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    // The eye/pencil toggle swaps the textarea for the markdown preview.
+    cx.update(|window, cx| window.click("card-description-toggle", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, _cx| {
+        assert!(
+            window.find("card-description-preview").visible(),
+            "preview should replace the editor"
+        );
+    });
+    cx.update(|window, cx| window.click("card-modal-save", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    let reloaded = Store::open_path(path).board(&board_id).expect("board");
+    let saved = reloaded
+        .columns
+        .iter()
+        .flat_map(|column| column.ordered_cards())
+        .find(|card| card.id == card_id)
+        .expect("card after save");
+    assert_eq!(saved.labels, expected);
+}
+
+/// Cancelling (or a backdrop press) must not write anything.
+#[gpui::test]
+fn card_modal_cancel_discards_changes(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    cx.update(gpui_kit::init);
+
+    let store = Store::open_path(path.clone());
+    let board_id = store.boards().expect("boards")[0].id.clone();
+    let card = store.board(&board_id).expect("board").columns[0].ordered_cards()[0].clone();
+    let card_id = card.id.clone();
+
+    let (_view, cx) =
+        cx.add_window_view(|_window, _cx| AppShell::with_store(Store::open_path(path.clone())));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    cx.update(|window, cx| window.click(format!("board-card-{card_id}"), cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, cx| window.click("card-label-5", cx));
+    cx.update(|window, cx| window.click("card-modal-cancel", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    cx.update(|window, _cx| {
+        assert!(
+            window.try_find("card-modal").is_none(),
+            "cancel should close the modal"
+        );
+    });
+
+    let reloaded = Store::open_path(path).board(&board_id).expect("board");
+    let saved = reloaded
+        .columns
+        .iter()
+        .flat_map(|column| column.ordered_cards())
+        .find(|card| card.id == card_id)
+        .expect("card after cancel");
+    assert_eq!(saved.labels, card.labels, "cancel must not persist labels");
 }
