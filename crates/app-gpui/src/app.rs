@@ -9,11 +9,12 @@ use gpui_kit::TestSupportExt;
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, ClickEvent, Context, IntoElement, Render, Window, div, px};
 use jiff::Timestamp;
-use kandrium_core::BoardWithColumns;
+use kandrium_core::{Board, BoardWithColumns};
 
 use crate::assets::{Icon, icon};
 use crate::store::{ClockRow, Store};
 use crate::theme::{Text, TextStyled, Tokens};
+use crate::views::tasks::DropTarget;
 use crate::views::{clocks, placeholder, tasks};
 
 /// The five top-level sections, in the same order as the egui app.
@@ -73,15 +74,19 @@ impl std::fmt::Display for Section {
     }
 }
 
-/// Root view. Owns the read-only database handle and the data each section
-/// renders.
+/// Root view. Owns the database handles and the data each section renders.
 pub struct AppShell {
     section: Section,
     tokens: Tokens,
     use_24h: bool,
     store: Store,
+    boards: Vec<Board>,
+    active_board_id: Option<String>,
     board: Option<BoardWithColumns>,
     board_error: Option<String>,
+    drop_target: Option<DropTarget>,
+    dragging_card: Option<String>,
+    drop_generation: u64,
     clock_rows: Vec<ClockRow>,
     clock_error: Option<String>,
     now: Timestamp,
@@ -100,8 +105,13 @@ impl AppShell {
             tokens: Tokens::dark(),
             use_24h: true,
             store,
+            boards: Vec::new(),
+            active_board_id: None,
             board: None,
             board_error: None,
+            drop_target: None,
+            dragging_card: None,
+            drop_generation: 0,
             clock_rows: Vec::new(),
             clock_error: None,
             now: Timestamp::now(),
@@ -132,30 +142,130 @@ impl AppShell {
     fn load_tasks(&mut self) {
         match self.store.boards() {
             Ok(boards) => {
-                let keep = self.board.as_ref().map(|b| b.id.clone());
-                let target = keep
-                    .filter(|id| boards.iter().any(|b| &b.id == id))
-                    .or_else(|| boards.first().map(|b| b.id.clone()));
-                match target.map(|id| (id.clone(), self.store.board(&id))) {
-                    Some((_, Ok(board))) => {
-                        self.board = Some(board);
-                        self.board_error = None;
-                    }
-                    Some((_, Err(e))) => {
-                        self.board = None;
-                        self.board_error = Some(e);
-                    }
-                    None => {
-                        self.board = None;
-                        self.board_error = None;
+                self.boards = boards;
+                let target = self
+                    .active_board_id
+                    .clone()
+                    .or_else(|| self.boards.first().map(|board| board.id.clone()));
+                let Some(id) = target else {
+                    self.board = None;
+                    self.active_board_id = None;
+                    self.board_error = None;
+                    return;
+                };
+                if let Err(error) = self.load_board(&id) {
+                    // The held board disappeared (deleted or archived): fall
+                    // back to the first visible one before surfacing an error.
+                    let fallback = self
+                        .boards
+                        .first()
+                        .map(|board| board.id.clone())
+                        .filter(|first| first != &id);
+                    match fallback {
+                        Some(first) if self.load_board(&first).is_ok() => {}
+                        _ => {
+                            self.board = None;
+                            self.board_error = Some(error);
+                        }
                     }
                 }
             }
             Err(e) => {
+                self.boards.clear();
                 self.board = None;
                 self.board_error = Some(e);
             }
         }
+    }
+
+    /// Load one board by id, keeping the previous board on failure.
+    fn load_board(&mut self, id: &str) -> Result<(), String> {
+        match self.store.board(id) {
+            Ok(board) => {
+                self.active_board_id = Some(board.id.clone());
+                self.board = Some(board);
+                self.board_error = None;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Switch the Tasks tab to `id`.
+    pub(crate) fn open_board(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.active_board_id.as_deref() == Some(id) {
+            return;
+        }
+        self.drop_target = None;
+        if let Err(error) = self.load_board(id) {
+            self.board_error = Some(error);
+        }
+        cx.notify();
+    }
+
+    /// Record where a drop would land. No-op when the target has not changed,
+    /// so a drag does not repaint on every mouse move.
+    pub(crate) fn begin_card_drag(&mut self, card_id: &str, cx: &mut Context<Self>) {
+        if self.dragging_card.as_deref() != Some(card_id) {
+            self.dragging_card = Some(card_id.to_string());
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn set_drop_target(
+        &mut self,
+        column_id: &str,
+        before: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let same = self
+            .drop_target
+            .as_ref()
+            .is_some_and(|target| target.column_id == column_id && target.before == before);
+        if same {
+            return;
+        }
+        self.drop_generation += 1;
+        self.drop_target = Some(DropTarget {
+            column_id: column_id.to_string(),
+            before,
+            generation: self.drop_generation,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn clear_drop_target(&mut self, cx: &mut Context<Self>) {
+        let had_target = self.drop_target.take().is_some();
+        let had_drag = self.dragging_card.take().is_some();
+        if had_target || had_drag {
+            cx.notify();
+        }
+    }
+
+    /// Commit a drop. The target recorded by `on_drag_move` decides the
+    /// insertion point; a drop on a column without one appends.
+    pub(crate) fn drop_card(&mut self, card_id: &str, column_id: &str, cx: &mut Context<Self>) {
+        let before = self
+            .drop_target
+            .clone()
+            .filter(|target| target.column_id == column_id)
+            .and_then(|target| target.before)
+            .filter(|before| before != card_id);
+        self.drop_target = None;
+        self.dragging_card = None;
+        let result = self.store.move_card(card_id, column_id, before.as_deref());
+        match result {
+            Ok(()) => {
+                self.board_error = None;
+                if let Some(id) = self.active_board_id.clone()
+                    && let Err(error) = self.load_board(&id)
+                {
+                    self.board_error = Some(error);
+                }
+            }
+            Err(error) => self.board_error = Some(error),
+        }
+        cx.notify();
     }
 
     fn load_clocks(&mut self) {
@@ -261,7 +371,7 @@ impl AppShell {
     fn body(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = self.tokens;
         match self.section {
-            Section::Tasks => self.tasks_body(),
+            Section::Tasks => self.tasks_body(cx),
             Section::Clocks => {
                 if let Some(error) = &self.clock_error {
                     return placeholder::message(
@@ -309,7 +419,7 @@ impl AppShell {
         }
     }
 
-    fn tasks_body(&self) -> AnyElement {
+    fn tasks_body(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = self.tokens;
         if let Some(error) = &self.board_error {
             return placeholder::message(
@@ -321,17 +431,42 @@ impl AppShell {
             )
             .into_any_element();
         }
-        match &self.board {
-            Some(board) => tasks::board_view(board, &t).into_any_element(),
-            None => placeholder::message(
+        let Some(board) = &self.board else {
+            return placeholder::message(
                 "tasks-empty",
                 Icon::FolderKanban,
                 "No boards yet",
                 "The Tasks section will render the first board as soon as the database has one.",
                 &t,
             )
-            .into_any_element(),
-        }
+            .into_any_element();
+        };
+        // The active board is kept as a tab even when `list_boards` hides it
+        // (project boards): the active-project-board rule.
+        let active = Board {
+            id: board.id.clone(),
+            title: board.title.clone(),
+        };
+        let tabs = tasks::task_tabs(&self.boards, Some(&active));
+        div()
+            .id("tasks-body")
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(tasks::tabs_strip(
+                &tabs,
+                self.active_board_id.as_deref(),
+                &t,
+                cx,
+            ))
+            .child(div().flex_1().min_h_0().child(tasks::board_view(
+                board,
+                self.drop_target.as_ref(),
+                self.dragging_card.as_deref(),
+                &t,
+                cx,
+            )))
+            .into_any_element()
     }
 }
 
