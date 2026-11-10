@@ -277,6 +277,7 @@ fn card_view(
     let column_id = column.id.clone();
     let after = after.map(str::to_string);
     let tokens = *t;
+    let shell = cx.entity().downgrade();
 
     div()
         .id(format!("board-card-{}", card.id))
@@ -293,10 +294,10 @@ fn card_view(
             reduced,
         ))
         .child(card_body(card, t))
-        .on_mouse_down(MouseButton::Left, {
+        .on_click({
             let card_id = card_id.clone();
-            cx.listener(move |this, _: &gpui_kit::MouseDownEvent, _window, cx| {
-                this.begin_card_drag(&card_id, cx);
+            cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.open_card(&card_id, window, cx)
             })
         })
         .on_drag(
@@ -305,6 +306,12 @@ fn card_view(
                 title: card.title.clone(),
             },
             move |drag: &CardDrag, _offset, _window, cx| {
+                // A drag only begins after the pointer passes the threshold, so
+                // recording it here keeps a plain click from dimming the card.
+                let card_id = drag.card_id.clone();
+                if let Some(shell) = shell.upgrade() {
+                    shell.update(cx, |this, cx| this.begin_card_drag(&card_id, cx));
+                }
                 cx.new(|_| CardGhost::new(drag.title.clone(), tokens))
             },
         )

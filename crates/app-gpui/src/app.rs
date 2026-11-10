@@ -6,14 +6,16 @@
 //! been ported yet.
 
 use gpui_kit::TestSupportExt;
+use gpui_kit::component::input::{InputState, TextareaState};
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, ClickEvent, Context, IntoElement, Render, Window, div, px};
 use jiff::Timestamp;
-use kandrium_core::{Board, BoardWithColumns};
+use kandrium_core::{Board, BoardWithColumns, CreateCardBody, ProjectChoice};
 
 use crate::assets::{Icon, icon};
 use crate::store::{ClockRow, Store};
 use crate::theme::{Text, TextStyled, Tokens};
+use crate::views::card_modal::{self, EditSession, ModalContext};
 use crate::views::tasks::DropTarget;
 use crate::views::{clocks, placeholder, tasks};
 
@@ -87,6 +89,8 @@ pub struct AppShell {
     drop_target: Option<DropTarget>,
     dragging_card: Option<String>,
     drop_generation: u64,
+    editing: Option<EditSession>,
+    project_choices: Vec<ProjectChoice>,
     clock_rows: Vec<ClockRow>,
     clock_error: Option<String>,
     now: Timestamp,
@@ -112,6 +116,8 @@ impl AppShell {
             drop_target: None,
             dragging_card: None,
             drop_generation: 0,
+            editing: None,
+            project_choices: Vec::new(),
             clock_rows: Vec::new(),
             clock_error: None,
             now: Timestamp::now(),
@@ -266,6 +272,160 @@ impl AppShell {
             Err(error) => self.board_error = Some(error),
         }
         cx.notify();
+    }
+
+    /// Open the card editor for `card_id`, resolving the card from the board
+    /// currently on screen (mirrors included).
+    pub(crate) fn open_card(&mut self, card_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let card = {
+            let Some(board) = &self.board else {
+                return;
+            };
+            board
+                .columns
+                .iter()
+                .flat_map(|column| column.ordered_cards())
+                .find(|card| card.id == card_id)
+                .cloned()
+        };
+        let Some(card) = card else {
+            return;
+        };
+        // `list_boards` hides project boards, so a card whose home board is
+        // missing there is a project card (including area-board mirrors).
+        let is_project_card = !self.boards.iter().any(|board| board.id == card.board_id);
+        self.project_choices = match self.store.projects() {
+            Ok(choices) => choices,
+            Err(error) => {
+                self.board_error = Some(error);
+                Vec::new()
+            }
+        };
+
+        let title = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(card.title.clone())
+                .placeholder("Card title")
+        });
+        let description =
+            cx.new(|cx| TextareaState::new(window, cx).default_value(card.description.clone()));
+        let due = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(card.due_date.clone())
+                .placeholder("YYYY-MM-DD")
+        });
+        title.update(cx, |state, cx| state.focus(window, cx));
+
+        self.editing = Some(EditSession {
+            card_id: card.id,
+            is_project_card,
+            title,
+            description,
+            due,
+            labels: card.labels,
+            project_id: card.project_id,
+            area_board_id: card.area_board_id,
+            preview: false,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn close_card(&mut self, cx: &mut Context<Self>) {
+        if self.editing.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Persist the open editor. A blank title keeps the modal open with an
+    /// error, matching the egui modal.
+    pub(crate) fn save_editing(&mut self, cx: &mut Context<Self>) {
+        let Some(mut session) = self.editing.take() else {
+            return;
+        };
+        let title = session.title.read(cx).value().trim().to_string();
+        if title.is_empty() {
+            session.error = Some("A title is required".into());
+            self.editing = Some(session);
+            cx.notify();
+            return;
+        }
+        let body = CreateCardBody {
+            title,
+            description: Some(session.description.read(cx).value().to_string()),
+            due_date: Some(session.due.read(cx).value().to_string()),
+            labels: Some(session.labels.clone()),
+        };
+        // Project cards pick an area board; normal cards pick a project.
+        // Passing `None` for the other link leaves it untouched.
+        let result = if session.is_project_card {
+            self.store.save_card(
+                &session.card_id,
+                &body,
+                None,
+                Some(session.area_board_id.as_deref()),
+            )
+        } else {
+            self.store.save_card(
+                &session.card_id,
+                &body,
+                Some(session.project_id.as_deref()),
+                None,
+            )
+        };
+        match result {
+            Ok(()) => {
+                self.board_error = None;
+                self.reload_active_board();
+            }
+            Err(error) => {
+                session.error = Some(error);
+                self.editing = Some(session);
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_editing_preview(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = self.editing.as_mut() {
+            session.preview = !session.preview;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn toggle_editing_label(&mut self, label: i64, cx: &mut Context<Self>) {
+        if let Some(session) = self.editing.as_mut() {
+            if let Some(index) = session.labels.iter().position(|value| *value == label) {
+                session.labels.remove(index);
+            } else {
+                session.labels.push(label);
+            }
+            cx.notify();
+        }
+    }
+
+    /// Set the project tag of a normal card. An empty id clears it.
+    pub(crate) fn set_editing_project(&mut self, project_id: String, cx: &mut Context<Self>) {
+        if let Some(session) = self.editing.as_mut() {
+            session.project_id = (!project_id.is_empty()).then_some(project_id);
+            cx.notify();
+        }
+    }
+
+    /// Set the area board of a project card. An empty id unfiles it.
+    pub(crate) fn set_editing_area(&mut self, area_id: String, cx: &mut Context<Self>) {
+        if let Some(session) = self.editing.as_mut() {
+            session.area_board_id = (!area_id.is_empty()).then_some(area_id);
+            cx.notify();
+        }
+    }
+
+    fn reload_active_board(&mut self) {
+        if let Some(id) = self.active_board_id.clone()
+            && let Err(error) = self.load_board(&id)
+        {
+            self.board_error = Some(error);
+        }
     }
 
     fn load_clocks(&mut self) {
@@ -479,24 +639,42 @@ impl Default for AppShell {
 impl Render for AppShell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.tokens;
+        let overlay = self.editing.as_ref().map(|session| {
+            card_modal::modal(
+                ModalContext {
+                    session,
+                    area_boards: &self.boards,
+                    projects: &self.project_choices,
+                    tokens: &t,
+                },
+                cx,
+            )
+        });
         div()
-            .id("app-shell")
-            .test_support()
+            .id("app-root")
+            .relative()
             .size_full()
-            .flex()
-            .flex_col()
-            .bg(t.pasteboard)
-            .text(Text::Body)
-            .text_color(t.text)
-            .child(self.titlebar(cx))
             .child(
                 div()
-                    .id("section-body")
+                    .id("app-shell")
                     .test_support()
-                    .flex_1()
-                    .min_h_0()
+                    .size_full()
+                    .flex()
+                    .flex_col()
                     .bg(t.pasteboard)
-                    .child(self.body(cx)),
+                    .text(Text::Body)
+                    .text_color(t.text)
+                    .child(self.titlebar(cx))
+                    .child(
+                        div()
+                            .id("section-body")
+                            .test_support()
+                            .flex_1()
+                            .min_h_0()
+                            .bg(t.pasteboard)
+                            .child(self.body(cx)),
+                    ),
             )
+            .children(overlay)
     }
 }

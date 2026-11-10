@@ -43,6 +43,8 @@ pub struct Tokens {
     pub accent_soft: Rgba,
     /// Text-field background.
     pub field: Rgba,
+    /// Destructive / error text.
+    pub danger: Rgba,
     /// Corner radius for controls and cards.
     pub radius: f32,
 }
@@ -69,6 +71,7 @@ impl Tokens {
             accent_text: rgb(0x8CB6FA),
             accent_soft: rgb(0x243657),
             field: rgb(0x1E1E22),
+            danger: rgb(0xEB5A46),
             radius: 6.0,
         }
     }
@@ -94,6 +97,7 @@ impl Tokens {
             accent_text: rgb(0x1755C4),
             accent_soft: rgb(0xE3ECFD),
             field: rgb(0xFFFFFF),
+            danger: rgb(0xB42418),
             radius: 6.0,
         }
     }
