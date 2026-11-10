@@ -478,6 +478,7 @@ fn overlays(
                     out.push(
                         div()
                             .id(format!("doc-ann-{}-{quad_index}", ann.id))
+                            .test_support()
                             .absolute()
                             .left(px(r[0]))
                             .top(px(r[1]))
@@ -510,6 +511,7 @@ fn overlays(
                 out.push(
                     div()
                         .id(format!("doc-ann-{}", ann.id))
+                        .test_support()
                         .absolute()
                         .left(px(r[0]))
                         .top(px(r[1]))
@@ -611,6 +613,7 @@ fn popover(
                 .child(
                     div()
                         .id("doc-annotation-close")
+                        .test_support()
                         .p(px(2.))
                         .rounded(px(3.))
                         .cursor_pointer()
@@ -660,6 +663,7 @@ fn popover(
         colors.child(div().flex_1()).child(
             div()
                 .id("doc-annotation-delete")
+                .test_support()
                 .px(px(6.))
                 .py(px(2.))
                 .rounded(px(4.))
@@ -723,4 +727,22 @@ fn request(tab: &mut DocTab, page: usize, scale: f32, page_count: usize) -> bool
 /// Zoom bounds, used by both the toolbar and the shell.
 pub fn clamp_zoom(zoom: f32) -> f32 {
     zoom.clamp(ZOOM_MIN, documents::ZOOM_MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zoom_clamps_to_the_documented_range() {
+        assert_eq!(clamp_zoom(0.1), documents::ZOOM_MIN);
+        assert_eq!(clamp_zoom(8.0), documents::ZOOM_MAX);
+        assert_eq!(clamp_zoom(1.0), 1.0);
+    }
+
+    #[test]
+    fn quad_bounds_scales_and_normalizes() {
+        let quad = [[40.0, 30.0], [10.0, 30.0], [10.0, 50.0], [40.0, 50.0]];
+        assert_eq!(quad_bounds(&quad, 2.0), [20.0, 60.0, 80.0, 100.0]);
+    }
 }

@@ -132,6 +132,9 @@ pub struct DocTab {
     pub vim: Option<VimSession>,
     pub preview: bool,
     pub saved: String,
+    /// Buffer text seen by the last edit notification, used to tell a real
+    /// change from a caret/selection notification.
+    pub last_value: String,
     pub dirty: bool,
     pub generation: u64,
     // PDF
@@ -181,7 +184,8 @@ impl DocTab {
             editor: Some(editor),
             vim: Some(VimSession::new()),
             preview: false,
-            saved: text,
+            saved: text.clone(),
+            last_value: text,
             dirty: false,
             generation: 0,
             worker: None,
@@ -226,6 +230,7 @@ impl DocTab {
             vim: None,
             preview: false,
             saved: String::new(),
+            last_value: String::new(),
             dirty: false,
             generation: 0,
             worker: Some(worker),

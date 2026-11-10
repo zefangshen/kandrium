@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui_kit::TestSupportExt;
-use gpui_kit::component::input::{InputState, TextareaState};
+use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     AnyElement, ClickEvent, Context, DragMoveEvent, Entity, Focusable, IntoElement, KeyDownEvent,
@@ -2057,6 +2057,16 @@ impl AppShell {
         };
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         input.update(cx, |state, cx| state.focus(window, cx));
+        cx.subscribe_in(
+            &input,
+            window,
+            |this: &mut AppShell, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.commit_doc_draft(window, cx);
+                }
+            },
+        )
+        .detach();
         self.documents.draft = Some(DocDraft {
             kind,
             target,
@@ -2078,8 +2088,24 @@ impl AppShell {
         else {
             return;
         };
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(name));
-        input.update(cx, |state, cx| state.focus(window, cx));
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(name.clone()));
+        let end = name.len();
+        input.update(cx, |state, cx| {
+            state.focus(window, cx);
+            // Renaming starts with the whole name selected, so typing replaces
+            // it and Enter on an untouched field keeps the current name.
+            state.set_selected_range(0..end, cx);
+        });
+        cx.subscribe_in(
+            &input,
+            window,
+            |this: &mut AppShell, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.commit_doc_draft(window, cx);
+                }
+            },
+        )
+        .detach();
         self.documents.draft = Some(DocDraft {
             kind: DocDraftKind::Rename,
             target: path,
@@ -2368,6 +2394,13 @@ impl AppShell {
             }
             return;
         }
+        // Textarea notifications also fire for caret and selection moves; only
+        // a changed buffer restarts the debounce, or an idle edit would never
+        // settle into a write.
+        if tab.dirty && value == tab.last_value {
+            return;
+        }
+        tab.last_value = value;
         tab.dirty = true;
         tab.generation = tab.generation.wrapping_add(1);
         let generation = tab.generation;
