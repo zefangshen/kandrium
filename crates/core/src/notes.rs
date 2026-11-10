@@ -97,6 +97,55 @@ pub fn rename_path(path: &Path, root: &Path, new_name: &str) -> Result<PathBuf> 
     rename_in_root(path, root, new_name)
 }
 
+/// Create an empty note named `name` inside `in_dir`.
+///
+/// The `.md` extension is appended when the name has none. The name is a bare
+/// file name (separators rejected) and must not collide, so the caller can
+/// show the error instead of silently getting `untitled-2.md`.
+pub fn create_named_note(root: &Path, in_dir: &Path, name: &str) -> Result<PathBuf> {
+    let dir = fsutil::guard(root, in_dir)?;
+    let name = bare_name(name)?;
+    let file_name = if name.to_ascii_lowercase().ends_with(".md")
+        || name.to_ascii_lowercase().ends_with(".markdown")
+    {
+        name.to_string()
+    } else {
+        format!("{name}.md")
+    };
+    let candidate = dir.join(&file_name);
+    fsutil::guard(root, &candidate)?;
+    if candidate.exists() {
+        return Err(KandriumError::new(format!(
+            "\"{file_name}\" already exists"
+        )));
+    }
+    fs::write(&candidate, "")?;
+    Ok(candidate)
+}
+
+/// Create a folder named `name` inside `in_dir`, with the same name rules as
+/// [`create_named_note`].
+pub fn create_named_folder(root: &Path, in_dir: &Path, name: &str) -> Result<PathBuf> {
+    let dir = fsutil::guard(root, in_dir)?;
+    let name = bare_name(name)?;
+    let candidate = dir.join(name);
+    fsutil::guard(root, &candidate)?;
+    if candidate.exists() {
+        return Err(KandriumError::new(format!("\"{name}\" already exists")));
+    }
+    fs::create_dir(&candidate)?;
+    Ok(candidate)
+}
+
+/// Reject empty names, `.`/`..` and anything containing a separator.
+fn bare_name(name: &str) -> Result<&str> {
+    let name = name.trim();
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+        return Err(KandriumError::new("Invalid name"));
+    }
+    Ok(name)
+}
+
 /// Delete a file or directory (recursively). The notes root itself cannot
 /// be deleted.
 pub fn delete_path(path: &Path, root: &Path) -> Result<()> {
@@ -176,6 +225,24 @@ mod tests {
 
         delete_path(&dir, &f.root).unwrap();
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn named_creation_appends_md_and_rejects_collisions() {
+        let f = fixture();
+        let note = create_named_note(&f.root, &f.root, "Meeting notes").unwrap();
+        assert!(note.ends_with("Meeting notes.md"));
+        assert!(note.exists());
+
+        let kept = create_named_note(&f.root, &f.root, "todo.markdown").unwrap();
+        assert!(kept.ends_with("todo.markdown"));
+
+        assert!(create_named_note(&f.root, &f.root, "Meeting notes").is_err());
+        assert!(create_named_note(&f.root, &f.root, "../escape").is_err());
+
+        let folder = create_named_folder(&f.root, &f.root, "Archive").unwrap();
+        assert!(folder.is_dir());
+        assert!(create_named_folder(&f.root, &f.root, "Archive").is_err());
     }
 
     #[test]

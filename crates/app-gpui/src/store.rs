@@ -12,8 +12,9 @@
 //! All logic stays in `kandrium-core`; these are thin calls plus the
 //! `CreateCardBody` shaping a form needs.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use kandrium_core::notes::{self, NoteEntry};
 use kandrium_core::{
     Board, BoardWithColumns, CardStatus, Clock, CreateCardBody, Person, ProjectChoice, Travel,
     add_clock, add_person, bootstrap, end_travel, extend_travel, get_all_board, get_board_readonly,
@@ -229,6 +230,45 @@ impl Store {
 
     pub fn remove_travel(&self, travel_id: &str) -> StoreResult<()> {
         remove_travel(self.wconn()?, travel_id).map_err(|e| e.to_string())
+    }
+
+    // -----------------------------------------------------------------------
+    // Notes — the filesystem layer needs no database handle, so these work
+    // even when the database itself failed to open.
+    // -----------------------------------------------------------------------
+
+    /// The notes root (`KANDRIUM_NOTES` honoured), created when missing.
+    pub fn notes_root(&self) -> StoreResult<PathBuf> {
+        notes::ensure_root().map_err(|e| e.to_string())
+    }
+
+    pub fn notes_tree(&self, root: &Path) -> StoreResult<Vec<NoteEntry>> {
+        notes::scan_tree(root).map_err(|e| e.to_string())
+    }
+
+    pub fn read_note(&self, path: &Path, root: &Path) -> StoreResult<String> {
+        notes::read_note(path, root).map_err(|e| e.to_string())
+    }
+
+    pub fn write_note(&self, path: &Path, root: &Path, text: &str) -> StoreResult<()> {
+        notes::write_note(path, root, text).map_err(|e| e.to_string())
+    }
+
+    /// Create a name-validated note inside `in_dir` (`.md` appended).
+    pub fn create_note(&self, root: &Path, in_dir: &Path, name: &str) -> StoreResult<PathBuf> {
+        notes::create_named_note(root, in_dir, name).map_err(|e| e.to_string())
+    }
+
+    pub fn create_folder(&self, root: &Path, in_dir: &Path, name: &str) -> StoreResult<PathBuf> {
+        notes::create_named_folder(root, in_dir, name).map_err(|e| e.to_string())
+    }
+
+    pub fn rename_note(&self, path: &Path, root: &Path, new_name: &str) -> StoreResult<PathBuf> {
+        notes::rename_path(path, root, new_name).map_err(|e| e.to_string())
+    }
+
+    pub fn delete_note(&self, path: &Path, root: &Path) -> StoreResult<()> {
+        notes::delete_path(path, root).map_err(|e| e.to_string())
     }
 
     /// Projects offered by the card modal's project picker.
