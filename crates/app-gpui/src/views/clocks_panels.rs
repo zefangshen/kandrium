@@ -22,7 +22,7 @@ use crate::views::clocks::{
 };
 
 /// Full-section scrim with a centred panel.
-fn overlay(id: &'static str, t: &Tokens, panel: AnyElement) -> AnyElement {
+fn overlay(id: &'static str, panel: AnyElement) -> AnyElement {
     div()
         .id(id)
         .absolute()
@@ -276,7 +276,7 @@ pub fn picker(
                 ),
         );
 
-    Some(overlay("clock-picker-overlay", t, panel.into_any_element()))
+    Some(overlay("clock-picker-overlay", panel.into_any_element()))
 }
 
 // ---------------------------------------------------------------------------
@@ -436,11 +436,7 @@ pub fn inspector(
                 }),
         );
 
-    Some(overlay(
-        "clock-inspector-overlay",
-        t,
-        panel.into_any_element(),
-    ))
+    Some(overlay("clock-inspector-overlay", panel.into_any_element()))
 }
 
 fn section_label(label: &str, t: &Tokens) -> AnyElement {
@@ -572,16 +568,15 @@ fn resident_row(
         );
 
     if let Some(travel) = &status.travel {
-        row = row.child(trip_row(state, entry, travel, t, cx));
+        row = row.child(trip_row(state, travel, t, cx));
     } else if let Some(travel) = &status.upcoming {
-        row = row.child(trip_row(state, entry, travel, t, cx));
+        row = row.child(trip_row(state, travel, t, cx));
     }
     row.into_any_element()
 }
 
 fn trip_row(
     state: &ClockState,
-    entry: &ClockEntry,
     travel: &Travel,
     t: &Tokens,
     cx: &mut Context<AppShell>,
@@ -1025,7 +1020,7 @@ pub fn form(
                 ),
         );
 
-    Some(overlay("clock-form-overlay", t, panel.into_any_element()))
+    Some(overlay("clock-form-overlay", panel.into_any_element()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1107,9 +1102,5 @@ pub fn confirm(state: &ClockState, t: &Tokens, cx: &mut Context<AppShell>) -> Op
                 ),
         );
 
-    Some(overlay(
-        "clock-confirm-overlay",
-        t,
-        panel.into_any_element(),
-    ))
+    Some(overlay("clock-confirm-overlay", panel.into_any_element()))
 }
