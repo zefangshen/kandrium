@@ -1,0 +1,52 @@
+[workspace]
+# Standalone workspace. The repository root excludes this crate so the
+# shipping egui build, `cargo test --workspace` and `cargo clippy --workspace`
+# keep exactly the cost they had before the gpui migration started.
+#
+# Build and run it explicitly:
+#   cargo run --manifest-path crates/app-gpui/Cargo.toml --bin kandrium-gpui
+members = ["."]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# PDF rasterization, shared with the egui app.
+hayro = "0.7.1"
+
+[package]
+name = "kandrium-app-gpui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Kandrium desktop UI on gpui (migration in progress)"
+publish = false
+
+[[bin]]
+name = "kandrium-gpui"
+path = "src/main.rs"
+
+[dependencies]
+# Exact pins: the migration must be reproducible, not current.
+gpui-kit = "=0.9.1"
+kandrium-core = { path = "../core" }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+# Same version as `kandrium-core`; its `Timestamp` is part of the core API.
+jiff = "0.2"
+egui = "0.36.2"
+hayro = { workspace = true }
+kurbo = "0.13"
+image = "0.25.1"
+smallvec = "1"
+
+[dev-dependencies]
+# `gpui` is reachable by name only through the `gpui-pre` package (its lib is
+# named `gpui`); gpui-kit's `test-support` adds the snapshot/click layer
+# (`gpui_kit::test`) and turns on `gpui-base/test-support`, which is what makes
+# observation and synchronous observers work.
+gpui-pre = { version = "=0.3.12", features = ["test-support"] }
+gpui-kit = { version = "=0.9.1", features = ["test-support"] }
+tempfile = "3"
