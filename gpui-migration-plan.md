@@ -401,6 +401,8 @@ Only rows that moved; everything else in §4 stands.
 | PDF surface | L / Medium | L / **Medium-Low** | `image_viewer` is a direct reference for pixel upload + zoom/pan |
 | Headless tests | L / **High** | L / **Medium** | First-class `#[gpui::test]` + `VisualTestContext`; the duplicate-ID scan is still lost |
 | Markdown preview | M / Medium | M / Medium | Unchanged — but if gpui-kit's component cannot match tokens, writing your own `MarkdownElement` is **L** |
+| Test harness | L / **High** | **S / Low** | Resolved in the spike: `TestAppContext` + `.test_support()` + `#[gpui::test]`; only the egui duplicate-ID scan is lost |
+| Read-only board path | not estimated | **S** | Found during the spike: `get_board` writes on read; split into derive/persist + `get_board_readonly` |
 
 Net effect: **risk falls across the board; volume does not.** It is still a
 ~22.7k-line second implementation, two XL items remain (vim, Projects), and the
@@ -445,12 +447,33 @@ row of §6.1 above is a *design* reference, never a source to port.
 
 ## 7. Where the rest of the app stands
 
-### 7.1 `kandrium-core` — untouched
+### 7.1 `kandrium-core` — the one change Stage 1 had to make
 
 `crates/core` has no UI dependency (`dirs`, `jiff`, `log`, `rand`, `rusqlite`,
-`rusqlite_migration`, `serde`, `serde_json`, `tempfile`, `thiserror`). Its
-**119 tests** and all schema/migration/backup logic are invariant. This is the
-plan's main safety property: every phase can be abandoned without data risk.
+`rusqlite_migration`, `serde`, `serde_json`, `tempfile`, `thiserror`). All
+schema/migration/backup logic is invariant. This is the plan's main safety
+property: every phase can be abandoned without data risk.
+
+One exception was found during the spike and fixed in Stage 1:
+`services::board::get_board` **writes on read** for non-project boards (it
+backfills and reconciles `area_card_order`). That is fine when the app is the
+only front-end, but a second, read-only consumer would fail with
+`SQLITE_READONLY`, and every read would bump `PRAGMA data_version` and wake the
+app's watcher thread.
+
+The fix keeps both behaviours and adds a read-only variant:
+
+- `get_board` → `get_board_impl(db, id, reconcile = true)` — unchanged for the
+  app and MCP;
+- `get_board_readonly` → `get_board_impl(db, id, reconcile = false)` — derives
+  the identical order and stamps `display_position` without persisting;
+- the derivation is split out as `derive_area_order` (pure reads) and
+  `persist_area_order` (IMMEDIATE transaction, no-op when the plan is empty);
+- `db::open_db_readonly` opens with `SQLITE_OPEN_READ_ONLY`.
+
+Two tests pin the contract: a read-only connection renders an unbackfilled area
+board without error, and the derived order (including `display_position`)
+equals what the writing path stores. **The MCP tool surface is untouched.**
 
 ### 7.2 `kandrium-mcp` — untouched, contract unaffected
 
@@ -778,16 +801,70 @@ Each phase has an explicit fallback: **abandon it**. Because `kandrium-core`
 and `kandrium-mcp` are untouched and the egui app remains in the workspace,
 every phase is revertible with no data consequence.
 
-| Phase | Scope | Independently shippable? | Fallback |
+| Phase | Scope | Status | Fallback |
 | --- | --- | --- | --- |
-| 0 | Freeze: commit tree, tag, CI green (§13) | n/a | n/a |
-| 1 | **Spike** (§11), throwaway crate | No — internal | Delete it; decision documented |
-| 2 | New `crates/app-gpui` binary: shell, 5-section nav, theme/fonts/icons, `SavedState` JSON, read-only board | **No** — internal preview build | Delete crate |
-| 3 | Board interactivity: DnD, card chip, card modal, column ops, animation host | **No** — internal | Delete crate |
-| 4 | Markdown editor + vim (largest; do it *after* the shell proves out) | **No** | Keep egui app default |
-| 5 | Notes + Documents (trees, tabs, autosave, PDF surface) | **No** | Keep egui app default |
-| 6 | Projects (tree, Overview, doc tabs) + Clocks grid + Archived table | **No** — first near-parity build | Keep egui app default |
-| 7 | Parity pass, packaging, flip the default binary, delete `crates/app` | **Yes** | Ship the previous release |
+| 0 | Freeze: commit tree, tag, CI green (§13) | Done | n/a |
+| 1 | **Spike** (§11), throwaway crate | **Done — PASS**, harness resolved (§11.1) | Delete crate |
+| 2 | **Foundation** (Stage 1): own workspace, core read-only board path, theme/fonts/icons, 5-section shell, read-only board + Clocks | **Done** — runnable preview build | Delete crate |
+| 3 | Board interactivity: DnD, board switching, card modal, column ops, animation host | **Next** — concrete tasks §9.1 | Delete crate |
+| 4 | Markdown editor + vim (largest; after the shell proves out) | **Next** — concrete tasks §9.2 | Keep egui app default |
+| 5 | Notes + Documents (trees, tabs, autosave, PDF surface) | Pending | Keep egui app default |
+| 6 | Projects (tree, Overview, doc tabs) + Clocks parity + Archived table | Pending | Keep egui app default |
+| 7 | Parity pass, packaging, flip the default binary, delete `crates/app` | Pending | Ship the previous release |
+
+### 9.1 Stage 2 — board interactivity (concrete tasks)
+
+Prerequisite: the `gpui-migration` branch at the Stage 1 commits; `crates/app`
+and `crates/app-gpui` both green.
+
+1. **Writable handle, lazily.** `src/store.rs` gains `write_db: Option<Connection>`
+   opened with `kandrium_core::open_db` (not `bootstrap` — the file is already
+   schema-current). Reads stay on the read-only handle; every mutation takes the
+   write handle. Rule to enforce in review: no `get_board` on the read-only
+   handle, no `_readonly` call on the write handle.
+2. **Board switching.** `views/tasks.rs` header becomes a tab row from
+   `Store::boards()`; `AppShell` stores `active_board: Option<String>` and
+   reloads through `Store::board`. Test: switching from the seed board to the
+   third board changes the column set.
+3. **Drag state.** New `src/dnd.rs` porting the `dnd::GridZone` insertion-index
+   idea and the `drag_probe` timeline (`LIFT_S 0.140`, `GAP_S 0.160`,
+   `SNAP_S 0.260`, `TOTAL_S 0.560`) onto `with_animation`. Reuse
+   `cubic-bezier(0.20, 0, 0, 1)` for lift/reflow and
+   `cubic-bezier(0.40, 0, 0.20, 1)` for snap-back.
+4. **Drop.** On drop call `kandrium_core::services::board::move_area_card` for
+   Tasks boards (mirrors included — a mirrored card is never moved into the area
+   column) and `move_card` for project boards; reload from the write handle.
+   Tests: a native card dropped into another column changes `position`; a
+   mirrored card dropped into a status column preserves `project_id` and
+   `area_board_id`.
+5. **Card modal shell.** `src/views/card_modal.rs` reading the card through
+   core, title editable, description read-only (the editor is Stage 3), Escape
+   and click-outside close. No image/attachment surface yet.
+6. **Column ops** (app-only by design): create / rename / delete / move through
+   `kandrium_core::services::column`; keep the MCP tool surface untouched.
+7. **Tests.** Headless: drag across columns mutates the DB and re-renders; modal
+   opens for the clicked card id; no duplicate element paths after a reorder.
+   Physical-mouse verification stays manual.
+
+### 9.2 Stage 3 — markdown editing and vim (concrete tasks)
+
+1. **Editor component.** Wrap gpui's `TextInput`/`EntityInputHandler` in
+   `src/widgets/editor.rs`, matching the egui fixed-height frame + inner scroll
+   + frameless multiline reference in `widgets/card_modal.rs`.
+2. **Vim layer.** Port `crates/app/src/widgets/vim.rs` with its 47-case matrix:
+   `pre_edit` equivalent consumes key events before insertion; Normal/Visual
+   commands mutate the buffer; caret movement uses the entity's selection API;
+   own snapshot stack for `u` / `Ctrl-r` (direct buffer edits bypass the
+   built-in undoer). Ex commands `:w`, `:q`, `:wq`, `:x`.
+3. **Markdown preview.** Evaluate gpui-kit's markdown component first; if it
+   cannot match tokens, write a `MarkdownElement` over `pulldown-cmark` (§5.3).
+   Preview toggle mirrors `markdown::mode_toggle`.
+4. **Notes tree + autosave.** Tree from `kandrium_core::notes`, debounced writes
+   through `fsutil::write_atomic`, `SavedState` JSON parity for `tree_open` and
+   vim mode.
+5. **Tests.** Re-run the vim behaviour matrix headlessly; markdown round-trip;
+   autosave writes are atomic (temp file + rename).
+
 
 ### Is a partial migration possible?
 
@@ -1008,6 +1085,90 @@ project. No production code.
 cannot match the app's token styling for markdown/cards, stop and stay on egui.
 Record the result in this file either way.
 
+### 11.1 Spike result — PASS (2026-11-10)
+
+All four probes ran against the real database and real UI code:
+
+| Probe | Question | Result |
+| --- | --- | --- |
+| A | 3 columns × real cards, h-scroll + per-column v-scroll | Pass — layout idiom matches, no infinite-width trap |
+| B | caret read/set, key consumed before insert, Esc handling | Pass |
+| C | PDF page → RGBA → gpui image, zoom + pan | Pass (`hayro` output reused unchanged) |
+| D | lift / reflow / snap-back animation host | Pass (`with_animation`, curves from `anim.rs`) |
+
+**Harness resolved.** `TestAppContext` works. The two blockers were both
+mechanical:
+
+- enable `test-support` on **both** `gpui-pre` and `gpui-kit` (the latter turns
+  on `gpui-base/test-support`, which is what makes observation synchronous);
+- force `taffy` to `0.15.0` (`cargo update -p taffy --precise 0.15.0`). The
+  `gpui-fast?/test-support` optional backend pins `=0.15.0` even though it is
+  never built; a pre-existing lock holding `0.15.1` reports a phantom conflict.
+  A fresh resolve picks 0.15.0 on its own.
+
+One thing the spike changed: observation is **opt-in per element**
+(`.test_support()`), and `#[gpui::test]` (not `#[gpui_kit::test]`, which the
+gpui-kit docs mention but does not exist) is the attribute to use. A headless
+test can assert render count, laid-out `bounds()`, click dispatch, and Esc
+delivery with focus retained.
+
+**Estimate that moved**: headless tests went from *L / High* to **S / Low** for
+shell and board-level tests — better than §6.4 predicted. The duplicate-ID
+warning scan is the only egui test capability not matched.
+
+**Finding that changed the plan**: `kandrium_core::services::board::get_board`
+writes on read (it reconciles `area_card_order` for non-project boards), so a
+second, read-only front-end fails with `SQLITE_READONLY` and spurious
+`data_version` bumps would wake the app's watcher. This added a core change to
+Stage 1 (§7.1), which the original phase table did not anticipate.
+
+### 11.2 Stage 1 foundation — DONE (2026-11-10)
+
+Runnable, judged before later stages build on it.
+
+**Delivered**
+
+- **Workspace isolation.** `crates/app-gpui` is its own workspace
+  (`members = ["."]`) and the root `Cargo.toml` has
+  `exclude = ["crates/app-gpui"]`. `default-members` was rejected because it
+  does not affect `cargo test --workspace`; only a separate workspace keeps the
+  egui build/test/clippy cost identical. Run with
+  `cargo run --manifest-path crates/app-gpui/Cargo.toml --bin kandrium-gpui -- app`.
+- **Core read path** (§7.1): `get_board_readonly`, `derive_area_order` /
+  `persist_area_order`, `db::open_db_readonly`; `get_board` semantics
+  unchanged. Two new core tests.
+- **Theme.** `src/theme.rs` owns the palette (dark + light, same hex values as
+  the egui app), 6 px radius, Inter/JetBrains Mono loaded from
+  `crates/app/assets/fonts/`, and a `Text` enum whose `metrics()` is the single
+  size table. `TextStyled::text()` is the only way to apply a size. Structural,
+  not a convention: there is no other public size source.
+- **Icons.** `src/assets.rs` renders the existing
+  `crates/app/assets/icons/*.svg` through `svg().data(include_bytes!(…))`; no
+  copied assets, no asset-path map.
+- **Shell.** Title bar with the segmented control (icon + label, accent-soft
+  selected chip) and five real sections. Tasks and Clocks render live data;
+  Notes / Documents / Projects show explicit not-ported cards.
+- **Board view.** Read-only: 280 px columns, card titles, due dates, labels,
+  and the `meta_label` (project identifier on Tasks boards, filed-area title on
+  project boards). No drag, no modal.
+- **Clocks view.** Saved cities with `format_clock` output and a working 12/24
+  toggle.
+- **macOS.** Dev bundle technique documented in `crates/app-gpui/README.md`
+  (`target/KandriumGpui-dev.app` with a symlinked executable); the app was
+  launched from that bundle against the real database.
+
+**Gates**: `cargo fmt` clean; `cargo clippy --workspace --all-targets` clean
+for the gpui workspace, `cargo clippy --workspace` clean at the root;
+`cargo test --workspace` 278 green; `cargo test` in `crates/app-gpui` 10 green
+(2 unit, 5 spike/harness, 3 shell).
+
+**Estimate that moved**: the shell + theme + read-only board was ~1 stage of
+the table's phase 2 and landed without surprises. The phase order held. The one
+thing to watch is that Stage 2 needs a *second* (writable) connection — the
+read-only default was the right call for Stage 1 but cannot serve mutations.
+
+
+
 ---
 
 ## 12. What breaks, and what you'd be agreeing to lose
@@ -1040,7 +1201,8 @@ Record the result in this file either way.
 **What does *not* break**
 
 - All data: schema, migrations, backups, notes/documents/projects files,
-  PDF sidecars. `kandrium-core` is untouched.
+  PDF sidecars. The Stage 1 core change is additive (`get_board_readonly` +
+  `open_db_readonly`); `get_board` keeps its exact writing semantics.
 - `kandrium-mcp` and its 13-tool camelCase contract.
 - Logging, panic reports, atomic writes, DB safety.
 - `cargo packager` and the dev `.app` workflow.
@@ -1083,25 +1245,32 @@ Things this plan does **not** know, and where they are resolved:
 
 | Unknown | Why it matters | Resolved in |
 | --- | --- | --- |
-| Does gpui-kit's editor expose vim bindings / caret control, and can a key be consumed before insertion? | §5.1 is XL or M/L | Spike 2 |
-| Exact `gpui-pre` package identity and re-export shape | Dependency hygiene | Spike 5 |
-| gpui-kit markdown styling hooks (tokens, code blocks) | §5.3 loss is quantifiable | Spike 1 |
-| Whether animation can target arbitrary element bounds at 60 fps | §5.2 feel | Spike 4 |
-| `TestAppContext`/`VisualTestContext` API details, input simulation incl. IME | §7.9 scope | Spike, docs |
-| Dock-icon override still works under gpui's `NSApplication` | macOS polish | Spike 1/2 on a real bundle |
-| gpui's macOS minimum + GPU requirement vs. the app's 10.15 floor | Packaging claim in README | Before Phase 2 |
-| Which Zed APIs exist in `gpui-pre 0.3.12` vs. Zed `0.2.2` | Every §6 reference is potentially stale | Spike 6 |
+| Does gpui-kit's editor expose vim bindings / caret control, and can a key be consumed before insertion? | §5.1 is XL or M/L | **Probe B: pass.** Full vim port is Stage 3 (§9.2) |
+| Exact `gpui-pre` package identity and re-export shape | Dependency hygiene | **Resolved**: `gpui-pre 0.3.12`, lib name `gpui`, `taffy` 0.15.0, harness in §11.1 |
+| gpui-kit markdown styling hooks (tokens, code blocks) | §5.3 loss is quantifiable | Stage 3 (§9.2) — not needed for the shell |
+| Whether animation can target arbitrary element bounds at 60 fps | §5.2 feel | **Probe D: pass** with `with_animation` |
+| `TestAppContext`/`VisualTestContext` API details, input simulation incl. IME | §7.9 scope | **Resolved**: `#[gpui::test]`, `.test_support()`, click/key simulation (§11.1) |
+| Dock-icon override still works under gpui's `NSApplication` | macOS polish | Not yet tested; Stage 7 |
+| gpui's macOS minimum + GPU requirement vs. the app's 10.15 floor | Packaging claim in README | Not yet tested; before Phase 7 |
+| Which Zed APIs exist in `gpui-pre 0.3.12` vs. Zed `0.2.2` | Every §6 reference is potentially stale | Verified per API as used; recurring task |
 | Whether Longbridge will state in writing that the editor/markdown/dock components are independent of Zed's GPL crates | §8.5's "clean" verdict is evidence-based, not a clearance | Ask upstream; otherwise the §8.7 rule and a `cargo deny` allow-list are the mitigation |
 
 ---
 
 ## 15. Recommendation summary
 
-1. **Today: no.** Keep egui 0.36. It is not the bottleneck.
-2. **If a real blocker appears**: gpui-kit + its `gpui-pre` snapshot, nothing
-   else, and never mixed with registry `gpui`.
-3. **Before anything**: commit, tag, add CI.
-4. **First action if approved**: run the §11 spike; write the result here; let
-   it decide.
+> **Status (2026-11-10)**: the decision was reversed after the user reviewed the
+> spike. All four probes passed, the harness was resolved, and the migration was
+> approved. Stage 1 (foundation) is complete on the `gpui-migration` branch; the
+> egui app is still the shipping product. §9.1 and §9.2 are the executable next
+> stages.
+
+1. **At planning time: no.** Keep egui 0.36. It is not the bottleneck. The
+   portal is now approved against that recommendation, with the fallback intact.
+2. **Toolchain**: gpui-kit + its `gpui-pre` snapshot, nothing else, and never
+   mixed with registry `gpui`.
+3. **Before anything**: commit, tag, add CI. (Branch `gpui-migration`, `main`
+   stays egui-only.)
+4. **Spike**: done — §11.1. It decided in favour of proceeding.
 5. **Plan for**: XL vim editor, XL projects, L PDF surface, M animation host
    (revised in §6.4). The rest is ordinary but voluminous layout work.
