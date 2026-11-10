@@ -928,6 +928,83 @@ fn area_board_interleaves_native_and_project_cards() {
     );
 }
 
+/// A read-only connection must render an area board whose unified order has
+/// never been persisted — the case that used to fail with `SQLITE_READONLY`
+/// because `get_board` backfilled `area_card_order` on read.
+#[test]
+fn readonly_connection_renders_unbackfilled_area_board() {
+    let (_dir, db) = fresh_db();
+    let root = _dir.path().join("projects");
+    std::fs::create_dir_all(&root).unwrap();
+    let (p1, p2, n1, n2, _) = area_order_fixture(&db, &root);
+
+    let pending: i64 = db
+        .query_row("SELECT COUNT(*) FROM area_card_order", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(pending, 0, "fixture must leave the order unbackfilled");
+
+    // Close the writable handle so the read-only open sees a checkpointed file.
+    drop(db);
+    let ro = open_db_readonly(&_dir.path().join("t.db")).unwrap();
+    let board = get_board_readonly(&ro, "board_career").unwrap();
+
+    let todo = &board.columns[0];
+    let seed = todo.cards[0].id.clone();
+    assert_eq!(
+        ordered_ids(todo),
+        [
+            seed.as_str(),
+            n1.id.as_str(),
+            n2.id.as_str(),
+            p1.id.as_str(),
+            p2.id.as_str()
+        ]
+    );
+
+    let after: i64 = ro
+        .query_row("SELECT COUNT(*) FROM area_card_order", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(after, 0, "a read-only load must not persist the order");
+}
+
+/// The order a read-only load derives is exactly the order the writing path
+/// would store, so a read-only front-end and the app never disagree.
+#[test]
+fn readonly_derivation_matches_the_writer() {
+    let (_dir, db) = fresh_db();
+    let root = _dir.path().join("projects");
+    std::fs::create_dir_all(&root).unwrap();
+    area_order_fixture(&db, &root);
+
+    let derived = get_board_readonly(&db, "board_career").unwrap();
+    let pending: i64 = db
+        .query_row("SELECT COUNT(*) FROM area_card_order", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(pending, 0, "derivation must not write");
+
+    let written = get_board(&db, "board_career").unwrap();
+    for (derived, written) in derived.columns.iter().zip(&written.columns) {
+        assert_eq!(ordered_ids(derived), ordered_ids(written));
+        assert_eq!(
+            derived
+                .ordered_cards()
+                .iter()
+                .map(|c| c.display_position)
+                .collect::<Vec<_>>(),
+            written
+                .ordered_cards()
+                .iter()
+                .map(|c| c.display_position)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    let after: i64 = db
+        .query_row("SELECT COUNT(*) FROM area_card_order", [], |r| r.get(0))
+        .unwrap();
+    assert!(after > 0, "the writing path must persist the order");
+}
+
 #[test]
 fn moving_a_mirror_across_area_statuses_moves_its_project_column() {
     let (_d, db) = fresh_db();

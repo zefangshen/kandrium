@@ -45,7 +45,27 @@ pub fn create_board(db: &Connection, title: &str) -> Result<Board> {
 }
 
 /// Load a single board with columns and cards. Errors if board not found.
+///
+/// This is the writing path: a non-project board lazily backfills and
+/// reconciles its unified order in `area_card_order`. Front-ends that share
+/// the database with the app and only render should use
+/// [`get_board_readonly`] instead.
 pub fn get_board(db: &Connection, id: &str) -> Result<BoardWithColumns> {
+    get_board_impl(db, id, true)
+}
+
+/// Read-only variant of [`get_board`].
+///
+/// The board is derived exactly the same way — including the unified order of
+/// a non-project board — but nothing is persisted, so this works on a
+/// connection opened with [`crate::db::open_db_readonly`]. Cards that have no
+/// persisted slot yet get the position the writer would assign, which keeps a
+/// read-only view stable and identical to the next writing load.
+pub fn get_board_readonly(db: &Connection, id: &str) -> Result<BoardWithColumns> {
+    get_board_impl(db, id, false)
+}
+
+fn get_board_impl(db: &Connection, id: &str, reconcile: bool) -> Result<BoardWithColumns> {
     let board: Option<(String, String)> = db
         .query_row("SELECT id, title FROM boards WHERE id = ?", [id], |r| {
             Ok((r.get(0)?, r.get(1)?))
@@ -133,7 +153,7 @@ pub fn get_board(db: &Connection, id: &str) -> Result<BoardWithColumns> {
             }
         }
 
-        apply_area_order(db, &board_id, &columns, &mut board_columns)?;
+        apply_area_order(db, &board_id, &columns, &mut board_columns, reconcile)?;
     }
 
     Ok(BoardWithColumns {
@@ -156,8 +176,35 @@ struct AreaCandidate {
     order: i64,
 }
 
-/// Load, backfill and reconcile the unified display order of a non-project
-/// board, then stamp every card with its [`Card::display_position`].
+/// One row to write to `area_card_order`.
+struct AreaOrderWrite {
+    card_id: String,
+    status: CardStatus,
+    position: i64,
+}
+
+/// The unified display order a non-project board should have, plus the writes
+/// that make it durable.
+///
+/// Deriving the order is pure SQL reads; only [`persist_area_order`] writes.
+/// That split is what lets a read-only consumer (the gpui app) render an area
+/// board without taking the write lock.
+struct AreaOrderPlan {
+    /// Final slot per visible card, including cards with no persisted row.
+    placement: HashMap<String, i64>,
+    /// Rows for cards no longer visible on this board.
+    stale: Vec<String>,
+    /// Rows to insert or re-bucket.
+    writes: Vec<AreaOrderWrite>,
+}
+
+impl AreaOrderPlan {
+    fn is_empty(&self) -> bool {
+        self.stale.is_empty() && self.writes.is_empty()
+    }
+}
+
+/// Load and reconcile the unified display order of a non-project board.
 ///
 /// Native cards and project cards filed to the board ("mirrors") are one
 /// sequence per canonical status bucket, persisted in `area_card_order`. This
@@ -168,12 +215,11 @@ struct AreaCandidate {
 ///   - rows whose stored status no longer matches the card's real column are
 ///     re-bucketed at the end of their new status;
 ///   - rows for cards no longer visible on this board are deleted.
-fn apply_area_order(
+fn derive_area_order(
     db: &Connection,
     board_id: &str,
     columns: &[(String, String, i64)],
-    board_columns: &mut [Column],
-) -> Result<()> {
+) -> Result<AreaOrderPlan> {
     let status_of: HashMap<&str, CardStatus> = columns
         .iter()
         .filter_map(|(id, title, _)| status_from_column_title(title).map(|s| (id.as_str(), s)))
@@ -284,52 +330,92 @@ fn apply_area_order(
         }
     }
 
-    if !inserts.is_empty() || !rebuckets.is_empty() || !stale.is_empty() {
-        // IMMEDIATE: the write lock is taken up front so the running max
-        // position read can't race a concurrent backfill in the other
-        // process (app vs MCP).
-        let tx =
-            rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)?;
-        {
-            // Running max position per status, seeded from every retained row.
-            let mut max_pos: [i64; 3] = [-1; 3];
-            for (card_id, position) in &placement {
-                if let Some(candidate) = by_id.get(card_id.as_str()) {
-                    let slot = candidate.status.index();
-                    max_pos[slot] = max_pos[slot].max(*position);
-                }
-            }
-            let mut del =
-                tx.prepare("DELETE FROM area_card_order WHERE board_id = ? AND card_id = ?")?;
-            for card_id in &stale {
-                del.execute(rusqlite::params![board_id, card_id])?;
-            }
-            drop(del);
-            let mut upsert = tx.prepare(
-                "INSERT INTO area_card_order (board_id, card_id, status, position) \
-                 VALUES (?, ?, ?, ?) \
-                 ON CONFLICT(board_id, card_id) \
-                 DO UPDATE SET status = excluded.status, position = excluded.position",
-            )?;
-            // Re-bucketed cards are appended to their new status; the insert
-            // list (initial backfill) follows the deterministic order above.
-            for candidate in rebuckets.iter().chain(inserts.iter()) {
-                let slot = candidate.status.index();
-                max_pos[slot] += 1;
-                upsert.execute(rusqlite::params![
-                    board_id,
-                    candidate.id,
-                    candidate.status.as_str(),
-                    max_pos[slot]
-                ])?;
-                placement.insert(candidate.id.clone(), max_pos[slot]);
-            }
+    // Running max position per status, seeded from every retained row.
+    // Re-bucketed cards are appended to their new status; the insert list
+    // (initial backfill) follows the deterministic order above.
+    let mut max_pos: [i64; 3] = [-1; 3];
+    for (card_id, position) in &placement {
+        if let Some(candidate) = by_id.get(card_id.as_str()) {
+            let slot = candidate.status.index();
+            max_pos[slot] = max_pos[slot].max(*position);
         }
-        tx.commit()?;
+    }
+    let mut writes = Vec::with_capacity(rebuckets.len() + inserts.len());
+    for candidate in rebuckets.iter().chain(inserts.iter()) {
+        let slot = candidate.status.index();
+        max_pos[slot] += 1;
+        placement.insert(candidate.id.clone(), max_pos[slot]);
+        writes.push(AreaOrderWrite {
+            card_id: candidate.id.clone(),
+            status: candidate.status,
+            position: max_pos[slot],
+        });
     }
 
-    // Stamp per-column display positions: merge the column's own cards and
-    // its mirrors by their persisted slot.
+    Ok(AreaOrderPlan {
+        placement,
+        stale,
+        writes,
+    })
+}
+
+/// Make a derived area order durable: delete rows for cards that left the
+/// board and upsert the new and re-bucketed ones. Nothing is written (and no
+/// transaction is opened) when the derived plan matches the stored rows.
+fn persist_area_order(db: &Connection, board_id: &str, plan: &AreaOrderPlan) -> Result<()> {
+    if plan.is_empty() {
+        return Ok(());
+    }
+    // IMMEDIATE: the write lock is taken up front so a concurrent backfill in
+    // the other process (app vs MCP) cannot interleave between our reads and
+    // this write.
+    let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)?;
+    {
+        let mut del =
+            tx.prepare("DELETE FROM area_card_order WHERE board_id = ? AND card_id = ?")?;
+        for card_id in &plan.stale {
+            del.execute(rusqlite::params![board_id, card_id])?;
+        }
+        drop(del);
+        let mut upsert = tx.prepare(
+            "INSERT INTO area_card_order (board_id, card_id, status, position) \
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT(board_id, card_id) \
+             DO UPDATE SET status = excluded.status, position = excluded.position",
+        )?;
+        for write in &plan.writes {
+            upsert.execute(rusqlite::params![
+                board_id,
+                write.card_id,
+                write.status.as_str(),
+                write.position
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Derive the unified order, optionally persist it, then stamp every card
+/// with its [`Card::display_position`].
+fn apply_area_order(
+    db: &Connection,
+    board_id: &str,
+    columns: &[(String, String, i64)],
+    board_columns: &mut [Column],
+    persist: bool,
+) -> Result<()> {
+    let plan = derive_area_order(db, board_id, columns)?;
+    if persist {
+        persist_area_order(db, board_id, &plan)?;
+    }
+    stamp_display_positions(board_columns, &plan.placement);
+    Ok(())
+}
+
+/// Stamp per-column display positions: merge the column's own cards and its
+/// mirrors by their persisted slot.
+fn stamp_display_positions(board_columns: &mut [Column], placement: &HashMap<String, i64>) {
     for column in board_columns.iter_mut() {
         column
             .cards
@@ -359,8 +445,6 @@ fn apply_area_order(
             card.display_position = display_position as i64;
         }
     }
-
-    Ok(())
 }
 
 /// Rewrite the unified order of a non-project board after a card moved.

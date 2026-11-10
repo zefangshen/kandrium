@@ -30,8 +30,8 @@ pub use constants::{
     status_from_column_title,
 };
 pub use db::{
-    backups_dir, bootstrap, migrate_legacy_db, open_db, resolve_db_path, resolve_old_db_path,
-    run_schema, uid,
+    backups_dir, bootstrap, migrate_legacy_db, open_db, open_db_readonly, resolve_db_path,
+    resolve_old_db_path, run_schema, uid,
 };
 pub use error::{KandriumError, Result};
 pub use import::{ImportCounts, import_old_db};
@@ -46,7 +46,9 @@ pub use projects::{
     unarchive_project, update_project, validate_identifier,
 };
 pub use seed::seed;
-pub use services::board::{create_board, get_all_board, get_board, list_boards};
+pub use services::board::{
+    create_board, get_all_board, get_board, get_board_readonly, list_boards,
+};
 pub use services::card::{
     create_card, create_card_in_status, delete_card, list_archived_cards, move_all_card,
     move_area_card, move_card, move_card_to_board, move_card_to_status, rename_card,

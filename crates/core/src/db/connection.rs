@@ -108,6 +108,20 @@ pub fn open_db(path: &std::path::Path) -> Result<Connection> {
     Ok(db)
 }
 
+/// Open an existing Kandrium database for reading only.
+///
+/// A second front-end that merely renders data (the gpui app during the
+/// migration) must never take the write lock, bump `PRAGMA data_version`, or
+/// fail with `SQLITE_READONLY` because a read path tried to reconcile a lazy
+/// order. WAL mode is a property of the file, so it does not need to be set
+/// here (and could not be on a read-only connection).
+pub fn open_db_readonly(path: &std::path::Path) -> Result<Connection> {
+    let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    db.pragma_update(None, "foreign_keys", "ON")?;
+    db.busy_timeout(Duration::from_millis(5000))?;
+    Ok(db)
+}
+
 /// True when the database has at least one board (i.e. seed/import already ran).
 pub fn has_boards(db: &Connection) -> Result<bool> {
     let count: i64 = db.query_row("SELECT COUNT(*) FROM boards", [], |r| r.get(0))?;
