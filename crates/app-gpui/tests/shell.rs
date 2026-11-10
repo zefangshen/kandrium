@@ -116,3 +116,226 @@ fn clocks_view_renders_seeded_cities(cx: &mut TestAppContext) {
         }
     });
 }
+
+/// Drag a card from the first column onto the second and assert the write
+/// landed in SQLite. This exercises the whole Stage 2 path: gpui drag session
+/// → `AppShell::drop_card` → `Store::move_card` → `kandrium_core::move_area_card`.
+#[gpui::test]
+fn dragging_a_card_to_another_column_persists(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+
+    let store = Store::open_path(path.clone());
+    let board_id = store.boards().expect("boards")[0].id.clone();
+    let before = store.board(&board_id).expect("board");
+    let source_column = before.columns[0].id.clone();
+    let target_column = before.columns[1].id.clone();
+    let card_id = before.columns[0].ordered_cards()[0].id.clone();
+    assert!(
+        before.columns[1]
+            .ordered_cards()
+            .iter()
+            .all(|card| card.id != card_id),
+        "seed should start the card on the first column"
+    );
+
+    let (_view, cx) =
+        cx.add_window_view(|_window, _cx| AppShell::with_store(Store::open_path(path.clone())));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    // Press the card, move past the 2px drag threshold, cross columns and drop.
+    cx.update(|window, cx| {
+        window.drag_to(
+            format!("board-card-{card_id}"),
+            format!("board-column-{target_column}"),
+            cx,
+        );
+    });
+
+    let after = Store::open_path(path).board(&board_id).expect("board");
+    let source = after
+        .columns
+        .iter()
+        .find(|column| column.id == source_column)
+        .expect("source column");
+    let target = after
+        .columns
+        .iter()
+        .find(|column| column.id == target_column)
+        .expect("target column");
+
+    assert!(
+        source.ordered_cards().iter().all(|card| card.id != card_id),
+        "card {card_id} is still in {source_column}"
+    );
+    assert!(
+        target.ordered_cards().iter().any(|card| card.id == card_id),
+        "card {card_id} did not land in {target_column}"
+    );
+}
+
+/// Dropping onto the top half of a card must insert *before* it, which is the
+/// within-column reorder path (and `move_area_card`'s `before_card_id`).
+#[gpui::test]
+fn dropping_on_a_cards_top_half_inserts_before_it(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+
+    let store = Store::open_path(path.clone());
+    let board_id = store.boards().expect("boards")[0].id.clone();
+    let before = store.board(&board_id).expect("board");
+    let target_column = before.columns[1].id.clone();
+    let moving = before.columns[0].ordered_cards()[0].id.clone();
+    let anchor = before.columns[1].ordered_cards()[0].id.clone();
+
+    let (_view, cx) =
+        cx.add_window_view(|_window, _cx| AppShell::with_store(Store::open_path(path.clone())));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    let (from, to) = cx.update(|window, _cx| {
+        let from = window
+            .find(format!("board-card-{moving}"))
+            .bounds()
+            .center();
+        let anchor = window.find(format!("board-card-{anchor}")).bounds();
+        // A few pixels below the top edge: above the card's midline.
+        (
+            from,
+            gpui::point(anchor.center().x, anchor.origin.y + px(4.)),
+        )
+    });
+    cx.update(|window, cx| window.drag(from, to, cx));
+
+    let after = Store::open_path(path).board(&board_id).expect("board");
+    let order: Vec<_> = after
+        .columns
+        .iter()
+        .find(|column| column.id == target_column)
+        .expect("target column")
+        .ordered_cards()
+        .iter()
+        .map(|card| card.id.clone())
+        .collect();
+
+    assert_eq!(
+        order,
+        vec![moving.clone(), anchor.clone()],
+        "dropping on the top half should place {moving} before {anchor}"
+    );
+}
+
+/// Project cards filed onto an area board are mirrors. Dragging a mirror to
+/// another area column must move the card's *project* column, never file it
+/// into the area board's own column (`move_area_card` mirror semantics).
+#[gpui::test]
+fn dragging_a_mirror_across_area_statuses_moves_its_project_column(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+
+    let mut db = kandrium_core::open_db(&path).expect("open db");
+    kandrium_core::bootstrap(&mut db, &path).expect("bootstrap");
+    let projects_root = dir.path().join("projects");
+    std::fs::create_dir_all(&projects_root).unwrap();
+    let project = kandrium_core::create_project(&db, &projects_root, "Kandrium", None, "blank")
+        .expect("project");
+    let project_board =
+        kandrium_core::get_board_readonly(&db, &project.board_id).expect("project board");
+    let project_todo = project_board.columns[0].id.clone();
+    let project_progress = project_board.columns[1].id.clone();
+    let card = kandrium_core::create_card(
+        &db,
+        &project_todo,
+        &kandrium_core::CreateCardBody {
+            title: "Mirror".into(),
+            ..Default::default()
+        },
+    )
+    .expect("card");
+    kandrium_core::set_card_area(&db, &card.id, Some("board_career"))
+        .expect("file onto area board");
+    drop(db);
+
+    let store = Store::open_path(path.clone());
+    let area = store.board("board_career").expect("area board");
+    let area_todo = area
+        .columns
+        .iter()
+        .find(|column| column.title == "To Do")
+        .expect("area To Do")
+        .id
+        .clone();
+    let area_progress = area
+        .columns
+        .iter()
+        .find(|column| column.title == "In Progress")
+        .expect("area In Progress")
+        .id
+        .clone();
+    assert!(
+        area.columns
+            .iter()
+            .find(|column| column.id == area_todo)
+            .expect("area To Do")
+            .ordered_cards()
+            .iter()
+            .any(|card_on_board| card_on_board.id == card.id),
+        "the mirror should start in the area board's To Do column"
+    );
+    drop(store);
+
+    let (_view, cx) =
+        cx.add_window_view(|_window, _cx| AppShell::with_store(Store::open_path(path.clone())));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, cx| {
+        window.drag_to(
+            format!("board-card-{}", card.id),
+            format!("board-column-{area_progress}"),
+            cx,
+        );
+    });
+
+    // The mirror's status change moved the real (project) column.
+    let project_after = Store::open_path(path.clone())
+        .board(&project.board_id)
+        .expect("project board");
+    let progress = project_after
+        .columns
+        .iter()
+        .find(|column| column.id == project_progress)
+        .expect("project In Progress");
+    assert!(
+        progress
+            .ordered_cards()
+            .iter()
+            .any(|card_on_board| card_on_board.id == card.id),
+        "the mirror's project card should now be in the project's In Progress column"
+    );
+
+    // And the area board shows it under In Progress, not filed as a native To Do card.
+    let area_after = Store::open_path(path)
+        .board("board_career")
+        .expect("area board");
+    let todo = area_after
+        .columns
+        .iter()
+        .find(|column| column.id == area_todo)
+        .expect("area To Do");
+    assert!(
+        todo.ordered_cards()
+            .iter()
+            .all(|card_on_board| card_on_board.id != card.id),
+        "the mirror must not stay in the area board's To Do column"
+    );
+    let progress = area_after
+        .columns
+        .iter()
+        .find(|column| column.id == area_progress)
+        .expect("area In Progress");
+    assert!(
+        progress
+            .ordered_cards()
+            .iter()
+            .any(|card_on_board| card_on_board.id == card.id),
+        "the mirror should now render under the area board's In Progress column"
+    );
+}
