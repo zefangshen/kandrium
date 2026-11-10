@@ -5,9 +5,33 @@
 //! (`KANDRIUM_DOCS`), the path guards, the `-2` import names and the atomic
 //! annotation sidecars are the same ones the egui app uses. This module owns
 //! only the tree, the tab list and the small session file that stores which
-//! tabs were open, keyed by root-relative paths.
+//! tabs were open, keyed by root-relative paths. PDF rendering lives next door
+//! in [`crate::views::documents_pdf`].
 
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::mpsc::Receiver;
+use std::time::Duration;
+
+use gpui_kit::base::text::markdown;
+use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_kit::prelude::*;
+use gpui_kit::{
+    AnyElement, App, Bounds, ClickEvent, Context, Entity, Pixels, Point, RenderImage, Rgba,
+    ScrollHandle, TestSupportExt, Window, div, point, px, rgba, size,
+};
+
+use kandrium_core::documents::{AnnotationKind, DocAnnotation, DocEntry};
+use pdf_render::{Event, PageText, PdfWorker};
+
+use crate::app::AppShell;
+use crate::assets::{Icon, icon};
+use crate::theme::{Text, TextStyled, Tokens};
+use crate::views::placeholder;
+use crate::vim::VimSession;
 
 /// Tree panel width when expanded, matching the other tree sections.
 pub const TREE_W: f32 = 240.0;
@@ -18,7 +42,32 @@ pub const ROW_H: f32 = 26.0;
 /// Indentation per folder level.
 pub const INDENT: f32 = 14.0;
 
-/// Which pointer tool the PDF viewer has active. Selection stays visual-only,
+/// Space between page blocks in the viewer.
+pub const PAGE_MARGIN: f32 = 8.0;
+/// Reserved lane for the viewer's scrollbar.
+pub const VIEWER_RIGHT_INSET: f32 = 7.0;
+
+pub const ZOOM_STEP: f32 = 1.25;
+pub const ZOOM_MIN: f32 = 0.25;
+pub const ZOOM_MAX: f32 = 4.0;
+
+/// Rendered-page cache cap (egui keeps the same number of textures).
+pub const TEXTURE_CACHE_CAP: usize = 24;
+
+/// Side of a sticky-note anchor in points.
+pub const NOTE_ANCHOR: f32 = 20.0;
+/// Highlight fill alpha (of 255).
+pub const HIGHLIGHT_ALPHA: u8 = 90;
+
+/// Halo colours for notes and highlights, in the same order as egui.
+pub const NOTE_COLORS: [&str; 4] = ["#f6d448", "#a5d6a7", "#8ab4f8", "#f6a6c1"];
+
+/// Debounce before a dirty Markdown tab is written.
+pub const AUTOSAVE: Duration = Duration::from_millis(400);
+/// Debounce before changed annotations hit the sidecar.
+pub const ANNOTATION_AUTOSAVE: Duration = Duration::from_millis(500);
+
+/// Which pointer tool the viewer has active. Selection stays visual-only,
 /// exactly like the egui app.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Tool {
@@ -36,7 +85,338 @@ impl Tool {
             Tool::Note => "Note",
         }
     }
+
+    pub fn icon(self) -> Icon {
+        match self {
+            Tool::Select => Icon::Square,
+            Tool::Highlight => Icon::Highlighter,
+            Tool::Note => Icon::StickyNote,
+        }
+    }
 }
+
+/// Which viewer a tab uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocKind {
+    Pdf,
+    Markdown,
+}
+
+/// A selection drag in page view space.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Selection {
+    pub page: usize,
+    pub start: [f32; 2],
+    pub current: [f32; 2],
+}
+
+impl Selection {
+    /// Normalized rect `[x0, y0, x1, y1]`.
+    pub fn rect(&self) -> [f32; 4] {
+        [
+            self.start[0].min(self.current[0]),
+            self.start[1].min(self.current[1]),
+            self.start[0].max(self.current[0]),
+            self.start[1].max(self.current[1]),
+        ]
+    }
+}
+
+/// One open document.
+pub struct DocTab {
+    pub kind: DocKind,
+    pub path: PathBuf,
+    pub name: String,
+    // Markdown
+    pub editor: Option<Entity<TextareaState>>,
+    pub vim: Option<VimSession>,
+    pub preview: bool,
+    pub saved: String,
+    pub dirty: bool,
+    pub generation: u64,
+    // PDF
+    pub worker: Option<PdfWorker>,
+    pub events: Option<Receiver<Event>>,
+    pub page_count: usize,
+    pub error: Option<String>,
+    /// Zoom multiplier over fit-width (1.0 = fit width).
+    pub zoom: f32,
+    /// Natural page size in points, learned from the first render.
+    pub page_size: Option<(f32, f32)>,
+    pub images: HashMap<(usize, u32), Arc<RenderImage>>,
+    pub stamps: HashMap<(usize, u32), u64>,
+    pub pending: HashSet<(usize, u32)>,
+    pub page_texts: HashMap<usize, PageText>,
+    pub text_requested: HashSet<usize>,
+    pub annotations: Vec<DocAnnotation>,
+    pub ann_dirty: bool,
+    pub ann_generation: u64,
+    pub selection: Option<Selection>,
+    pub popover: Option<String>,
+    pub popover_editor: Option<Entity<TextareaState>>,
+    pub visible_page: usize,
+    pub jump_to: Option<usize>,
+    /// Page rects recorded during prepaint (window coordinates).
+    pub page_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
+    /// Scroll viewport recorded during prepaint (window coordinates).
+    pub viewport: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    /// Fit-width scale used by the last frame, for pointer math.
+    pub last_scale: f32,
+    /// Monotonic counter for texture-cache LRU stamps.
+    pub next_stamp: u64,
+    pub scroll: ScrollHandle,
+}
+
+impl DocTab {
+    pub(crate) fn markdown(
+        path: PathBuf,
+        name: String,
+        text: String,
+        editor: Entity<TextareaState>,
+    ) -> Self {
+        Self {
+            kind: DocKind::Markdown,
+            path,
+            name,
+            editor: Some(editor),
+            vim: Some(VimSession::new()),
+            preview: false,
+            saved: text,
+            dirty: false,
+            generation: 0,
+            worker: None,
+            events: None,
+            page_count: 0,
+            error: None,
+            zoom: 1.0,
+            page_size: None,
+            images: HashMap::new(),
+            stamps: HashMap::new(),
+            pending: HashSet::new(),
+            page_texts: HashMap::new(),
+            text_requested: HashSet::new(),
+            annotations: Vec::new(),
+            ann_dirty: false,
+            ann_generation: 0,
+            selection: None,
+            popover: None,
+            popover_editor: None,
+            visible_page: 0,
+            jump_to: None,
+            page_bounds: Rc::new(RefCell::new(HashMap::new())),
+            viewport: Rc::new(RefCell::new(None)),
+            last_scale: 1.0,
+            next_stamp: 0,
+            scroll: ScrollHandle::new(),
+        }
+    }
+
+    pub(crate) fn pdf(
+        path: PathBuf,
+        name: String,
+        worker: PdfWorker,
+        events: Receiver<Event>,
+        annotations: Vec<DocAnnotation>,
+    ) -> Self {
+        Self {
+            kind: DocKind::Pdf,
+            path,
+            name,
+            editor: None,
+            vim: None,
+            preview: false,
+            saved: String::new(),
+            dirty: false,
+            generation: 0,
+            worker: Some(worker),
+            events: Some(events),
+            page_count: 0,
+            error: None,
+            zoom: 1.0,
+            page_size: None,
+            images: HashMap::new(),
+            stamps: HashMap::new(),
+            pending: HashSet::new(),
+            page_texts: HashMap::new(),
+            text_requested: HashSet::new(),
+            annotations,
+            ann_dirty: false,
+            ann_generation: 0,
+            selection: None,
+            popover: None,
+            popover_editor: None,
+            visible_page: 0,
+            jump_to: None,
+            page_bounds: Rc::new(RefCell::new(HashMap::new())),
+            viewport: Rc::new(RefCell::new(None)),
+            last_scale: 1.0,
+            next_stamp: 0,
+            scroll: ScrollHandle::new(),
+        }
+    }
+
+    /// Dirty marker in the tab strip: Markdown edits or unsaved annotations.
+    pub fn has_unsaved(&self) -> bool {
+        self.dirty || self.ann_dirty
+    }
+}
+
+/// What the inline name field is doing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocDraftKind {
+    File,
+    Folder,
+    Rename,
+}
+
+/// An inline name field: a create row in the tree header, or a row label
+/// swapped for an input while renaming.
+pub struct DocDraft {
+    pub kind: DocDraftKind,
+    /// Directory a new entry goes into, or the path being renamed.
+    pub target: PathBuf,
+    pub input: Entity<InputState>,
+}
+
+/// Documents section state.
+pub struct DocumentsState {
+    pub root: Option<PathBuf>,
+    pub entries: Vec<DocEntry>,
+    pub expanded: HashSet<PathBuf>,
+    pub selected: Option<PathBuf>,
+    pub tabs: Vec<DocTab>,
+    pub active: Option<usize>,
+    pub tree_open: bool,
+    pub error: Option<String>,
+    pub draft: Option<DocDraft>,
+    /// Path waiting for a delete confirmation.
+    pub confirm: Option<PathBuf>,
+    pub tool: Tool,
+    /// Session file read on the first load, applied once a window exists.
+    pub session_loaded: bool,
+    pub restore: Option<(bool, Option<usize>, Vec<String>)>,
+    /// Set while a render/text request is outstanding; the shell repaints.
+    pub needs_repaint: bool,
+}
+
+impl Default for DocumentsState {
+    fn default() -> Self {
+        Self {
+            root: None,
+            entries: Vec::new(),
+            expanded: HashSet::new(),
+            selected: None,
+            tabs: Vec::new(),
+            active: None,
+            tree_open: true,
+            error: None,
+            draft: None,
+            confirm: None,
+            tool: Tool::Select,
+            session_loaded: false,
+            restore: None,
+            needs_repaint: false,
+        }
+    }
+}
+
+impl DocumentsState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn tab_index(&self, path: &Path) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.path == path)
+    }
+
+    pub fn active_tab(&self) -> Option<&DocTab> {
+        self.active.and_then(|index| self.tabs.get(index))
+    }
+
+    /// Where a new file or folder lands: the selected folder, the selected
+    /// file's folder, or the root.
+    pub fn selected_dir(&self, root: &Path) -> PathBuf {
+        match &self.selected {
+            Some(path) if path.is_dir() => path.clone(),
+            Some(path) => path
+                .parent()
+                .map(|parent| parent.to_path_buf())
+                .unwrap_or_else(|| root.to_path_buf()),
+            None => root.to_path_buf(),
+        }
+    }
+}
+
+/// Screen point → page view space (points).
+pub fn screen_to_page(origin: Point<Pixels>, scale: f32, pos: Point<Pixels>) -> [f32; 2] {
+    [
+        (pos.x - origin.x).as_f32() / scale,
+        (pos.y - origin.y).as_f32() / scale,
+    ]
+}
+
+/// Page view space rect → screen bounds.
+pub fn page_to_screen(origin: Point<Pixels>, scale: f32, r: &[f32; 4]) -> Bounds<Pixels> {
+    Bounds::new(
+        origin + point(px(r[0] * scale), px(r[1] * scale)),
+        size(px((r[2] - r[0]) * scale), px((r[3] - r[1]) * scale)),
+    )
+}
+
+/// Scale in per-mille, the texture cache key.
+pub fn permille(scale: f32) -> u32 {
+    (scale * 1000.0).round().max(1.0) as u32
+}
+
+/// Small anchor quad for a note placed at `p` (points, y down).
+pub fn note_anchor_quad(p: [f32; 2]) -> [[f32; 2]; 4] {
+    [
+        p,
+        [p[0] + NOTE_ANCHOR, p[1]],
+        [p[0] + NOTE_ANCHOR, p[1] + NOTE_ANCHOR],
+        [p[0], p[1] + NOTE_ANCHOR],
+    ]
+}
+
+/// Parse `#rrggbb` (leading `#` optional); falls back to the first note colour.
+pub fn hex_rgb(hex: &str) -> (u8, u8, u8) {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() >= 6
+        && let (Ok(r), Ok(g), Ok(b)) = (
+            u8::from_str_radix(&hex[0..2], 16),
+            u8::from_str_radix(&hex[2..4], 16),
+            u8::from_str_radix(&hex[4..6], 16),
+        )
+    {
+        return (r, g, b);
+    }
+    hex_rgb(NOTE_COLORS[0])
+}
+
+/// `#rrggbb` at an explicit alpha.
+pub fn color_with_alpha(hex: &str, alpha: u8) -> Rgba {
+    let (r, g, b) = hex_rgb(hex);
+    rgba(((r as u32) << 24) | ((g as u32) << 16) | ((b as u32) << 8) | alpha as u32)
+}
+
+/// Pages worth rendering or keeping around: the visible window plus three
+/// quarters of a page either side (egui's pre-render margin).
+pub fn visible_pages(top: f32, viewport_h: f32, row_h: f32, count: usize) -> Vec<usize> {
+    if row_h <= 0.0 {
+        return Vec::new();
+    }
+    (0..count)
+        .filter(|page| {
+            let start = *page as f32 * row_h;
+            let end = start + row_h;
+            end >= top - row_h * 0.75 && start <= top + viewport_h + row_h * 0.75
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Session
+// ---------------------------------------------------------------------------
 
 /// Session text: `tree_open`, active tab index, then one root-relative path
 /// per line. Plain text keeps the gpui shell free of a settings dependency
@@ -95,6 +475,682 @@ pub fn abs_path(root: &Path, rel: &str) -> PathBuf {
     root.join(rel)
 }
 
+// ---------------------------------------------------------------------------
+// View
+// ---------------------------------------------------------------------------
+
+/// Render the whole section.
+pub fn documents_view(
+    state: &mut DocumentsState,
+    t: &Tokens,
+    window: &mut Window,
+    cx: &mut Context<AppShell>,
+) -> AnyElement {
+    state.needs_repaint = false;
+    let mut row = div()
+        .id("documents-view")
+        .test_support()
+        .size_full()
+        .flex()
+        .child(tree_panel(state, t, cx));
+
+    if state.tree_open {
+        row = row.child(div().w(px(1.)).h_full().bg(t.divider));
+    }
+    row.child(content(state, t, window, cx)).into_any_element()
+}
+
+/// Header (collapse, new file, new folder, upload), the inline create row and
+/// the tree rows.
+fn tree_panel(state: &mut DocumentsState, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
+    if !state.tree_open {
+        return div()
+            .id("documents-tree-rail")
+            .test_support()
+            .w(px(RAIL_W))
+            .h_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .pt(px(10.))
+            .border_r_1()
+            .border_color(t.divider)
+            .child(
+                div()
+                    .id("documents-expand")
+                    .test_support()
+                    .p(px(4.))
+                    .rounded(px(t.radius))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(t.hover))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                        this.toggle_documents_tree(cx)
+                    }))
+                    .child(icon(Icon::ChevronRight, 14., t.text_muted)),
+            )
+            .into_any_element();
+    }
+
+    let mut panel = div()
+        .id("documents-tree")
+        .test_support()
+        .w(px(TREE_W))
+        .h_full()
+        .flex()
+        .flex_col()
+        .border_r_1()
+        .border_color(t.divider)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .px(px(10.))
+                .py(px(8.))
+                .border_b_1()
+                .border_color(t.divider)
+                .child(icon(Icon::FileText, 14., t.text_muted))
+                .child(
+                    div()
+                        .flex_1()
+                        .text(Text::SmallStrong)
+                        .text_color(t.text)
+                        .child("Documents"),
+                )
+                .child(tree_action(
+                    "documents-collapse",
+                    Icon::ChevronLeft,
+                    t,
+                    cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_documents_tree(cx)),
+                ))
+                .child(tree_action(
+                    "documents-upload",
+                    Icon::Upload,
+                    t,
+                    cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.pick_and_import_documents(window, cx)
+                    }),
+                ))
+                .child(tree_action(
+                    "documents-new-file",
+                    Icon::FilePlus,
+                    t,
+                    cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.begin_doc_draft(DocDraftKind::File, window, cx)
+                    }),
+                ))
+                .child(tree_action(
+                    "documents-new-folder",
+                    Icon::FolderPlus,
+                    t,
+                    cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.begin_doc_draft(DocDraftKind::Folder, window, cx)
+                    }),
+                )),
+        );
+
+    if let Some(draft) = &state.draft
+        && draft.kind != DocDraftKind::Rename
+    {
+        let label = match draft.kind {
+            DocDraftKind::File => "New file (Markdown)",
+            DocDraftKind::Folder => "New folder",
+            DocDraftKind::Rename => "Rename",
+        };
+        panel = panel.child(
+            div()
+                .id("documents-draft")
+                .test_support()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .px(px(10.))
+                .py(px(8.))
+                .border_b_1()
+                .border_color(t.divider)
+                .capture_key_down(cx.listener(|this, event, window, cx| {
+                    this.handle_doc_draft_key(event, window, cx)
+                }))
+                .child(
+                    div()
+                        .text(Text::Small)
+                        .text_color(t.text_muted)
+                        .child(label),
+                )
+                .child(Input::new(&draft.input)),
+        );
+    }
+
+    if let Some(error) = &state.error {
+        panel = panel.child(
+            div()
+                .id("documents-error")
+                .test_support()
+                .mx(px(8.))
+                .my(px(6.))
+                .p(px(8.))
+                .rounded(px(t.radius))
+                .bg(rgba(0x5c1d1dcc))
+                .text(Text::Small)
+                .text_color(t.text)
+                .child(error.clone()),
+        );
+    }
+
+    let entries = state.entries.clone();
+    let mut rows = div()
+        .id("documents-tree-rows")
+        .test_support()
+        .flex_1()
+        .overflow_y_scroll();
+    if entries.is_empty() && state.draft.is_none() {
+        rows = rows.child(
+            div()
+                .px(px(12.))
+                .py(px(10.))
+                .text(Text::Small)
+                .text_color(t.text_faint)
+                .child("No documents yet. Upload a PDF or Markdown file."),
+        );
+    }
+    for entry in &entries {
+        rows = rows.child(tree_row(entry, 0, state, t, cx));
+    }
+
+    panel.child(rows).into_any_element()
+}
+
+fn tree_action(
+    id: impl Into<gpui_kit::ElementId>,
+    glyph: Icon,
+    t: &Tokens,
+    listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .test_support()
+        .p(px(3.))
+        .rounded(px(4.))
+        .cursor_pointer()
+        .hover(|style| style.bg(t.hover))
+        .on_click(listener)
+        .child(icon(glyph, 13., t.text_muted))
+        .into_any_element()
+}
+
+fn tree_row(
+    entry: &DocEntry,
+    depth: usize,
+    state: &DocumentsState,
+    t: &Tokens,
+    cx: &mut Context<AppShell>,
+) -> AnyElement {
+    let path = entry.path.clone();
+    let selected = state.selected.as_deref() == Some(entry.path.as_path());
+    let open = state.expanded.contains(&entry.path);
+    let renaming = state
+        .draft
+        .as_ref()
+        .is_some_and(|draft| draft.kind == DocDraftKind::Rename && draft.target == entry.path);
+
+    let mut row = div()
+        .id(format!("doc-row-{}", entry.path.display()))
+        .test_support()
+        .w_full()
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .h(px(ROW_H))
+        .pl(px(10.0 + depth as f32 * INDENT))
+        .pr(px(8.))
+        .cursor_pointer()
+        .when(selected, |this| this.bg(t.selected))
+        .hover(|style| style.bg(t.hover));
+
+    if renaming {
+        let input = state
+            .draft
+            .as_ref()
+            .map(|draft| draft.input.clone())
+            .expect("renaming implies a draft");
+        return row
+            .capture_key_down(
+                cx.listener(|this, event, window, cx| this.handle_doc_draft_key(event, window, cx)),
+            )
+            .child(div().w(px(12.)))
+            .child(icon(
+                if entry.is_dir {
+                    Icon::Folder
+                } else {
+                    doc_icon(&entry.path)
+                },
+                13.,
+                t.text_muted,
+            ))
+            .child(div().flex_1().min_w_0().child(Input::new(&input)))
+            .into_any_element();
+    }
+
+    if entry.is_dir {
+        let toggle = path.clone();
+        let rename = path.clone();
+        let delete = path.clone();
+        let new_file = path.clone();
+        let new_folder = path.clone();
+        let row_id = entry.path.display().to_string();
+        row = row
+            .child(icon(
+                if open {
+                    Icon::ChevronDown
+                } else {
+                    Icon::ChevronRight
+                },
+                12.,
+                t.text_faint,
+            ))
+            .child(icon(Icon::Folder, 13., t.text_muted))
+            .child(
+                div()
+                    .flex_1()
+                    .text(Text::Small)
+                    .text_color(t.text)
+                    .child(entry.name.clone()),
+            )
+            .child(tree_action(
+                format!("doc-folder-file-{row_id}"),
+                Icon::FilePlus,
+                t,
+                cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.begin_doc_draft_in(DocDraftKind::File, new_file.clone(), window, cx)
+                }),
+            ))
+            .child(tree_action(
+                format!("doc-folder-folder-{row_id}"),
+                Icon::FolderPlus,
+                t,
+                cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.begin_doc_draft_in(DocDraftKind::Folder, new_folder.clone(), window, cx)
+                }),
+            ))
+            .child(tree_action(
+                format!("doc-folder-rename-{row_id}"),
+                Icon::Pencil,
+                t,
+                cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.begin_doc_rename(rename.clone(), window, cx)
+                }),
+            ))
+            .child(tree_action(
+                format!("doc-folder-delete-{row_id}"),
+                Icon::Trash2,
+                t,
+                cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                    this.ask_delete_document(delete.clone(), cx)
+                }),
+            ))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                this.toggle_doc_folder(toggle.clone(), cx)
+            }));
+    } else {
+        let open_path = path.clone();
+        let rename = path.clone();
+        let delete = path.clone();
+        let row_id = entry.path.display().to_string();
+        row = row
+            .child(div().w(px(12.)))
+            .child(icon(doc_icon(&entry.path), 13., t.text_muted))
+            .child(
+                div()
+                    .flex_1()
+                    .text(Text::Small)
+                    .text_color(t.text)
+                    .child(entry.name.clone()),
+            )
+            .child(tree_action(
+                format!("doc-file-rename-{row_id}"),
+                Icon::Pencil,
+                t,
+                cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.begin_doc_rename(rename.clone(), window, cx)
+                }),
+            ))
+            .child(tree_action(
+                format!("doc-file-delete-{row_id}"),
+                Icon::Trash2,
+                t,
+                cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                    this.ask_delete_document(delete.clone(), cx)
+                }),
+            ))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.open_document(open_path.clone(), window, cx)
+            }));
+    }
+
+    let mut column = div().flex().flex_col().child(row);
+    if entry.is_dir && open {
+        for child in entry.children.iter().flatten() {
+            column = column.child(tree_row(child, depth + 1, state, t, cx));
+        }
+    }
+    column.into_any_element()
+}
+
+fn doc_icon(path: &Path) -> Icon {
+    if kandrium_core::documents::is_pdf(path) {
+        Icon::File
+    } else {
+        Icon::FileText
+    }
+}
+
+/// Tab strip plus the active document body.
+fn content(
+    state: &mut DocumentsState,
+    t: &Tokens,
+    window: &mut Window,
+    cx: &mut Context<AppShell>,
+) -> AnyElement {
+    let mut body = div()
+        .id("documents-content")
+        .test_support()
+        .flex_1()
+        .min_w_0()
+        .h_full()
+        .flex()
+        .flex_col();
+
+    if state.tabs.is_empty() {
+        return body
+            .child(placeholder::message(
+                "documents-empty",
+                Icon::FileText,
+                "No document open",
+                "Pick a document in the tree, or upload a PDF or Markdown file.",
+                t,
+            ))
+            .into_any_element();
+    }
+
+    let mut strip = div()
+        .id("documents-tabs")
+        .test_support()
+        .flex()
+        .items_center()
+        .gap(px(2.))
+        .px(px(8.))
+        .py(px(4.))
+        .border_b_1()
+        .border_color(t.divider);
+    for (index, tab) in state.tabs.iter().enumerate() {
+        let active = state.active == Some(index);
+        let path = tab.path.clone();
+        let close_path = tab.path.clone();
+        strip = strip.child(
+            div()
+                .id(format!("doc-tab-{}", tab.path.display()))
+                .test_support()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .px(px(8.))
+                .py(px(3.))
+                .rounded(px(t.radius))
+                .when(active, |this| this.bg(t.selected))
+                .hover(|style| style.bg(t.hover))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.activate_doc_tab(path.clone(), window, cx)
+                }))
+                .child(icon(doc_icon(&tab.path), 12., t.text_muted))
+                .child(
+                    div()
+                        .text(Text::Small)
+                        .text_color(if active { t.text } else { t.text_muted })
+                        .child(tab.name.clone()),
+                )
+                .when(tab.has_unsaved(), |this| {
+                    this.child(div().size(px(4.)).rounded(px(2.)).bg(t.accent))
+                })
+                .child(
+                    div()
+                        .id(format!("doc-tab-close-{}", tab.path.display()))
+                        .p(px(1.))
+                        .rounded(px(3.))
+                        .hover(|style| style.bg(t.pressed))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                            cx.stop_propagation();
+                            this.close_doc_tab_by_path(close_path.clone(), cx)
+                        }))
+                        .child(icon(Icon::X, 11., t.text_faint)),
+                ),
+        );
+    }
+    strip = strip.child(div().flex_1());
+    if state
+        .active_tab()
+        .is_some_and(|tab| tab.kind == DocKind::Markdown)
+    {
+        strip = strip.child(tab_action(
+            "documents-preview",
+            if state.active_tab().is_some_and(|tab| tab.preview) {
+                "Edit"
+            } else {
+                "Preview"
+            },
+            t,
+            cx.listener(|this, _: &ClickEvent, window, cx| this.toggle_doc_preview(window, cx)),
+        ));
+    }
+    body = body.child(strip);
+
+    let Some(index) = state.active else {
+        return body.into_any_element();
+    };
+
+    match state.tabs[index].kind {
+        DocKind::Markdown => body = body.child(markdown_body(state, index, t, cx)),
+        DocKind::Pdf => {
+            body = body.child(crate::views::documents_pdf::viewer(state, index, t, cx));
+        }
+    }
+
+    if let Some(confirm) = &state.confirm {
+        body = body.child(delete_confirm(confirm, t, cx));
+    }
+    let _ = window;
+    body.into_any_element()
+}
+
+fn markdown_body(
+    state: &mut DocumentsState,
+    index: usize,
+    t: &Tokens,
+    cx: &mut Context<AppShell>,
+) -> AnyElement {
+    let tab = &state.tabs[index];
+    if tab.preview {
+        let text = tab
+            .editor
+            .as_ref()
+            .map(|editor| editor.read(cx).value().to_string())
+            .unwrap_or_default();
+        return div()
+            .id("doc-preview")
+            .test_support()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .p(px(20.))
+            .child(markdown(text.as_str()))
+            .into_any_element();
+    }
+
+    let editor = tab.editor.clone().expect("markdown tab has an editor");
+    let mode = mode_strip(tab, t);
+    let readonly = tab.vim.as_ref().is_none_or(|vim| !vim.is_insert());
+    div()
+        .id("doc-editor-wrap")
+        .test_support()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .child(mode)
+        .child(
+            div()
+                .id("doc-editor")
+                .test_support()
+                .flex_1()
+                .min_h_0()
+                .p(px(12.))
+                .child(Textarea::new(&editor).readonly(readonly)),
+        )
+        .capture_key_down(
+            cx.listener(|this, event, window, cx| this.handle_documents_key(event, window, cx)),
+        )
+        .into_any_element()
+}
+
+/// Mode badge, pending keys, ex line or error, and a short hint.
+fn mode_strip(tab: &DocTab, t: &Tokens) -> AnyElement {
+    let Some(vim) = &tab.vim else {
+        return div().into_any_element();
+    };
+    let mut row = div()
+        .id("doc-mode")
+        .test_support()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .px(px(12.))
+        .py(px(3.))
+        .border_b_1()
+        .border_color(t.divider)
+        .child(
+            div()
+                .px(px(6.))
+                .py(px(1.))
+                .rounded(px(4.))
+                .bg(t.panel)
+                .text(Text::SmallStrong)
+                .text_color(t.text_muted)
+                .child(vim.mode_label()),
+        );
+    if let Some(line) = vim.ex_line() {
+        row = row.child(
+            div()
+                .text(Text::Small)
+                .text_color(t.text)
+                .child(line.to_string()),
+        );
+    } else if let Some(error) = vim.ex_error() {
+        row = row.child(
+            div()
+                .text(Text::Small)
+                .text_color(t.danger)
+                .child(error.to_string()),
+        );
+    } else {
+        let pending = vim.pending();
+        if !pending.is_empty() {
+            row = row.child(
+                div()
+                    .text(Text::Small)
+                    .text_color(t.text_muted)
+                    .child(pending),
+            );
+        }
+    }
+    row.child(
+        div()
+            .flex_1()
+            .text(Text::Small)
+            .text_color(t.text_faint)
+            .child("Esc normal · i insert · :w save · :q close"),
+    )
+    .into_any_element()
+}
+
+fn tab_action(
+    id: &'static str,
+    label: &'static str,
+    t: &Tokens,
+    listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .test_support()
+        .px(px(8.))
+        .py(px(3.))
+        .rounded(px(t.radius))
+        .cursor_pointer()
+        .hover(|style| style.bg(t.hover))
+        .on_click(listener)
+        .child(
+            div()
+                .text(Text::Small)
+                .text_color(t.text_muted)
+                .child(label),
+        )
+        .into_any_element()
+}
+
+fn delete_confirm(path: &Path, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let target = path.to_path_buf();
+    div()
+        .id("documents-delete-confirm")
+        .test_support()
+        .mx(px(16.))
+        .mb(px(16.))
+        .p(px(12.))
+        .flex()
+        .items_center()
+        .gap(px(10.))
+        .rounded(px(t.radius))
+        .bg(t.card)
+        .border_1()
+        .border_color(t.border)
+        .child(
+            div()
+                .flex_1()
+                .text(Text::Small)
+                .text_color(t.text)
+                .child(format!("Delete \"{name}\"? This cannot be undone.")),
+        )
+        .child(tab_action(
+            "documents-delete-cancel",
+            "Cancel",
+            t,
+            cx.listener(|this, _: &ClickEvent, _window, cx| this.cancel_delete_document(cx)),
+        ))
+        .child(tab_action(
+            "documents-delete-confirm-yes",
+            "Delete",
+            t,
+            cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                this.confirm_delete_document(target.clone(), cx)
+            }),
+        ))
+        .into_any_element()
+}
+
+/// Whether a page-text map contains an annotation kind (used by tests).
+#[allow(dead_code)]
+fn has_kind(annotations: &[DocAnnotation], kind: AnnotationKind) -> bool {
+    annotations.iter().any(|ann| ann.kind == kind)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +1193,60 @@ mod tests {
     fn tool_default_is_select() {
         assert_eq!(Tool::default(), Tool::Select);
         assert_eq!(Tool::Highlight.label(), "Highlight");
+    }
+
+    #[test]
+    fn screen_page_space_round_trip() {
+        let origin = point(px(100.0), px(50.0));
+        let scale = 2.0;
+        let p = screen_to_page(origin, scale, point(px(200.0), px(150.0)));
+        assert!((p[0] - 50.0).abs() < 1e-4 && (p[1] - 50.0).abs() < 1e-4);
+        let screen = page_to_screen(origin, scale, &[10.0, 20.0, 110.0, 34.0]);
+        assert!((screen.origin.x.as_f32() - 120.0).abs() < 1e-4);
+        assert!((screen.origin.y.as_f32() - 90.0).abs() < 1e-4);
+        assert!((screen.size.width.as_f32() - 200.0).abs() < 1e-4);
+        assert!((screen.size.height.as_f32() - 28.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn note_anchor_quad_is_square() {
+        let quad = note_anchor_quad([10.0, 20.0]);
+        assert_eq!(quad[0], [10.0, 20.0]);
+        assert_eq!(quad[2], [10.0 + NOTE_ANCHOR, 20.0 + NOTE_ANCHOR]);
+    }
+
+    #[test]
+    fn hex_rgb_parses_and_falls_back() {
+        assert_eq!(hex_rgb("#ff0000"), (0xff, 0x00, 0x00));
+        assert_eq!(hex_rgb("f6d448"), (0xf6, 0xd4, 0x48));
+        assert_eq!(hex_rgb("nope"), (0xf6, 0xd4, 0x48));
+    }
+
+    #[test]
+    fn selection_rect_normalizes_corners() {
+        let sel = Selection {
+            page: 0,
+            start: [30.0, 10.0],
+            current: [5.0, 40.0],
+        };
+        assert_eq!(sel.rect(), [5.0, 10.0, 30.0, 40.0]);
+    }
+
+    #[test]
+    fn visible_page_window_includes_one_page_margin() {
+        // Three 100 px rows, viewport over the middle row.
+        assert_eq!(visible_pages(90.0, 120.0, 100.0, 3), vec![0, 1, 2]);
+        // Viewport on the first page only plus its pre-render margin.
+        assert_eq!(visible_pages(0.0, 100.0, 100.0, 4), vec![0, 1]);
+        // Beyond the end.
+        assert!(visible_pages(10_000.0, 100.0, 100.0, 3).is_empty());
+        assert!(visible_pages(0.0, 100.0, 0.0, 3).is_empty());
+    }
+
+    #[test]
+    fn permille_rounds_up_to_one() {
+        assert_eq!(permille(0.0), 1);
+        assert_eq!(permille(1.25), 1250);
+        assert_eq!(permille(0.9996), 1000);
     }
 }

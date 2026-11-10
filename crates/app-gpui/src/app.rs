@@ -1,9 +1,8 @@
 //! The application shell: a title bar with the five-section segmented control
 //! and one body per section.
 //!
-//! Stage 1 of the migration: Tasks and Clocks read the real database
-//! (read-only); Notes, Documents and Projects state honestly that they have not
-//! been ported yet.
+//! Tasks, Clocks, Notes and Documents read and write the real data; Projects
+//! is the last section still on the placeholder.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -13,14 +12,17 @@ use gpui_kit::component::input::{InputState, TextareaState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     AnyElement, ClickEvent, Context, DragMoveEvent, Entity, Focusable, IntoElement, KeyDownEvent,
-    Render, Window, div, px,
+    Pixels, Point, Render, RenderImage, Window, div, px,
 };
 use jiff::Timestamp;
 use jiff::civil::Date;
+use kandrium_core::documents::{AnnotationDoc, AnnotationKind, new_annotation};
 use kandrium_core::{
     ALL_BOARD_ID, Board, BoardWithColumns, CardStatus, CreateCardBody, Person, ProjectChoice,
     Travel, day_end_seconds, day_start_seconds,
 };
+use pdf_render::{Event as PdfEvent, PdfWorker};
+use smallvec::smallvec;
 
 use crate::assets::{Icon, icon};
 use crate::store::Store;
@@ -30,6 +32,8 @@ use crate::views::clocks::{
     self, ClockDrag, ClockState, ConfirmKind, ConfirmState, DragState, FormKind, FormState,
     InspectorState, PickerState,
 };
+use crate::views::documents::{self, DocDraft, DocDraftKind, DocKind, DocTab, DocumentsState};
+use crate::views::documents_pdf;
 use crate::views::tasks::DropTarget;
 use crate::views::{
     notes::{self, DraftKind, NameDraft, NoteTab, NotesState},
@@ -115,6 +119,7 @@ pub struct AppShell {
     /// Generation of the tick loop currently allowed to run.
     clock_tick_running: Option<u64>,
     notes: NotesState,
+    documents: DocumentsState,
 }
 
 impl AppShell {
@@ -143,6 +148,7 @@ impl AppShell {
             clock_tick: 0,
             clock_tick_running: None,
             notes: NotesState::new(),
+            documents: DocumentsState::new(),
         };
         shell.load_tasks();
         shell.load_clocks();
@@ -161,12 +167,17 @@ impl AppShell {
         if self.section == Section::Notes {
             self.flush_active_note(cx);
         }
+        if self.section == Section::Documents {
+            self.flush_documents(cx);
+            self.save_documents_session();
+        }
         self.section = section;
         match section {
             Section::Tasks => self.load_tasks(),
             Section::Clocks => self.load_clocks(),
             Section::Notes => self.load_notes(),
-            Section::Documents | Section::Projects => {}
+            Section::Documents => self.load_documents(),
+            Section::Projects => {}
         }
         if section != Section::Clocks {
             self.invalidate_clock_tick();
@@ -1786,6 +1797,1016 @@ impl AppShell {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Documents
+    // -----------------------------------------------------------------------
+
+    /// Where the open-tab session lives: next to the database, so a
+    /// `KANDRIUM_DB` override isolates it automatically.
+    fn documents_session_path(&self) -> PathBuf {
+        self.store
+            .path
+            .parent()
+            .map(|parent| parent.join("gpui-documents.session"))
+            .unwrap_or_else(|| PathBuf::from("gpui-documents.session"))
+    }
+
+    /// Resolve the documents root, rescan it and read the session file once.
+    fn load_documents(&mut self) {
+        let root = match self.store.documents_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.documents.root = None;
+                self.documents.entries.clear();
+                self.documents.error = Some(error);
+                return;
+            }
+        };
+        match self.store.documents_tree(&root) {
+            Ok(entries) => {
+                self.documents.root = Some(root.clone());
+                self.documents.entries = entries;
+                self.documents.error = None;
+            }
+            Err(error) => {
+                self.documents.root = Some(root.clone());
+                self.documents.entries.clear();
+                self.documents.error = Some(error);
+            }
+        }
+        if !self.documents.session_loaded {
+            self.documents.session_loaded = true;
+            if let Ok(text) = std::fs::read_to_string(self.documents_session_path()) {
+                self.documents.restore = Some(documents::parse_session(&text));
+            }
+        }
+    }
+
+    /// Restore the tabs once a window exists. Missing files are dropped.
+    fn restore_documents_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((tree_open, active, rels)) = self.documents.restore.take() else {
+            return;
+        };
+        self.documents.tree_open = tree_open;
+        let Some(root) = self.documents.root.clone() else {
+            return;
+        };
+        for rel in rels {
+            let path = documents::abs_path(&root, &rel);
+            if path.is_file() {
+                self.open_document(path, window, cx);
+            }
+        }
+        if let Some(index) = active {
+            self.documents.active = if self.documents.tabs.is_empty() {
+                None
+            } else {
+                Some(index.min(self.documents.tabs.len() - 1))
+            };
+        }
+        cx.notify();
+    }
+
+    /// Persist the tab list as root-relative paths plus the tree flag.
+    fn save_documents_session(&self) {
+        let Some(root) = self.documents.root.clone() else {
+            return;
+        };
+        let rels: Vec<String> = self
+            .documents
+            .tabs
+            .iter()
+            .filter_map(|tab| documents::rel_path(&root, &tab.path))
+            .collect();
+        let text =
+            documents::format_session(self.documents.tree_open, self.documents.active, &rels);
+        let _ = kandrium_core::fsutil::write_atomic(&self.documents_session_path(), text);
+    }
+
+    pub(crate) fn toggle_documents_tree(&mut self, cx: &mut Context<Self>) {
+        self.documents.tree_open = !self.documents.tree_open;
+        self.save_documents_session();
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_doc_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if !self.documents.expanded.remove(&path) {
+            self.documents.expanded.insert(path.clone());
+        }
+        self.documents.selected = Some(path);
+        cx.notify();
+    }
+
+    /// Open a document in a tab, reusing the tab when the path is already open.
+    pub(crate) fn open_document(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.documents.selected = Some(path.clone());
+        if let Some(index) = self.documents.tab_index(&path) {
+            self.documents.active = Some(index);
+            if let Some(editor) = self.documents.tabs[index].editor.clone() {
+                editor.update(cx, |state, cx| state.focus(window, cx));
+            }
+            cx.notify();
+            return;
+        }
+        let Some(root) = self.documents.root.clone() else {
+            self.documents.error = Some("The documents folder is unavailable".into());
+            cx.notify();
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if kandrium_core::documents::is_pdf(&path) {
+            match self.store.load_annotations(&path, &root) {
+                Ok(doc) => {
+                    let (worker, events) = PdfWorker::open(path.clone(), || {});
+                    self.documents.tabs.push(DocTab::pdf(
+                        path,
+                        name,
+                        worker,
+                        events,
+                        doc.annotations,
+                    ));
+                    self.documents.active = Some(self.documents.tabs.len() - 1);
+                    self.documents.error = None;
+                }
+                Err(error) => {
+                    self.documents.error = Some(error);
+                    cx.notify();
+                    return;
+                }
+            }
+        } else if kandrium_core::documents::is_markdown(&path) {
+            match self.store.read_document(&path, &root) {
+                Ok(text) => {
+                    let editor =
+                        cx.new(|cx| TextareaState::new(window, cx).default_value(text.clone()));
+                    let session = crate::vim::VimSession::new();
+                    session.sync_readonly(&editor, cx);
+                    cx.observe(&editor, |this: &mut AppShell, editor, cx| {
+                        this.doc_tab_edited(&editor, cx)
+                    })
+                    .detach();
+                    self.documents
+                        .tabs
+                        .push(DocTab::markdown(path, name, text, editor.clone()));
+                    self.documents.active = Some(self.documents.tabs.len() - 1);
+                    self.documents.error = None;
+                    editor.update(cx, |state, cx| state.focus(window, cx));
+                }
+                Err(error) => self.documents.error = Some(error),
+            }
+        } else {
+            self.documents.error = Some("Unsupported document type".into());
+        }
+        self.save_documents_session();
+        cx.notify();
+    }
+
+    pub(crate) fn activate_doc_tab(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.documents.tab_index(&path) else {
+            return;
+        };
+        self.documents.active = Some(index);
+        if let Some(editor) = self.documents.tabs[index].editor.clone() {
+            editor.update(cx, |state, cx| state.focus(window, cx));
+        }
+        self.save_documents_session();
+        cx.notify();
+    }
+
+    pub(crate) fn close_doc_tab_by_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.save_document_tab(&path, cx);
+        let Some(index) = self.documents.tab_index(&path) else {
+            return;
+        };
+        // A failed save keeps the tab (and its dirty buffer) open so the user
+        // can retry instead of losing the edit.
+        if self.documents.tabs[index].has_unsaved() {
+            cx.notify();
+            return;
+        }
+        self.documents.tabs.remove(index);
+        self.documents.active = match (self.documents.tabs.is_empty(), self.documents.active) {
+            (true, _) => None,
+            (false, Some(active)) if active > index => Some(active - 1),
+            (false, Some(active)) if active == index => {
+                Some(index.min(self.documents.tabs.len() - 1))
+            }
+            (false, other) => other,
+        };
+        self.save_documents_session();
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_doc_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.documents.active else {
+            return;
+        };
+        let Some(tab) = self.documents.tabs.get_mut(index) else {
+            return;
+        };
+        tab.preview = !tab.preview;
+        let editor = tab.editor.clone();
+        if let Some(editor) = editor {
+            editor.update(cx, |state, cx| state.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn begin_doc_draft(
+        &mut self,
+        kind: DocDraftKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.documents.root.clone() else {
+            self.documents.error = Some("The documents folder is unavailable".into());
+            cx.notify();
+            return;
+        };
+        let target = self.documents.selected_dir(&root);
+        self.begin_doc_draft_in(kind, target, window, cx);
+    }
+
+    pub(crate) fn begin_doc_draft_in(
+        &mut self,
+        kind: DocDraftKind,
+        target: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.documents.draft.is_some() {
+            return;
+        }
+        let placeholder = match kind {
+            DocDraftKind::File => "name.md",
+            DocDraftKind::Folder => "Folder name",
+            DocDraftKind::Rename => "New name",
+        };
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.documents.draft = Some(DocDraft {
+            kind,
+            target,
+            input,
+        });
+        self.documents.error = None;
+        cx.notify();
+    }
+
+    pub(crate) fn begin_doc_rename(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(name) = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+        else {
+            return;
+        };
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(name));
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.documents.draft = Some(DocDraft {
+            kind: DocDraftKind::Rename,
+            target: path,
+            input,
+        });
+        self.documents.error = None;
+        cx.notify();
+    }
+
+    pub(crate) fn handle_doc_draft_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                cx.stop_propagation();
+                self.cancel_doc_draft(cx);
+            }
+            "enter" => {
+                cx.stop_propagation();
+                self.commit_doc_draft(window, cx);
+            }
+            _ => {}
+        }
+    }
+
+    fn commit_doc_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = &self.documents.draft else {
+            return;
+        };
+        let kind = draft.kind;
+        let target = draft.target.clone();
+        let name = draft.input.read(cx).value().trim().to_string();
+        let Some(root) = self.documents.root.clone() else {
+            self.documents.error = Some("The documents folder is unavailable".into());
+            cx.notify();
+            return;
+        };
+        if name.is_empty() {
+            self.documents.error = Some("A name is required".into());
+            cx.notify();
+            return;
+        }
+        let result = match kind {
+            DocDraftKind::File => self.store.create_markdown(&target, &root, &name),
+            DocDraftKind::Folder => self.store.create_doc_folder(&target, &root, &name),
+            DocDraftKind::Rename => self.store.rename_document(&target, &root, &name),
+        };
+        match result {
+            Ok(created) => {
+                if kind == DocDraftKind::Rename {
+                    self.remap_doc_paths(&target, &created);
+                } else {
+                    self.documents.expanded.insert(target);
+                    if kind == DocDraftKind::File {
+                        self.open_document(created.clone(), window, cx);
+                    }
+                }
+                self.documents.selected = Some(created);
+                self.documents.draft = None;
+                self.documents.error = None;
+                self.load_documents();
+                self.save_documents_session();
+            }
+            Err(error) => self.documents.error = Some(error),
+        }
+        cx.notify();
+    }
+
+    fn cancel_doc_draft(&mut self, cx: &mut Context<Self>) {
+        if self.documents.draft.take().is_some() {
+            self.documents.error = None;
+            cx.notify();
+        }
+    }
+
+    /// Follow a rename (file or folder) through open tabs, the selection and
+    /// the expanded set.
+    fn remap_doc_paths(&mut self, from: &Path, to: &Path) {
+        for tab in &mut self.documents.tabs {
+            if let Some(path) = remap_path(&tab.path, from, to) {
+                tab.path = path;
+                tab.name = tab
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_default();
+            }
+        }
+        if let Some(selected) = &self.documents.selected
+            && let Some(path) = remap_path(selected, from, to)
+        {
+            self.documents.selected = Some(path);
+        }
+        let expanded: Vec<PathBuf> = self
+            .documents
+            .expanded
+            .iter()
+            .filter_map(|path| remap_path(path, from, to))
+            .collect();
+        self.documents.expanded = expanded.into_iter().collect();
+    }
+
+    pub(crate) fn ask_delete_document(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.documents.confirm = Some(path);
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_delete_document(&mut self, cx: &mut Context<Self>) {
+        if self.documents.confirm.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn confirm_delete_document(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(root) = self.documents.root.clone() else {
+            return;
+        };
+        match self.store.delete_document(&path, &root) {
+            Ok(()) => {
+                let active_path = self.documents.active_tab().map(|tab| tab.path.clone());
+                // Drop the tabs without flushing: the backing file is gone, so
+                // a save would only leave an orphan sidecar behind.
+                self.documents
+                    .tabs
+                    .retain(|tab| !tab.path.starts_with(&path));
+                self.documents.active = active_path
+                    .and_then(|path| self.documents.tabs.iter().position(|tab| tab.path == path));
+                if self.documents.active.is_none() && !self.documents.tabs.is_empty() {
+                    self.documents.active = Some(self.documents.tabs.len() - 1);
+                }
+                if self
+                    .documents
+                    .selected
+                    .as_deref()
+                    .is_some_and(|selected| selected.starts_with(&path))
+                {
+                    self.documents.selected = None;
+                }
+                self.documents.confirm = None;
+                self.documents.error = None;
+                self.load_documents();
+                self.save_documents_session();
+            }
+            Err(error) => self.documents.error = Some(error),
+        }
+        cx.notify();
+    }
+
+    /// Native multi-select upload into the selected folder. Each file lands
+    /// under the `-2` unique-name rule; failures are reported per file.
+    pub(crate) fn pick_and_import_documents(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.documents.root.clone() else {
+            self.documents.error = Some("The documents folder is unavailable".into());
+            cx.notify();
+            return;
+        };
+        let Some(files) = rfd::FileDialog::new()
+            .add_filter("Documents", &["pdf", "md", "markdown"])
+            .pick_files()
+        else {
+            return;
+        };
+        if files.is_empty() {
+            return;
+        }
+        let dest = self.documents.selected_dir(&root);
+        match self.store.import_documents(&files, &dest, &root) {
+            Ok(results) => {
+                let errors: Vec<String> = results
+                    .iter()
+                    .filter_map(|(source, error)| {
+                        error
+                            .as_ref()
+                            .map(|message| format!("{}: {message}", source.display()))
+                    })
+                    .collect();
+                self.documents.expanded.insert(dest.clone());
+                self.documents.selected = Some(dest);
+                self.load_documents();
+                self.documents.error = if errors.is_empty() {
+                    None
+                } else {
+                    Some(errors.join("\n"))
+                };
+            }
+            Err(error) => self.documents.error = Some(error),
+        }
+        cx.notify();
+    }
+
+    /// Keys routed to the active Markdown tab before the textarea sees them.
+    pub(crate) fn handle_documents_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.documents.active else {
+            return;
+        };
+        let Some(tab) = self.documents.tabs.get(index) else {
+            return;
+        };
+        if tab.preview || tab.kind != DocKind::Markdown {
+            return;
+        }
+        let Some(editor) = tab.editor.clone() else {
+            return;
+        };
+        if !editor.read(cx).focus_handle(cx).is_focused(window) {
+            return;
+        }
+        let outcome = {
+            let Some(vim) = self.documents.tabs[index].vim.as_mut() else {
+                return;
+            };
+            vim.handle_key(event, &editor, window, cx)
+        };
+        if outcome.handled {
+            cx.stop_propagation();
+            cx.notify();
+        }
+        match outcome.ex {
+            Some(vim::ExCommand::Write) => self.save_active_document(cx),
+            Some(vim::ExCommand::Close) => self.close_active_document(cx),
+            None => {
+                if event.keystroke.key == "escape" && !outcome.handled {
+                    cx.stop_propagation();
+                    self.close_active_document(cx);
+                }
+            }
+        }
+    }
+
+    fn save_active_document(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.documents.active_tab().map(|tab| tab.path.clone()) else {
+            return;
+        };
+        self.save_document_tab(&path, cx);
+    }
+
+    fn close_active_document(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.documents.active_tab().map(|tab| tab.path.clone()) else {
+            return;
+        };
+        self.close_doc_tab_by_path(path, cx);
+    }
+
+    /// Save every tab whose buffer changed, then the session.
+    fn flush_documents(&mut self, cx: &mut Context<Self>) {
+        let paths: Vec<PathBuf> = self
+            .documents
+            .tabs
+            .iter()
+            .map(|tab| tab.path.clone())
+            .collect();
+        for path in paths {
+            self.save_document_tab(&path, cx);
+        }
+    }
+
+    /// A textarea notification. Only a value that differs from the last write
+    /// marks the tab dirty and schedules the debounce.
+    fn doc_tab_edited(&mut self, editor: &Entity<TextareaState>, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .documents
+            .tabs
+            .iter()
+            .position(|tab| tab.editor.as_ref() == Some(editor))
+        else {
+            return;
+        };
+        let value = editor.read(cx).value().to_string();
+        let tab = &mut self.documents.tabs[index];
+        if value == tab.saved {
+            if tab.dirty {
+                tab.dirty = false;
+                cx.notify();
+            }
+            return;
+        }
+        tab.dirty = true;
+        tab.generation = tab.generation.wrapping_add(1);
+        let generation = tab.generation;
+        let path = tab.path.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(documents::AUTOSAVE).await;
+            this.update(cx, |this, cx| this.autosave_document(&path, generation, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// A debounce that already lost its race (a newer edit bumped the
+    /// generation) bows out.
+    fn autosave_document(&mut self, path: &Path, generation: u64, cx: &mut Context<Self>) {
+        let Some(index) = self.documents.tab_index(path) else {
+            return;
+        };
+        if self.documents.tabs[index].generation != generation {
+            return;
+        }
+        self.save_document_tab(path, cx);
+    }
+
+    /// Write a dirty tab through core: Markdown text or the annotation
+    /// sidecar. Errors keep the tab dirty so the edit is never dropped.
+    fn save_document_tab(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let Some(index) = self.documents.tab_index(path) else {
+            return;
+        };
+        match self.documents.tabs[index].kind {
+            DocKind::Markdown => {
+                if !self.documents.tabs[index].dirty {
+                    return;
+                }
+                let Some(root) = self.documents.root.clone() else {
+                    return;
+                };
+                let Some(editor) = self.documents.tabs[index].editor.clone() else {
+                    return;
+                };
+                let value = editor.read(cx).value().to_string();
+                match self.store.write_document(path, &root, &value) {
+                    Ok(()) => {
+                        let tab = &mut self.documents.tabs[index];
+                        tab.saved = value;
+                        tab.dirty = false;
+                        self.documents.error = None;
+                    }
+                    Err(error) => self.documents.error = Some(error),
+                }
+                cx.notify();
+            }
+            DocKind::Pdf => self.save_annotations_tab(path, cx),
+        }
+    }
+
+    fn save_annotations_tab(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let Some(index) = self.documents.tab_index(path) else {
+            return;
+        };
+        if !self.documents.tabs[index].ann_dirty {
+            return;
+        }
+        let Some(root) = self.documents.root.clone() else {
+            return;
+        };
+        let doc = AnnotationDoc {
+            annotations: self.documents.tabs[index].annotations.clone(),
+            ..AnnotationDoc::default()
+        };
+        match self.store.save_annotations(path, &root, &doc) {
+            Ok(()) => {
+                self.documents.tabs[index].ann_dirty = false;
+                self.documents.error = None;
+            }
+            Err(error) => self.documents.error = Some(error),
+        }
+        cx.notify();
+    }
+
+    /// Mark the annotation sidecar dirty and debounce its write.
+    fn mark_annotations_dirty(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let Some(index) = self.documents.tab_index(path) else {
+            return;
+        };
+        let tab = &mut self.documents.tabs[index];
+        tab.ann_dirty = true;
+        tab.ann_generation = tab.ann_generation.wrapping_add(1);
+        let generation = tab.ann_generation;
+        let path = path.to_path_buf();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(documents::ANNOTATION_AUTOSAVE)
+                .await;
+            this.update(cx, |this, cx| {
+                this.autosave_annotations(&path, generation, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn autosave_annotations(&mut self, path: &Path, generation: u64, cx: &mut Context<Self>) {
+        let Some(index) = self.documents.tab_index(path) else {
+            return;
+        };
+        if self.documents.tabs[index].ann_generation != generation {
+            return;
+        }
+        self.save_annotations_tab(path, cx);
+    }
+
+    fn open_doc_popover(
+        &mut self,
+        path: &Path,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.documents.tab_index(path) else {
+            return;
+        };
+        let text = self.documents.tabs[index]
+            .annotations
+            .iter()
+            .find(|ann| ann.id == id)
+            .map(|ann| ann.text.clone())
+            .unwrap_or_default();
+        let editor = cx.new(|cx| TextareaState::new(window, cx).default_value(text));
+        editor.update(cx, |state, cx| state.focus(window, cx));
+        cx.observe(&editor, |this: &mut AppShell, editor, cx| {
+            this.doc_popover_edited(&editor, cx)
+        })
+        .detach();
+        let tab = &mut self.documents.tabs[index];
+        tab.popover = Some(id.to_string());
+        tab.popover_editor = Some(editor);
+        cx.notify();
+    }
+
+    pub(crate) fn open_annotation(
+        &mut self,
+        path: PathBuf,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.documents.tab_index(&path) else {
+            return;
+        };
+        if self.documents.tabs[index].popover.as_deref() == Some(id.as_str()) {
+            self.close_doc_popover(path, cx);
+            return;
+        }
+        self.open_doc_popover(&path, &id, window, cx);
+    }
+
+    pub(crate) fn close_doc_popover(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(index) = self.documents.tab_index(&path) else {
+            return;
+        };
+        let tab = &mut self.documents.tabs[index];
+        tab.popover = None;
+        tab.popover_editor = None;
+        cx.notify();
+    }
+
+    fn doc_popover_edited(&mut self, editor: &Entity<TextareaState>, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .documents
+            .tabs
+            .iter()
+            .position(|tab| tab.popover_editor.as_ref() == Some(editor))
+        else {
+            return;
+        };
+        let Some(id) = self.documents.tabs[index].popover.clone() else {
+            return;
+        };
+        let value = editor.read(cx).value().to_string();
+        let changed = match self.documents.tabs[index]
+            .annotations
+            .iter_mut()
+            .find(|ann| ann.id == id)
+        {
+            Some(ann) if ann.text != value => {
+                ann.text = value;
+                ann.modified_at = now_unix();
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            let path = self.documents.tabs[index].path.clone();
+            self.mark_annotations_dirty(&path, cx);
+        }
+    }
+
+    pub(crate) fn set_annotation_color(
+        &mut self,
+        path: PathBuf,
+        id: String,
+        color: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.documents.tab_index(&path) else {
+            return;
+        };
+        let changed = match self.documents.tabs[index]
+            .annotations
+            .iter_mut()
+            .find(|ann| ann.id == id)
+        {
+            Some(ann) if ann.color != color => {
+                ann.color = color;
+                ann.modified_at = now_unix();
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.mark_annotations_dirty(&path, cx);
+        }
+    }
+
+    pub(crate) fn delete_annotation(&mut self, path: PathBuf, id: String, cx: &mut Context<Self>) {
+        let Some(index) = self.documents.tab_index(&path) else {
+            return;
+        };
+        let before = self.documents.tabs[index].annotations.len();
+        let tab = &mut self.documents.tabs[index];
+        tab.annotations.retain(|ann| ann.id != id);
+        let removed = tab.annotations.len() != before;
+        if tab.popover.as_deref() == Some(id.as_str()) {
+            tab.popover = None;
+            tab.popover_editor = None;
+        }
+        if removed {
+            self.mark_annotations_dirty(&path, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn zoom_doc_by(&mut self, path: PathBuf, delta: f32, cx: &mut Context<Self>) {
+        let Some(index) = self.documents.tab_index(&path) else {
+            return;
+        };
+        let factor = if delta >= 0.0 {
+            documents::ZOOM_STEP
+        } else {
+            1.0 / documents::ZOOM_STEP
+        };
+        let zoom = documents_pdf::clamp_zoom(self.documents.tabs[index].zoom * factor);
+        self.documents.tabs[index].zoom = zoom;
+        cx.notify();
+    }
+
+    pub(crate) fn reset_doc_zoom(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(index) = self.documents.tab_index(&path) else {
+            return;
+        };
+        self.documents.tabs[index].zoom = 1.0;
+        cx.notify();
+    }
+
+    pub(crate) fn jump_doc_page(&mut self, path: PathBuf, delta: i32, cx: &mut Context<Self>) {
+        let Some(index) = self.documents.tab_index(&path) else {
+            return;
+        };
+        let count = self.documents.tabs[index].page_count;
+        if count == 0 {
+            return;
+        }
+        let visible = self.documents.tabs[index].visible_page;
+        let target = (visible as i32 + delta).clamp(0, count as i32 - 1) as usize;
+        self.documents.tabs[index].jump_to = Some(target);
+        cx.notify();
+    }
+
+    pub(crate) fn set_doc_tool(&mut self, tool: documents::Tool, cx: &mut Context<Self>) {
+        if self.documents.tool != tool {
+            self.documents.tool = tool;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn doc_selection_down(
+        &mut self,
+        path: PathBuf,
+        page: usize,
+        origin: Option<Point<Pixels>>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(origin) = origin else {
+            return;
+        };
+        let Some(index) = self.documents.tab_index(&path) else {
+            return;
+        };
+        if !self.documents.tabs[index].page_texts.contains_key(&page) {
+            return;
+        }
+        let scale = self.documents.tabs[index].last_scale;
+        let start = documents::screen_to_page(origin, scale, position);
+        match self.documents.tool {
+            documents::Tool::Note => {
+                let mut ann = new_annotation(
+                    AnnotationKind::Note,
+                    page,
+                    Vec::new(),
+                    documents::NOTE_COLORS[3],
+                );
+                ann.quads = vec![documents::note_anchor_quad(start)];
+                let id = ann.id.clone();
+                self.documents.tabs[index].annotations.push(ann);
+                self.open_doc_popover(&path, &id, window, cx);
+                self.mark_annotations_dirty(&path, cx);
+            }
+            _ => {
+                self.documents.tabs[index].selection = Some(documents::Selection {
+                    page,
+                    start,
+                    current: start,
+                });
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn doc_selection_move(
+        &mut self,
+        path: PathBuf,
+        page: usize,
+        origin: Option<Point<Pixels>>,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(origin) = origin else {
+            return;
+        };
+        let Some(index) = self.documents.tab_index(&path) else {
+            return;
+        };
+        let scale = self.documents.tabs[index].last_scale;
+        if let Some(sel) = &mut self.documents.tabs[index].selection
+            && sel.page == page
+        {
+            sel.current = documents::screen_to_page(origin, scale, position);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn doc_selection_up(
+        &mut self,
+        path: PathBuf,
+        page: usize,
+        origin: Option<Point<Pixels>>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(origin) = origin else {
+            return;
+        };
+        let Some(index) = self.documents.tab_index(&path) else {
+            return;
+        };
+        let scale = self.documents.tabs[index].last_scale;
+        let Some(mut sel) = self.documents.tabs[index].selection.take() else {
+            return;
+        };
+        if sel.page == page {
+            sel.current = documents::screen_to_page(origin, scale, position);
+        }
+        if self.documents.tool != documents::Tool::Highlight || sel.page != page {
+            cx.notify();
+            return;
+        }
+        let rect = sel.rect();
+        let (quads, memo) = self.documents.tabs[index]
+            .page_texts
+            .get(&page)
+            .map(|text| (text.selection_quads(&rect), text.selection_text(&rect)))
+            .unwrap_or_default();
+        // Ignore tiny drags (plain clicks).
+        if quads.is_empty() || ((rect[2] - rect[0]) < 2.0 && (rect[3] - rect[1]) < 2.0) {
+            cx.notify();
+            return;
+        }
+        let mut ann = new_annotation(
+            AnnotationKind::Highlight,
+            page,
+            quads,
+            documents::NOTE_COLORS[0],
+        );
+        ann.text = memo;
+        let id = ann.id.clone();
+        self.documents.tabs[index].annotations.push(ann);
+        self.open_doc_popover(&path, &id, window, cx);
+        self.mark_annotations_dirty(&path, cx);
+    }
+
+    /// Drain worker events for every open PDF tab; keeps painting while a
+    /// parse or render is outstanding (gpui has no cross-thread wake).
+    pub(crate) fn pump_documents(&mut self, cx: &mut Context<Self>) {
+        let mut busy = false;
+        for tab in &mut self.documents.tabs {
+            if let Some(rx) = tab.events.take() {
+                loop {
+                    match rx.try_recv() {
+                        Ok(event) => apply_document_event(tab, event),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            tab.events = Some(rx);
+                            break;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
+            }
+            if tab.kind == DocKind::Pdf {
+                if tab.page_count == 0 && tab.error.is_none() {
+                    busy = true;
+                }
+                if !tab.pending.is_empty() {
+                    busy = true;
+                }
+            }
+        }
+        if busy {
+            cx.notify();
+        }
+    }
+
     fn titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.tokens;
         div()
@@ -1879,15 +2900,15 @@ impl AppShell {
             Section::Clocks => clocks::clocks_view(&mut self.clocks, self.use_24h, &t, window, cx)
                 .into_any_element(),
             Section::Notes => notes::notes_view(&self.notes, &t, window, cx).into_any_element(),
-            Section::Documents => placeholder::message(
-                "documents-placeholder",
-                Icon::FileText,
-                "Documents",
-                "Not ported yet. PDFs and markdown documents land in a later stage; nothing here \
-                 touches your documents folder.",
-                &t,
-            )
-            .into_any_element(),
+            Section::Documents => {
+                self.pump_documents(cx);
+                self.restore_documents_session(window, cx);
+                let element = documents::documents_view(&mut self.documents, &t, window, cx);
+                if self.documents.needs_repaint {
+                    cx.notify();
+                }
+                element.into_any_element()
+            }
             Section::Projects => placeholder::message(
                 "projects-placeholder",
                 Icon::Folder,
@@ -1965,6 +2986,78 @@ fn remap_path(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
     } else {
         to.join(rest)
     })
+}
+
+/// Apply one PDF worker event to a tab. Page size comes from the first
+/// render (`page 0` at scale 1), so later zoomed renders only fill the cache.
+fn apply_document_event(tab: &mut DocTab, event: PdfEvent) {
+    match event {
+        PdfEvent::Opened { page_count } => {
+            tab.page_count = page_count;
+            tab.error = None;
+        }
+        PdfEvent::OpenFailed { message } => {
+            tab.error = Some(message);
+            tab.page_count = 0;
+            tab.worker = None;
+        }
+        PdfEvent::Rendered {
+            page,
+            scale,
+            width,
+            height,
+            mut pixels,
+        } => {
+            let key = (page, documents::permille(scale));
+            tab.pending.remove(&key);
+            if width == 0 || height == 0 {
+                return;
+            }
+            if tab.page_size.is_none() && scale > 0.0 {
+                tab.page_size = Some((width as f32 / scale, height as f32 / scale));
+            }
+            // gpui's RenderImage is BGRA on little-endian; the worker emits
+            // straight RGBA8.
+            for px in pixels.as_chunks_mut::<4>().0 {
+                px.swap(0, 2);
+            }
+            let Some(buffer) = image::RgbaImage::from_raw(width, height, pixels) else {
+                return;
+            };
+            let rendered = RenderImage::new(smallvec![image::Frame::new(buffer)]);
+            tab.stamps.insert(key, tab.next_stamp);
+            tab.next_stamp = tab.next_stamp.wrapping_add(1);
+            tab.images.insert(key, std::sync::Arc::new(rendered));
+            while tab.images.len() > documents::TEXTURE_CACHE_CAP {
+                let Some(oldest) = tab
+                    .stamps
+                    .iter()
+                    .min_by_key(|(_, stamp)| **stamp)
+                    .map(|(key, _)| *key)
+                else {
+                    break;
+                };
+                tab.images.remove(&oldest);
+                tab.stamps.remove(&oldest);
+            }
+        }
+        PdfEvent::Text { page, text } => {
+            tab.page_texts.insert(page, text);
+        }
+        PdfEvent::Failed { message, .. } => {
+            if tab.error.is_none() {
+                tab.error = Some(message);
+            }
+        }
+    }
+}
+
+/// Unix seconds, matching the sidecar timestamps the egui app writes.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }
 
 impl Render for AppShell {
