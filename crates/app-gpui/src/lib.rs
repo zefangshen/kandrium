@@ -13,6 +13,7 @@ pub mod store;
 pub mod theme;
 pub mod views;
 pub mod vim;
+pub mod watcher;
 
 use gpui_kit::{AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 

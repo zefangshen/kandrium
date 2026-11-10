@@ -132,6 +132,13 @@ pub struct AppShell {
     settings_path: PathBuf,
     /// The user's vim preference, shared by every editor.
     vim_mode: bool,
+    /// External-change watcher; present only while a database-backed section
+    /// is foregrounded.
+    watcher: Option<crate::watcher::Watcher>,
+    watcher_generation: u64,
+    watcher_running: Option<u64>,
+    /// An external change arrived mid-drag and is applied on a later frame.
+    pending_sync: bool,
 }
 
 impl AppShell {
@@ -180,6 +187,10 @@ impl AppShell {
             settings,
             settings_path,
             vim_mode,
+            watcher: None,
+            watcher_generation: 0,
+            watcher_running: None,
+            pending_sync: false,
         };
         shell.load_tasks();
         shell.load_clocks();
@@ -738,6 +749,82 @@ impl AppShell {
             }
         })
         .detach();
+    }
+
+    /// Whether the foreground section reads the database and therefore needs
+    /// the external-change watcher. Notes and Documents are filesystem-backed.
+    fn wants_watcher(&self) -> bool {
+        matches!(self.section, Section::Tasks | Section::Clocks)
+    }
+
+    /// Stop the watcher thread and retire its pump loop.
+    fn stop_watcher(&mut self) {
+        if self.watcher.is_some() {
+            // `Drop` sets the stop flag; the thread exits within one poll.
+            self.watcher = None;
+        }
+        if self.watcher_running.is_some() {
+            self.watcher_generation = self.watcher_generation.wrapping_add(1);
+            self.watcher_running = None;
+        }
+    }
+
+    /// Keep one watcher alive while a database-backed section is on screen.
+    /// The pump loop only drains the receiver; the thread owns the connection.
+    fn ensure_watcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.wants_watcher() {
+            self.stop_watcher();
+            return;
+        }
+        if self.watcher.is_none() {
+            self.watcher = Some(crate::watcher::Watcher::spawn(self.store.path.clone()));
+        }
+        let generation = self.watcher_generation;
+        if self.watcher_running == Some(generation) {
+            return;
+        }
+        self.watcher_running = Some(generation);
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                let alive = this.update_in(cx, |this, _window, cx| {
+                    if this.watcher_generation != generation || !this.wants_watcher() {
+                        return None;
+                    }
+                    let changed = this
+                        .watcher
+                        .as_ref()
+                        .is_some_and(crate::watcher::Watcher::drain);
+                    if changed {
+                        this.apply_external_change(cx);
+                    }
+                    Some(())
+                });
+                let Ok(Some(())) = alive else {
+                    break;
+                };
+                cx.background_executor()
+                    .timer(crate::watcher::POLL_INTERVAL)
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    /// Refresh only what the foreground section shows. In-flight user state
+    /// (`editing`, note/document tabs, an active drag) is never rebuilt: a
+    /// drag defers the reload to the next frame, and an open modal keeps its
+    /// buffer while the board behind it updates.
+    fn apply_external_change(&mut self, cx: &mut Context<Self>) {
+        if self.dragging_card.is_some() || self.drop_target.is_some() {
+            self.pending_sync = true;
+            return;
+        }
+        match self.section {
+            Section::Tasks => self.load_tasks(),
+            Section::Clocks => self.load_clocks(),
+            Section::Notes | Section::Documents | Section::Projects => return,
+        }
+        cx.notify();
     }
 
     /// Times are formatted at render time, so the toggle needs no reload.
@@ -3216,6 +3303,13 @@ impl Render for AppShell {
         } else if self.clock_tick_running.is_some() {
             self.invalidate_clock_tick();
         }
+        // An external change that arrived mid-drag lands once the drop has
+        // finished, so the board never rearranges under the pointer.
+        if self.pending_sync && self.dragging_card.is_none() && self.drop_target.is_none() {
+            self.pending_sync = false;
+            self.apply_external_change(cx);
+        }
+        self.ensure_watcher(window, cx);
         let t = self.tokens;
         let overlay = self.editing.as_ref().map(|session| {
             card_modal::modal(
@@ -3260,6 +3354,7 @@ impl Render for AppShell {
 #[cfg(test)]
 mod settings_tests {
     use super::*;
+    use gpui_kit::test::TestWindowExt;
 
     fn seeded_db(dir: &Path) -> PathBuf {
         let path = dir.join("kandrium.db");
@@ -3300,5 +3395,100 @@ mod settings_tests {
         assert!(shell.vim_mode());
         assert_eq!(shell.notes.tree_w, settings::DEFAULT_TREE_W);
         assert!(shell.documents.tree_open);
+    }
+
+    fn first_card_id(shell: &AppShell) -> String {
+        shell.board.as_ref().expect("board").columns[0].ordered_cards()[0]
+            .id
+            .clone()
+    }
+
+    /// A commit from another connection surfaces through the watcher refresh,
+    /// and an open modal keeps its buffer across that refresh.
+    #[gpui::test]
+    fn external_change_refreshes_tasks_without_closing_the_modal(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seeded_db(dir.path());
+        cx.update(gpui_kit::init);
+        let boot = path.clone();
+        let (view, mut cx) =
+            cx.add_window_view(move |_window, _cx| AppShell::with_store(Store::open_path(boot)));
+        cx.update(|window, cx| window.render_frame(cx));
+
+        let card_id = cx.update(|_window, app| first_card_id(view.read(app)));
+        cx.update(|window, app| {
+            view.update(app, |shell, cx| shell.open_card(&card_id, window, cx))
+        });
+        cx.update(|window, cx| window.render_frame(cx));
+
+        let db = kandrium_core::open_db(&path).expect("second connection");
+        kandrium_core::rename_card(&db, &card_id, "Renamed elsewhere").expect("external rename");
+
+        cx.update(|_window, app| view.update(app, |shell, cx| shell.apply_external_change(cx)));
+        cx.update(|window, cx| window.render_frame(cx));
+
+        cx.update(|_window, app| {
+            view.read_with(app, |shell, _app| {
+                let board = shell.board.as_ref().expect("board");
+                let card = board
+                    .columns
+                    .iter()
+                    .flat_map(|column| column.ordered_cards())
+                    .find(|card| card.id == card_id)
+                    .expect("card");
+                assert_eq!(card.title, "Renamed elsewhere", "the board must reload");
+                assert!(
+                    shell.editing.is_some(),
+                    "an open modal must survive an external refresh"
+                );
+            })
+        });
+    }
+
+    /// A change that arrives while a card is dragged is deferred, not lost.
+    #[gpui::test]
+    fn external_change_defers_during_a_drag(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seeded_db(dir.path());
+        cx.update(gpui_kit::init);
+        let boot = path.clone();
+        let (view, mut cx) =
+            cx.add_window_view(move |_window, _cx| AppShell::with_store(Store::open_path(boot)));
+        cx.update(|window, cx| window.render_frame(cx));
+
+        let card_id = cx.update(|_window, app| first_card_id(view.read(app)));
+        cx.update(|_window, app| view.update(app, |shell, cx| shell.begin_card_drag(&card_id, cx)));
+
+        let db = kandrium_core::open_db(&path).expect("second connection");
+        kandrium_core::rename_card(&db, &card_id, "Renamed elsewhere").expect("external rename");
+        cx.update(|_window, app| view.update(app, |shell, cx| shell.apply_external_change(cx)));
+
+        cx.update(|_window, app| {
+            view.read_with(app, |shell, _app| {
+                assert!(shell.pending_sync, "the reload must be deferred");
+                let title = shell
+                    .board
+                    .as_ref()
+                    .unwrap()
+                    .columns
+                    .iter()
+                    .flat_map(|column| column.ordered_cards())
+                    .find(|card| card.id == card_id)
+                    .unwrap()
+                    .title
+                    .clone();
+                assert_ne!(
+                    title, "Renamed elsewhere",
+                    "the board must not move mid-drag"
+                );
+            })
+        });
+
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.update(|_window, app| {
+            view.read_with(app, |shell, _app| {
+                assert!(shell.pending_sync, "still dragging, still deferred");
+            })
+        });
     }
 }

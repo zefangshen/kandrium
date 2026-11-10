@@ -24,17 +24,17 @@ Order is strict: settings → watcher → packaging, one commit per part.
 
 ## Part 2 — data_version watcher
 
-- [ ] `crates/app-gpui/src/watcher.rs`: thread polling `PRAGMA data_version`
+- [x] `crates/app-gpui/src/watcher.rs`: thread polling `PRAGMA data_version`
       on its own connection, 250 ms poll + 120 ms debounce, stop flag, mpsc
       into the UI; never touches UI state.
-- [ ] `AppShell`: `watcher`, `watcher_generation`, `pending_sync`; start the
+- [x] `AppShell`: `watcher`, `watcher_generation`, `pending_sync`; start the
       pump only for Tasks/Clocks in `render`; stop on leaving; scoped
       `apply_external_change`; defer while dragging; modal/tabs untouched.
-- [ ] Tests: watcher thread emits and stops; external edit refreshes the
+- [x] Tests: watcher thread emits and stops; external edit refreshes the
       board; drag defers; open modal survives.
-- [ ] Verify the Clocks minute tick still renders from the cache with no DB
+- [x] Verify the Clocks minute tick still renders from the cache with no DB
       query.
-- [ ] `cargo fmt`, clippy, tests; commit part 2.
+- [x] `cargo fmt`, clippy, tests; commit part 2.
 
 ## Part 3 — packaging
 
