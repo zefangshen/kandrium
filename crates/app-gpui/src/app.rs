@@ -8,7 +8,9 @@
 use gpui_kit::TestSupportExt;
 use gpui_kit::component::input::{InputState, TextareaState};
 use gpui_kit::prelude::*;
-use gpui_kit::{AnyElement, ClickEvent, Context, IntoElement, Render, Window, div, px};
+use gpui_kit::{
+    AnyElement, ClickEvent, Context, Focusable, IntoElement, KeyDownEvent, Render, Window, div, px,
+};
 use jiff::Timestamp;
 use kandrium_core::{
     ALL_BOARD_ID, Board, BoardWithColumns, CardStatus, CreateCardBody, ProjectChoice,
@@ -20,6 +22,7 @@ use crate::theme::{Text, TextStyled, Tokens};
 use crate::views::card_modal::{self, EditSession, ModalContext};
 use crate::views::tasks::DropTarget;
 use crate::views::{clocks, placeholder, tasks};
+use crate::vim;
 
 /// The five top-level sections, in the same order as the egui app.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -332,6 +335,10 @@ impl AppShell {
                 .placeholder("YYYY-MM-DD")
         });
         title.update(cx, |state, cx| state.focus(window, cx));
+        // Vim starts in Normal mode: the description only accepts plain typing
+        // after `i`, so it starts read-only.
+        let vim = crate::vim::VimSession::new();
+        vim.sync_readonly(&description, cx);
         let focus = cx.focus_handle();
 
         self.editing = Some(EditSession {
@@ -341,6 +348,7 @@ impl AppShell {
             description,
             due,
             focus,
+            vim,
             labels: card.labels,
             project_id: card.project_id,
             area_board_id: card.area_board_id,
@@ -357,17 +365,17 @@ impl AppShell {
     }
 
     /// Persist the open editor. A blank title keeps the modal open with an
-    /// error, matching the egui modal.
-    pub(crate) fn save_editing(&mut self, cx: &mut Context<Self>) {
+    /// error, matching the egui modal. Returns whether the card was written.
+    fn persist_editing(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(mut session) = self.editing.take() else {
-            return;
+            return false;
         };
         let title = session.title.read(cx).value().trim().to_string();
         if title.is_empty() {
             session.error = Some("A title is required".into());
             self.editing = Some(session);
             cx.notify();
-            return;
+            return false;
         }
         let body = CreateCardBody {
             title,
@@ -400,9 +408,74 @@ impl AppShell {
             Err(error) => {
                 session.error = Some(error);
                 self.editing = Some(session);
+                cx.notify();
+                return false;
             }
         }
+        self.editing = Some(session);
         cx.notify();
+        true
+    }
+
+    /// Save and close (`Esc`, the Save button, `:q`, `:wq`, `:x`).
+    pub(crate) fn save_editing(&mut self, cx: &mut Context<Self>) {
+        if self.persist_editing(cx) {
+            self.editing = None;
+            cx.notify();
+        }
+    }
+
+    /// Save and keep the editor open (`:w`).
+    pub(crate) fn save_editing_and_keep_open(&mut self, cx: &mut Context<Self>) {
+        self.persist_editing(cx);
+    }
+
+    /// Keys routed to the open card modal before the textarea sees them.
+    ///
+    /// `Esc` in Normal mode (or outside the description) closes the editor;
+    /// otherwise the description's vim layer owns the key and consumes it.
+    pub(crate) fn handle_card_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.editing.as_ref() else {
+            return;
+        };
+        let description_focused = session
+            .description
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window);
+        let escape = event.keystroke.key == "escape";
+        if !description_focused || session.preview {
+            if escape {
+                cx.stop_propagation();
+                self.close_card(cx);
+            }
+            return;
+        }
+
+        let description = session.description.clone();
+        let outcome = match self.editing.as_mut() {
+            Some(session) => session.vim.handle_key(event, &description, window, cx),
+            None => return,
+        };
+        if outcome.handled {
+            cx.stop_propagation();
+            cx.notify();
+        }
+        match outcome.ex {
+            Some(vim::ExCommand::Write) => self.save_editing_and_keep_open(cx),
+            Some(vim::ExCommand::Close) => self.save_editing(cx),
+            None => {
+                if escape && !outcome.handled {
+                    cx.stop_propagation();
+                    self.close_card(cx);
+                }
+            }
+        }
     }
 
     pub(crate) fn toggle_editing_preview(&mut self, cx: &mut Context<Self>) {

@@ -3,8 +3,8 @@
 //! Mirrors the egui modal for the fields core supports: title, a markdown
 //! description with edit/preview, the project picker on normal cards or the
 //! area-board picker on project cards, labels and a due date. The description
-//! is a plain textarea for now; vim is a later stage and is deliberately not
-//! half-built here.
+//! is vim-modal: keys are captured by the panel and applied by
+//! [`crate::vim`] before the textarea sees them (see the module docs there).
 //!
 //! The overlay is a plain absolutely-positioned element inside the app root
 //! rather than `Dialog`: the shell already owns the open/closed state, so a
@@ -26,6 +26,7 @@ use kandrium_core::{Board, ProjectChoice};
 
 use crate::app::AppShell;
 use crate::theme::{self, Text, TextStyled, Tokens};
+use crate::vim::VimSession;
 
 /// One open card editor.
 pub struct EditSession {
@@ -37,6 +38,8 @@ pub struct EditSession {
     pub due: Entity<InputState>,
     /// Focus trap handle for the panel; keeps Tab inside the editor.
     pub focus: FocusHandle,
+    /// Modal state of the description field.
+    pub vim: VimSession,
     pub labels: Vec<i64>,
     pub project_id: Option<String>,
     pub area_board_id: Option<String>,
@@ -142,42 +145,49 @@ pub fn modal(ctx: ModalContext<'_>, cx: &mut Context<AppShell>) -> AnyElement {
                     })),
             ),
     );
-    panel = panel.child(
-        div()
-            .id("card-description-field")
-            .test_support()
-            .w_full()
-            .h(px(190.))
-            .flex()
-            .flex_col()
-            .rounded(px(t.radius))
-            .bg(t.field)
-            .border_1()
-            .border_color(t.border)
-            .p(px(8.))
-            .overflow_hidden()
-            .when(preview, |this| {
-                this.child(
-                    div()
-                        .id("card-description-preview")
-                        .test_support()
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .text(Text::Body)
-                        .text_color(t.text)
-                        .child(markdown(description_text.as_str())),
-                )
-            })
-            .when(!preview, |this| {
-                this.child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .child(Textarea::new(&session.description)),
-                )
-            }),
-    );
+    // The textarea only covers the text it renders, so clicking the empty part
+    // of the box would otherwise leave focus on the board behind the modal.
+    let focus_description = session.description.clone();
+    panel =
+        panel.child(
+            div()
+                .id("card-description-field")
+                .test_support()
+                .w_full()
+                .h(px(190.))
+                .flex()
+                .flex_col()
+                .rounded(px(t.radius))
+                .bg(t.field)
+                .border_1()
+                .border_color(t.border)
+                .p(px(8.))
+                .overflow_hidden()
+                .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                    focus_description.update(cx, |state, cx| state.focus(window, cx));
+                })
+                .when(preview, |this| {
+                    this.child(
+                        div()
+                            .id("card-description-preview")
+                            .test_support()
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .text(Text::Body)
+                            .text_color(t.text)
+                            .child(markdown(description_text.as_str())),
+                    )
+                })
+                .when(!preview, |this| {
+                    this.child(div().flex_1().min_h_0().child(
+                        Textarea::new(&session.description).readonly(!session.vim.is_insert()),
+                    ))
+                }),
+        );
+    if !preview {
+        panel = panel.child(mode_strip(session, t));
+    }
 
     // Project picker (normal cards) or area-board picker (project cards).
     if session.is_project_card {
@@ -285,14 +295,11 @@ pub fn modal(ctx: ModalContext<'_>, cx: &mut Context<AppShell>) -> AnyElement {
             )),
     );
 
-    // Escape closes the editor. The input deliberately does not consume Esc,
-    // so the key bubbles up to this panel; the focus trap keeps Tab here.
+    // The capture listener runs before the description's own key handling, so
+    // vim can consume Normal/Visual keys and `Esc` never edits the text.
     let panel = panel
-        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-            if event.keystroke.key == "escape" {
-                cx.stop_propagation();
-                this.close_card(cx);
-            }
+        .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+            this.handle_card_key(event, window, cx)
         }))
         .focus_trap("card-modal", &session.focus);
 
@@ -318,6 +325,59 @@ fn field_label(label: &'static str, t: &Tokens) -> impl IntoElement {
         .text(Text::SmallStrong)
         .text_color(t.text_muted)
         .child(label)
+}
+
+/// Mode badge, pending keys or the `:` command line, and a short hint.
+fn mode_strip(session: &EditSession, t: &Tokens) -> impl IntoElement {
+    let vim = &session.vim;
+    let mut row = div()
+        .id("card-description-mode")
+        .test_support()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .child(
+            div()
+                .px(px(6.))
+                .py(px(1.))
+                .rounded(px(4.))
+                .bg(t.panel)
+                .text(Text::SmallStrong)
+                .text_color(t.text_muted)
+                .child(vim.mode_label()),
+        );
+    if let Some(line) = vim.ex_line() {
+        row = row.child(
+            div()
+                .text(Text::Small)
+                .text_color(t.text)
+                .child(format!(":{line}")),
+        );
+    } else if let Some(error) = vim.ex_error() {
+        row = row.child(
+            div()
+                .text(Text::Small)
+                .text_color(t.danger)
+                .child(error.to_string()),
+        );
+    } else {
+        let pending = vim.pending();
+        if !pending.is_empty() {
+            row = row.child(
+                div()
+                    .text(Text::Small)
+                    .text_color(t.text_muted)
+                    .child(pending),
+            );
+        }
+    }
+    row.child(
+        div()
+            .flex_1()
+            .text(Text::Small)
+            .text_color(t.text_faint)
+            .child("i insert · Esc normal · :w save"),
+    )
 }
 
 fn action_button(
