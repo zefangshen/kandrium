@@ -14,19 +14,21 @@
 
 use std::path::PathBuf;
 
-use jiff::Timestamp;
 use kandrium_core::{
-    Board, BoardWithColumns, CardStatus, ClockText, CreateCardBody, ProjectChoice, bootstrap,
-    city_name, format_clock, get_all_board, get_board_readonly, list_boards, list_clocks,
-    list_project_choices, migrate_legacy_db, move_all_card, move_area_card, open_db,
-    open_db_readonly, resolve_db_path, resolve_zone, set_card_area, set_card_project, update_card,
+    Board, BoardWithColumns, CardStatus, Clock, CreateCardBody, Person, ProjectChoice, Travel,
+    add_clock, add_person, bootstrap, end_travel, extend_travel, get_all_board, get_board_readonly,
+    list_all_people, list_all_travels, list_boards, list_clocks, list_project_choices,
+    migrate_legacy_db, move_all_card, move_area_card, open_db, open_db_readonly, relocate_person,
+    remove_clock, remove_person, remove_travel, rename_person, reorder_clocks, resolve_db_path,
+    set_card_area, set_card_project, start_travel, update_card,
 };
 
-/// One saved city, formatted for display.
-pub struct ClockRow {
-    pub id: String,
-    pub city: String,
-    pub text: ClockText,
+/// One snapshot of the Clocks data. The app caches this so the minute tick
+/// never touches SQLite.
+pub struct ClockData {
+    pub clocks: Vec<Clock>,
+    pub people: Vec<Person>,
+    pub travels: Vec<Travel>,
 }
 
 /// Result type for the store: a user-facing message string.
@@ -156,21 +158,77 @@ impl Store {
         })
     }
 
-    /// Saved cities formatted at `now`.
-    pub fn clocks(&self, now: Timestamp, use_24h: bool) -> StoreResult<Vec<ClockRow>> {
+    /// One consistent snapshot of cities, people and trips. The app caches
+    /// these rows; rendering and the minute tick never query SQLite.
+    pub fn clock_data(&self) -> StoreResult<ClockData> {
         let db = self.conn()?;
-        let mut rows = Vec::new();
-        for clock in list_clocks(db).map_err(|e| e.to_string())? {
-            let Some(zone) = resolve_zone(&clock.tz_identifier) else {
-                continue;
-            };
-            rows.push(ClockRow {
-                id: clock.id.clone(),
-                city: city_name(&clock.tz_identifier),
-                text: format_clock(now, &zone, use_24h),
-            });
-        }
-        Ok(rows)
+        Ok(ClockData {
+            clocks: list_clocks(db).map_err(|e| e.to_string())?,
+            people: list_all_people(db).map_err(|e| e.to_string())?,
+            travels: list_all_travels(db).map_err(|e| e.to_string())?,
+        })
+    }
+
+    /// Add a saved city. Core rejects duplicates.
+    pub fn add_clock(&self, tz_identifier: &str) -> StoreResult<()> {
+        add_clock(self.wconn()?, tz_identifier)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Remove a saved city. Core refuses while it has residents
+    /// (`ON DELETE RESTRICT`); the returned message is the one to show.
+    pub fn remove_clock(&self, clock_id: &str) -> StoreResult<()> {
+        remove_clock(self.wconn()?, clock_id).map_err(|e| e.to_string())
+    }
+
+    /// Commit a complete permutation of clock ids.
+    pub fn reorder_clocks(&self, ids: &[String]) -> StoreResult<()> {
+        reorder_clocks(self.wconn()?, ids).map_err(|e| e.to_string())
+    }
+
+    pub fn add_person(&self, clock_id: &str, name: &str) -> StoreResult<()> {
+        add_person(self.wconn()?, clock_id, name)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn rename_person(&self, person_id: &str, name: &str) -> StoreResult<()> {
+        rename_person(self.wconn()?, person_id, name).map_err(|e| e.to_string())
+    }
+
+    pub fn remove_person(&self, person_id: &str) -> StoreResult<()> {
+        remove_person(self.wconn()?, person_id).map_err(|e| e.to_string())
+    }
+
+    pub fn relocate_person(&self, person_id: &str, clock_id: &str) -> StoreResult<()> {
+        relocate_person(self.wconn()?, person_id, clock_id).map_err(|e| e.to_string())
+    }
+
+    pub fn start_travel(
+        &self,
+        person_id: &str,
+        destination: &str,
+        starts_at: i64,
+        ends_at: Option<i64>,
+    ) -> StoreResult<()> {
+        start_travel(self.wconn()?, person_id, destination, starts_at, ends_at)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// End a running trip now.
+    pub fn end_travel(&self, travel_id: &str) -> StoreResult<()> {
+        end_travel(self.wconn()?, travel_id).map_err(|e| e.to_string())
+    }
+
+    /// Set or push a trip's return time. `None` makes it open-ended.
+    pub fn extend_travel(&self, travel_id: &str, ends_at: Option<i64>) -> StoreResult<()> {
+        extend_travel(self.wconn()?, travel_id, ends_at).map_err(|e| e.to_string())
+    }
+
+    pub fn remove_travel(&self, travel_id: &str) -> StoreResult<()> {
+        remove_travel(self.wconn()?, travel_id).map_err(|e| e.to_string())
     }
 
     /// Projects offered by the card modal's project picker.
