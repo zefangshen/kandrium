@@ -1,8 +1,8 @@
 # kandrium-app-gpui
 
 The gpui front-end for the egui → gpui migration (see `gpui-migration-plan.md`).
-Stage 1 is a **foundation**: an app shell with five sections, a read-only Tasks
-board and a real Clocks view, plus the four Phase 0 probes kept for reference.
+Tasks, Clocks, Notes and Documents are ported; Projects is still a placeholder.
+The four Phase 0 probes are kept for reference.
 
 This crate is its own workspace. The repository root excludes it
 (`exclude = ["crates/app-gpui"]`), so the shipping egui build,
@@ -15,19 +15,22 @@ they had before the migration started.
 cargo run --manifest-path crates/app-gpui/Cargo.toml --bin kandrium-gpui -- app
 ```
 
-The app opens the default database **read-only** and shows the first Tasks
-board and the saved Clocks. Notes, Documents and Projects are honest
-placeholders until later stages. It does not write to the database: the egui
-app and the MCP server keep full ownership of writes.
+The app opens the default database and shows the stored section (Tasks by
+default). It reads and writes through `kandrium-core`, and a background watcher
+polls `PRAGMA data_version`, so edits made by the egui app or the MCP server
+appear while the Tasks or Clocks section is open. UI preferences (vim mode,
+last section, tree widths and collapse flags) live in
+`gpui-settings.conf` next to the database.
 
 `KANDRIUM_DB` overrides the database path, as for the other binaries.
 
 ### Running on macOS
 
-Like the egui app, a GUI launched from a sandboxed agent shell cannot be trusted
-to see the right window server/state. Launch it through a minimal `.app` bundle
-instead — LaunchServices starts it as a real application, outside the agent
-sandbox:
+`KandriumGpui-dev.app` is a **developer convenience**, not a product build: its
+executable is a symlink into `target/debug/`. A GUI launched from a sandboxed
+agent shell cannot be trusted to see the right window server/state, so launch
+through this bundle instead — LaunchServices starts it as a real application,
+outside the agent sandbox:
 
 ```sh
 cargo build --manifest-path crates/app-gpui/Cargo.toml --bin kandrium-gpui
@@ -48,6 +51,32 @@ on the next launch. Restart with:
 ```sh
 killall kandrium-gpui; open -n crates/app-gpui/target/KandriumGpui-dev.app
 ```
+
+## Package a macOS bundle
+
+The product build uses `cargo packager`, like the egui app, with a crate-local
+config so both binaries can keep their own name. Run from the repository root:
+
+```sh
+just gpui-bundle
+# = cargo build --release --manifest-path crates/app-gpui/Cargo.toml --bin kandrium-gpui
+#   cargo packager --config crates/app-gpui/packager.json
+```
+
+`crates/app-gpui/packager.json` sets bundle id `app.kandrium.desktop`, version
+`0.1.0`, product name `Kandrium` (which is also the window title), the shared
+icons from `crates/app/packaging/`, and macOS 10.15 as the minimum. Outputs:
+
+```text
+crates/app-gpui/target/release/bundle/Kandrium.app
+crates/app-gpui/target/release/bundle/Kandrium_0.1.0_aarch64.dmg
+```
+
+cargo-packager changes into the config file's directory, which is why the
+binary, output and icon paths in that file are relative to `crates/app-gpui`.
+The root `packager.json` (egui) is untouched. The two configs intentionally
+duplicate the icon list and version string; when the egui app retires, both can
+share one root-level `packaging/` directory and a single version source.
 
 ## The green path (Probes A–D)
 
@@ -82,7 +111,16 @@ cargo test --manifest-path crates/app-gpui/Cargo.toml
     individually addressable, so duplicate element paths would fail);
   - the board view draws the real columns at the design-system width and the
     real seeded cards;
-  - the clocks view renders every seeded city.
+  - the clocks view renders every seeded city;
+  - the section, tree collapse and vim preference land in
+    `gpui-settings.conf`, and with vim off the card description takes plain
+    typing.
+- `src/settings.rs` — defaults with no file, unknown keys preserved across a
+  rewrite, bad values fall back, widths clamp.
+- `src/watcher.rs` — another connection's commit is reported; a stopped
+  watcher reports nothing.
+- `src/app.rs` — an external rename reloads the board while an open modal
+  survives, and defers while a card is dragged.
 
 No window server and no GPU are involved.
 
@@ -113,10 +151,15 @@ cargo update -p taffy --precise 0.15.0
 | file | role |
 | --- | --- |
 | `src/lib.rs` | `run()`: install fonts, open the window |
-| `src/app.rs` | `AppShell`, `Section`, the segmented control |
+| `src/app.rs` | `AppShell`, `Section`, the segmented control, the watcher pump |
+| `src/settings.rs` | `gpui-settings.conf`: vim, section, tree widths/flags |
+| `src/watcher.rs` | `data_version` polling thread, events over an mpsc channel |
 | `src/theme.rs` | palette, the single `Text` size table, font install |
 | `src/assets.rs` | Lucide SVGs, loaded from `crates/app/assets/icons/` |
-| `src/store.rs` | read-only `kandrium-core` calls |
-| `src/views/tasks.rs` | read-only board |
-| `src/views/clocks.rs` | saved cities |
+| `src/store.rs` | `kandrium-core` calls (reads and writes) |
+| `src/vim.rs` | the modal editor shared by every text field |
+| `src/views/tasks.rs` | board, drag and drop, card modal |
+| `src/views/clocks.rs` | saved cities and travel |
+| `src/views/notes.rs` | notes tree and tabs |
+| `src/views/documents.rs` | documents tree, PDF and Markdown tabs |
 | `src/views/placeholder.rs` | empty/error/not-ported states |

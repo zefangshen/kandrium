@@ -252,6 +252,12 @@ developer convenience only. The stale "does not write to the database" claim
    both warning-free (`vim.rs:2436` excluded from the count).
 3. `cargo test --workspace` (baseline 279) and
    `cargo test --manifest-path crates/app-gpui/Cargo.toml` (baseline 74).
+   Note: `tests/clocks.rs` has two wall-clock-sensitive tests
+   (`a_trip_can_be_assigned_extended_ended_and_removed`,
+   `relocation_cancels_trips_to_both_homes`) that fail after 23:00 local time
+   because a Tokyo "day window" starts/ends an hour before local midnight.
+   They are untouched by this stage and reproduced identically on `88a030c`
+   (Stage 5 tip) in a throwaway worktree.
 4. `just gpui-bundle`; inspect the `.app` and DMG.
 5. Rebuild and relaunch the dev app:
    `killall kandrium-gpui; open -n crates/app-gpui/target/KandriumGpui-dev.app`

@@ -38,12 +38,12 @@ Order is strict: settings → watcher → packaging, one commit per part.
 
 ## Part 3 — packaging
 
-- [ ] `crates/app-gpui/packager.json` (bundle id `app.kandrium.desktop`,
+- [x] `crates/app-gpui/packager.json` (bundle id `app.kandrium.desktop`,
       version 0.1.0, shared icons, app + dmg, minimum macOS 10.15).
-- [ ] `Justfile` recipe `gpui-bundle`; run it and inspect the `.app`/DMG.
-- [ ] `crates/app-gpui/README.md`: packaging section, correct the stale
+- [x] `Justfile` recipe `gpui-bundle`; run it and inspect the `.app`/DMG.
+- [x] `crates/app-gpui/README.md`: packaging section, correct the stale
       read-only claim, keep the dev-bundle recipe as dev-only.
-- [ ] Commit part 3.
+- [x] Commit part 3.
 
 ## Final
 
