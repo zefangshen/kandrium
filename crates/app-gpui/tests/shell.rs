@@ -543,3 +543,159 @@ fn card_modal_cancel_discards_changes(cx: &mut TestAppContext) {
         .expect("card after cancel");
     assert_eq!(saved.labels, card.labels, "cancel must not persist labels");
 }
+
+/// Open the first seeded card, focus its description and clear it from Normal
+/// mode so the vim tests start from a known empty buffer.
+fn open_empty_description(cx: &mut gpui::VisualTestContext, path: &Path) -> (String, String) {
+    cx.update(|_window, cx| gpui_kit::init(cx));
+    let store = Store::open_path(path.to_path_buf());
+    let board_id = store.boards().expect("boards")[0].id.clone();
+    let card_id = store.board(&board_id).expect("board").columns[0].ordered_cards()[0]
+        .id
+        .clone();
+
+    cx.update(|window, cx| window.click(format!("board-card-{card_id}"), cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, _cx| {
+        assert!(window.find("card-modal").visible(), "modal did not open");
+    });
+    cx.update(|window, cx| window.click("card-description-field", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    for key in ["g", "g", "d", "d"] {
+        cx.update(|window, cx| window.press(key, cx));
+    }
+    (board_id, card_id)
+}
+
+fn saved_description(path: &Path, board_id: &str, card_id: &str) -> String {
+    let board = Store::open_path(path.to_path_buf())
+        .board(board_id)
+        .expect("board");
+    board
+        .columns
+        .iter()
+        .flat_map(|column| column.ordered_cards())
+        .find(|card| card.id == card_id)
+        .expect("card after save")
+        .description
+        .clone()
+}
+
+/// `i` types through the textarea, `Esc` returns to Normal mode without
+/// closing the modal, and Normal-mode keys edit instead of typing.
+#[gpui::test]
+fn card_modal_description_vim_insert_then_normal(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let (_view, cx) =
+        cx.add_window_view(|_window, _cx| AppShell::with_store(Store::open_path(path.clone())));
+    let (board_id, card_id) = open_empty_description(cx, &path);
+
+    cx.update(|window, cx| window.press("i", cx));
+    cx.update(|window, cx| window.input("vim typed", cx));
+    cx.update(|window, cx| window.press("escape", cx));
+    cx.update(|window, cx| window.press("x", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, _cx| {
+        assert!(
+            window.find("card-modal").visible(),
+            "Esc in Insert must only leave Insert"
+        )
+    });
+
+    cx.update(|window, cx| window.click("card-modal-save", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    assert_eq!(
+        saved_description(&path, &board_id, &card_id),
+        "vim type",
+        "insert text should be kept and `x` should delete the last character"
+    );
+}
+
+/// Uppercase commands arrive through the keystroke's `key_char`, so
+/// `Shift-G` and `Shift-D` must reach the vim layer as `G` and `D`.
+#[gpui::test]
+fn card_modal_description_vim_uppercase_commands(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let (_view, cx) =
+        cx.add_window_view(|_window, _cx| AppShell::with_store(Store::open_path(path.clone())));
+    let (board_id, card_id) = open_empty_description(cx, &path);
+
+    cx.update(|window, cx| window.press("i", cx));
+    cx.update(|window, cx| window.input("ab", cx));
+    cx.update(|window, cx| window.press("enter", cx));
+    cx.update(|window, cx| window.input("cd", cx));
+    cx.update(|window, cx| window.press("escape", cx));
+    for key in ["g", "g", "shift-g", "shift-d"] {
+        cx.update(|window, cx| window.press(key, cx));
+    }
+    cx.update(|window, cx| window.click("card-modal-save", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    assert_eq!(
+        saved_description(&path, &board_id, &card_id),
+        "ab",
+        "`G` should move to the last line and `D` delete its contents"
+    );
+}
+
+/// Visual mode writes an inclusive selection back to the textarea.
+#[gpui::test]
+fn card_modal_description_vim_visual_delete(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let (_view, cx) =
+        cx.add_window_view(|_window, _cx| AppShell::with_store(Store::open_path(path.clone())));
+    let (board_id, card_id) = open_empty_description(cx, &path);
+
+    cx.update(|window, cx| window.press("i", cx));
+    cx.update(|window, cx| window.input("abcd", cx));
+    cx.update(|window, cx| window.press("escape", cx));
+    for key in ["g", "g", "v", "l", "l", "d"] {
+        cx.update(|window, cx| window.press(key, cx));
+    }
+    cx.update(|window, cx| window.click("card-modal-save", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    assert_eq!(saved_description(&path, &board_id, &card_id), "d");
+}
+
+/// `:w` writes the card and keeps the editor open; `Esc` afterwards closes it.
+#[gpui::test]
+fn card_modal_colon_write_saves_without_closing(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    let (_view, cx) =
+        cx.add_window_view(|_window, _cx| AppShell::with_store(Store::open_path(path.clone())));
+    let (board_id, card_id) = open_empty_description(cx, &path);
+
+    cx.update(|window, cx| window.press("i", cx));
+    cx.update(|window, cx| window.input("saved by vim", cx));
+    cx.update(|window, cx| window.press("escape", cx));
+    for key in [":", "w", "enter"] {
+        cx.update(|window, cx| window.press(key, cx));
+    }
+    cx.update(|window, cx| window.render_frame(cx));
+
+    assert_eq!(
+        saved_description(&path, &board_id, &card_id),
+        "saved by vim"
+    );
+    cx.update(|window, _cx| {
+        assert!(
+            window.find("card-modal").visible(),
+            ":w must save without closing the modal"
+        )
+    });
+
+    cx.update(|window, cx| window.press("escape", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, _cx| {
+        assert!(
+            window.try_find("card-modal").is_none(),
+            "Esc in Normal mode closes the editor"
+        )
+    });
+}
