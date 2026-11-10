@@ -47,8 +47,8 @@ Order is strict: settings → watcher → packaging, one commit per part.
 
 ## Final
 
-- [ ] `cargo fmt` ×2, `cargo clippy --workspace --all-targets` ×2,
+- [x] `cargo fmt` ×2, `cargo clippy --workspace --all-targets` ×2,
       `cargo test --workspace` + gpui tests; record counts.
-- [ ] Relaunch `target/KandriumGpui-dev.app`.
-- [ ] Report: persisted state, external-edit behaviour, packaging output and
+- [x] Relaunch `target/KandriumGpui-dev.app`.
+- [x] Report: persisted state, external-edit behaviour, packaging output and
       command, test counts, commit hashes, dropped parity, on-screen checks.

@@ -1,7 +1,7 @@
 # Stage 6 — the cross-cutting layer: settings, data_version watcher, packaging
 
-Status: awaiting approval. Branch: `gpui-migration`. Working tree verified
-clean (tip `88a030c`, Stage 5 accepted).
+Status: implemented on `gpui-migration`. Three commits plus the spec commit;
+see `tasks.md` for the checklist.
 
 ## 1. Goal
 
