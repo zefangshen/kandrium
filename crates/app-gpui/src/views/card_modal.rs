@@ -8,15 +8,18 @@
 //!
 //! The overlay is a plain absolutely-positioned element inside the app root
 //! rather than `Dialog`: the shell already owns the open/closed state, so a
-//! backdrop click and the Cancel button are enough to close it.
+//! backdrop click, Escape and the Cancel button are enough to close it. The
+//! panel is registered as a focus trap so Tab cannot move focus to the board
+//! behind the editor.
 
 use gpui_kit::TestSupportExt;
+use gpui_kit::base::FocusTrapElement;
 use gpui_kit::base::text::markdown;
 use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, App, ClickEvent, Context, Entity, IntoElement, MouseButton, MouseDownEvent, Window,
-    div, px, rgba,
+    AnyElement, App, ClickEvent, Context, Entity, FocusHandle, IntoElement, KeyDownEvent,
+    MouseButton, MouseDownEvent, Window, div, px, rgba,
 };
 
 use kandrium_core::{Board, ProjectChoice};
@@ -32,6 +35,8 @@ pub struct EditSession {
     pub title: Entity<InputState>,
     pub description: Entity<TextareaState>,
     pub due: Entity<InputState>,
+    /// Focus trap handle for the panel; keeps Tab inside the editor.
+    pub focus: FocusHandle,
     pub labels: Vec<i64>,
     pub project_id: Option<String>,
     pub area_board_id: Option<String>,
@@ -279,6 +284,17 @@ pub fn modal(ctx: ModalContext<'_>, cx: &mut Context<AppShell>) -> AnyElement {
                 cx.listener(|this, _: &ClickEvent, _window, cx| this.save_editing(cx)),
             )),
     );
+
+    // Escape closes the editor. The input deliberately does not consume Esc,
+    // so the key bubbles up to this panel; the focus trap keeps Tab here.
+    let panel = panel
+        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+            if event.keystroke.key == "escape" {
+                cx.stop_propagation();
+                this.close_card(cx);
+            }
+        }))
+        .focus_trap("card-modal", &session.focus);
 
     div()
         .id("card-modal-backdrop")

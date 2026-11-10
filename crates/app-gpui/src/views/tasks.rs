@@ -11,7 +11,7 @@ use gpui_kit::{
     Animation, AnimationExt, AnyElement, ClickEvent, Context, DragMoveEvent, IntoElement,
     MouseButton, MouseUpEvent, Render, Window, div, px,
 };
-use kandrium_core::{Board, BoardWithColumns, Card, Column};
+use kandrium_core::{ALL_BOARD_ID, Board, BoardWithColumns, Card, Column};
 
 use crate::anim::{LIFT, REFLOW, ease_standard, eased};
 use crate::app::AppShell;
@@ -49,10 +49,15 @@ struct DragStyle<'a> {
     reduced: bool,
 }
 
-/// The tab list: the visible (non-project) boards, plus the open board when it
-/// is not among them — the active-project-board rule.
+/// The tab list: the virtual All board first, then the visible (non-project)
+/// boards, plus the open board when it is not among them — the
+/// active-project-board rule.
 pub fn task_tabs(boards: &[Board], active: Option<&Board>) -> Vec<Board> {
-    let mut tabs = boards.to_vec();
+    let mut tabs = vec![Board {
+        id: ALL_BOARD_ID.to_string(),
+        title: "All".to_string(),
+    }];
+    tabs.extend(boards.iter().cloned());
     if let Some(active) = active
         && !tabs.iter().any(|board| board.id == active.id)
     {
@@ -293,7 +298,7 @@ fn card_view(
             t,
             reduced,
         ))
-        .child(card_body(card, t))
+        .child(card_body(card, card.meta_label.as_deref(), t))
         .on_click({
             let card_id = card_id.clone();
             cx.listener(move |this, _: &ClickEvent, window, cx| {
@@ -380,7 +385,7 @@ fn append_slot(
     )
 }
 
-fn card_body(card: &Card, t: &Tokens) -> AnyElement {
+fn card_body(card: &Card, meta: Option<&str>, t: &Tokens) -> AnyElement {
     div()
         .w_full()
         .flex()
@@ -397,7 +402,7 @@ fn card_body(card: &Card, t: &Tokens) -> AnyElement {
                 .text_color(t.text)
                 .child(card.title.clone()),
         )
-        .when_some(card.meta_label.clone(), |el, label| {
+        .when_some(meta.map(str::to_string), |el, label| {
             el.child(
                 div()
                     .text(Text::Small)
@@ -486,11 +491,11 @@ mod tests {
     }
 
     #[test]
-    fn tabs_append_the_active_board_when_it_is_not_listed() {
+    fn tabs_put_all_first_and_append_an_unlisted_active_board() {
         let listed = vec![board("a", "A"), board("b", "B")];
         let tabs = task_tabs(&listed, Some(&board("project", "P")));
         let ids: Vec<_> = tabs.iter().map(|board| board.id.as_str()).collect();
-        assert_eq!(ids, ["a", "b", "project"]);
+        assert_eq!(ids, ["all", "a", "b", "project"]);
     }
 
     #[test]
@@ -498,6 +503,14 @@ mod tests {
         let listed = vec![board("a", "A"), board("b", "B")];
         let tabs = task_tabs(&listed, Some(&board("b", "B")));
         let ids: Vec<_> = tabs.iter().map(|board| board.id.as_str()).collect();
-        assert_eq!(ids, ["a", "b"]);
+        assert_eq!(ids, ["all", "a", "b"]);
+    }
+
+    #[test]
+    fn the_all_board_is_not_added_twice() {
+        let listed = vec![board("a", "A")];
+        let tabs = task_tabs(&listed, Some(&board(ALL_BOARD_ID, "All")));
+        let ids: Vec<_> = tabs.iter().map(|board| board.id.as_str()).collect();
+        assert_eq!(ids, ["all", "a"]);
     }
 }

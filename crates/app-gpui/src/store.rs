@@ -16,10 +16,10 @@ use std::path::PathBuf;
 
 use jiff::Timestamp;
 use kandrium_core::{
-    Board, BoardWithColumns, ClockText, CreateCardBody, ProjectChoice, bootstrap, city_name,
-    format_clock, get_board_readonly, list_boards, list_clocks, list_project_choices,
-    migrate_legacy_db, move_area_card, open_db, open_db_readonly, resolve_db_path, resolve_zone,
-    set_card_area, set_card_project, update_card,
+    Board, BoardWithColumns, CardStatus, ClockText, CreateCardBody, ProjectChoice, bootstrap,
+    city_name, format_clock, get_all_board, get_board_readonly, list_boards, list_clocks,
+    list_project_choices, migrate_legacy_db, move_all_card, move_area_card, open_db,
+    open_db_readonly, resolve_db_path, resolve_zone, set_card_area, set_card_project, update_card,
 };
 
 /// One saved city, formatted for display.
@@ -125,6 +125,37 @@ impl Store {
         get_board_readonly(self.conn()?, id).map_err(|e| e.to_string())
     }
 
+    /// The virtual All board, shaped like a real one so the board surface can
+    /// render it unchanged. Each synthetic column id is `all:<status>`, and
+    /// `meta_label` carries the owning board (or area board) title.
+    pub fn all_board(&self) -> StoreResult<BoardWithColumns> {
+        // `get_all_board` backfills `all_card_order`, so it needs the writable
+        // handle even though the caller only renders.
+        let all = get_all_board(self.wconn()?).map_err(|e| e.to_string())?;
+        Ok(BoardWithColumns {
+            id: all.id,
+            title: all.title,
+            columns: all
+                .columns
+                .into_iter()
+                .map(|column| kandrium_core::Column {
+                    id: column.id,
+                    title: column.title,
+                    cards: column
+                        .cards
+                        .into_iter()
+                        .map(|entry| {
+                            let mut card = entry.card;
+                            card.meta_label = Some(entry.board_title);
+                            card
+                        })
+                        .collect(),
+                    mirrored: Vec::new(),
+                })
+                .collect(),
+        })
+    }
+
     /// Saved cities formatted at `now`.
     pub fn clocks(&self, now: Timestamp, use_24h: bool) -> StoreResult<Vec<ClockRow>> {
         let db = self.conn()?;
@@ -157,6 +188,19 @@ impl Store {
         before_card_id: Option<&str>,
     ) -> StoreResult<()> {
         move_area_card(self.wconn()?, card_id, to_column_id, before_card_id)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Move a card between status buckets from the All board. The home board's
+    /// matching status column is updated by core.
+    pub fn move_all_card(
+        &self,
+        card_id: &str,
+        status: CardStatus,
+        before_card_id: Option<&str>,
+    ) -> StoreResult<()> {
+        move_all_card(self.wconn()?, card_id, status, before_card_id)
             .map(|_| ())
             .map_err(|e| e.to_string())
     }

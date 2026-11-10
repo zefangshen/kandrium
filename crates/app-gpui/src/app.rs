@@ -10,7 +10,9 @@ use gpui_kit::component::input::{InputState, TextareaState};
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, ClickEvent, Context, IntoElement, Render, Window, div, px};
 use jiff::Timestamp;
-use kandrium_core::{Board, BoardWithColumns, CreateCardBody, ProjectChoice};
+use kandrium_core::{
+    ALL_BOARD_ID, Board, BoardWithColumns, CardStatus, CreateCardBody, ProjectChoice,
+};
 
 use crate::assets::{Icon, icon};
 use crate::store::{ClockRow, Store};
@@ -184,9 +186,16 @@ impl AppShell {
         }
     }
 
-    /// Load one board by id, keeping the previous board on failure.
+    /// Load one board by id, keeping the previous board on failure. The virtual
+    /// All board is loaded through `Store::all_board` and stored in the same
+    /// shape, so the surface renders both identically.
     fn load_board(&mut self, id: &str) -> Result<(), String> {
-        match self.store.board(id) {
+        let loaded = if id == ALL_BOARD_ID {
+            self.store.all_board()
+        } else {
+            self.store.board(id)
+        };
+        match loaded {
             Ok(board) => {
                 self.active_board_id = Some(board.id.clone());
                 self.board = Some(board);
@@ -259,7 +268,15 @@ impl AppShell {
             .filter(|before| before != card_id);
         self.drop_target = None;
         self.dragging_card = None;
-        let result = self.store.move_card(card_id, column_id, before.as_deref());
+        // All-board columns are synthetic `all:<status>` ids: a drop there
+        // changes the card's status on its home board (core handles the move).
+        let result = match column_id
+            .strip_prefix("all:")
+            .and_then(CardStatus::from_key)
+        {
+            Some(status) => self.store.move_all_card(card_id, status, before.as_deref()),
+            None => self.store.move_card(card_id, column_id, before.as_deref()),
+        };
         match result {
             Ok(()) => {
                 self.board_error = None;
@@ -315,6 +332,7 @@ impl AppShell {
                 .placeholder("YYYY-MM-DD")
         });
         title.update(cx, |state, cx| state.focus(window, cx));
+        let focus = cx.focus_handle();
 
         self.editing = Some(EditSession {
             card_id: card.id,
@@ -322,6 +340,7 @@ impl AppShell {
             title,
             description,
             due,
+            focus,
             labels: card.labels,
             project_id: card.project_id,
             area_board_id: card.area_board_id,
