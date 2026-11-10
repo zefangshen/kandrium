@@ -1,0 +1,11 @@
+[package]
+name = "pdf-render"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "PDF rasterization and text extraction for Kandrium"
+publish = false
+
+[dependencies]
+hayro = { workspace = true }
+kurbo = "0.13"

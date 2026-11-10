@@ -433,7 +433,7 @@ impl DocumentsState {
         }
         if documents::is_pdf(&path) {
             let repaint = self.ui_ctx.clone().unwrap_or_default();
-            let (worker, events) = PdfWorker::open(path.clone(), repaint);
+            let (worker, events) = PdfWorker::open(path.clone(), move || repaint.request_repaint());
             self.open.push(OpenDoc {
                 kind: DocKind::Pdf,
                 path,

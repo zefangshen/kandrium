@@ -14,14 +14,8 @@
 //! `app` is the Stage 1 shell. The four probes predate it and stay for
 //! reference.
 //!
-//! The PDF module is the *existing* `crates/app/src/pdf.rs`, pulled in by
-//! path so the spike reuses the real renderer without touching `crates/app`.
-
-// The PDF module is the *existing* app module; its own dead-code allowances
-// live in `crates/app`, so silence them here rather than editing that file.
-#[allow(dead_code)]
-#[path = "../../app/src/pdf.rs"]
-mod pdf;
+//! The PDF probe uses the shared `pdf-render` crate (the same worker the egui
+//! app uses), not a copy.
 
 mod board;
 mod drag_probe;

@@ -1,9 +1,9 @@
-//! C. PDF surface: reuse the existing `crates/app/src/pdf.rs` worker, hand its
-//! RGBA frame to gpui as an image, and zoom/pan it with plain layout.
+//! C. PDF surface: reuse the shared `pdf-render` worker, hand its RGBA frame
+//! to gpui as an image, and zoom/pan it with plain layout.
 //!
-//! The renderer is *not* reimplemented: `crate::pdf` is the same module the
-//! egui app uses, included by path. The only new code is the RGBA -> BGRA
-//! conversion gpui's `RenderImage` requires and the view transform.
+//! The renderer is *not* reimplemented: `pdf-render` is the same crate the
+//! egui app uses. The only new code is the RGBA -> BGRA conversion gpui's
+//! `RenderImage` requires and the view transform.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,13 +11,13 @@ use std::time::Duration;
 
 use gpui_kit::*;
 
-use crate::pdf::{Event, PdfWorker, Request};
+use pdf_render::{Event, PdfWorker, Request};
 
 pub fn run() {
     let path = find_pdf();
     println!("[C] pdf: {}", path.display());
 
-    let (worker, rx) = PdfWorker::open(path, egui::Context::default());
+    let (worker, rx) = PdfWorker::open(path, || {});
     worker.send(Request::Render {
         page: 0,
         scale: 2.0,

@@ -13,10 +13,6 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 
-[workspace.dependencies]
-# PDF rasterization, shared with the egui app.
-hayro = "0.7.1"
-
 [package]
 name = "kandrium-app-gpui"
 version.workspace = true
@@ -33,12 +29,11 @@ path = "src/main.rs"
 # Exact pins: the migration must be reproducible, not current.
 gpui-kit = "=0.9.1"
 kandrium-core = { path = "../core" }
+pdf-render = { path = "../pdf-render" }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 # Same version as `kandrium-core`; its `Timestamp` is part of the core API.
 jiff = "0.2"
-egui = "0.36.2"
-hayro = { workspace = true }
-kurbo = "0.13"
+rfd = "0.15"
 image = "0.25.1"
 smallvec = "1"
 
