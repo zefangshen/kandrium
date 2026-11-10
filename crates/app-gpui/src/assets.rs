@@ -11,6 +11,7 @@ use gpui_kit::{Rgba, Styled, Svg, px, svg};
 pub enum Icon {
     Calendar,
     Check,
+    ChevronDown,
     ChevronLeft,
     ChevronRight,
     Ellipsis,
@@ -39,6 +40,7 @@ impl Icon {
         match self {
             Icon::Calendar => include_bytes!("../../app/assets/icons/calendar.svg"),
             Icon::Check => include_bytes!("../../app/assets/icons/check.svg"),
+            Icon::ChevronDown => include_bytes!("../../app/assets/icons/chevron-down.svg"),
             Icon::ChevronLeft => include_bytes!("../../app/assets/icons/chevron-left.svg"),
             Icon::ChevronRight => include_bytes!("../../app/assets/icons/chevron-right.svg"),
             Icon::Ellipsis => include_bytes!("../../app/assets/icons/ellipsis.svg"),

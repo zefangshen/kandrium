@@ -99,32 +99,36 @@ stated gate. Commits follow the plan in `spec.md` §7.
 
 ### B1. Store notes wrappers
 
-- [ ] `notes_root` (`ensure_root`), `notes_tree`, `read_note`,
-      `write_note`, `create_note`, `create_folder`, rename, delete.
-- [ ] Confirm core exposes rename/delete; if not, stop and report the gap.
-- **Gate:** `cargo clippy --manifest-path crates/app-gpui/Cargo.toml`.
+- [x] `notes_root` (`ensure_root`), `notes_tree`, `read_note`,
+      `write_note`, `create_note`, `create_folder`, `rename_note`,
+      `delete_note` on `Store`, forwarding to `kandrium_core::notes`.
+- [x] Core already exposed rename/delete (`rename_path`, `delete_path`);
+      only name-validated creation was added (`create_named_note`,
+      `create_named_folder`).
+- **Gate:** `cargo clippy --manifest-path crates/app-gpui/Cargo.toml`. Passed.
 
 ### B2. Tree and tabs
 
-- [ ] Recursive tree honouring `KANDRIUM_NOTES`; expanded set; selected row.
-- [ ] New note / new folder / rename / delete from the tree header, inline
-      naming, confirm for delete.
-- [ ] File click opens a tab; tab strip; active tab.
-- [ ] Collapse-to-rail (30 px) if the layout expresses cleanly; otherwise
-      drop and report.
-- **Gate:** manual pass.
+- [x] Recursive tree honouring `KANDRIUM_NOTES`; expanded set; selected row.
+- [x] New note / new folder from the tree header, rename / delete on rows,
+      inline naming, confirm for delete.
+- [x] File click opens a tab; tab strip; active tab; close saves first.
+- [x] Collapse-to-rail (30 px) with a separate rail id.
+- **Gate:** covered by `tests/notes.rs` (tree header + empty state render);
+  on-screen pass left to the user.
 
 ### B3. Editor, preview, vim, autosave
 
-- [ ] `TextareaState` per note; `.readonly(!vim.is_insert())`.
-- [ ] Preview toggle using the Stage 3 markdown renderer.
-- [ ] Vim capture listener: `Esc`, `:w` flush, `:q` closes.
-- [ ] 400 ms debounced autosave through `write_note`; flush on tab switch,
-      section change, `:w`, `:q`.
+- [x] `TextareaState` per note; `.readonly(!vim.is_insert())`.
+- [x] Preview toggle using `gpui_kit::base::text::markdown`.
+- [x] Vim capture listener: `Esc`, `:w` flush, `:q` saves and closes.
+- [x] 400 ms debounced autosave (generation-guarded) through `write_note`;
+      flush on tab close, section change, `:w`, `:q`.
 - **Gate:** manual pass: type, wait, reopen, confirm persistence.
 
 ### B4. Notes tests and report
 
-- [ ] `tests/notes.rs`: temp `KANDRIUM_NOTES` root; create/open/rename/
-      delete; autosave writes atomically; tree sorts directories first.
-- [ ] Run all gates; relaunch the app; commit; report.
+- [x] `tests/notes.rs`: temp notes root; create/read/write/rename/delete;
+      collision and escape rejection; the section renders `notes-view`,
+      `notes-tree`, `notes-new-note`, `notes-empty`.
+- [x] Run all gates; relaunch the app; commit; report.

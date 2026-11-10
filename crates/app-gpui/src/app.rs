@@ -5,14 +5,15 @@
 //! (read-only); Notes, Documents and Projects state honestly that they have not
 //! been ported yet.
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui_kit::TestSupportExt;
 use gpui_kit::component::input::{InputState, TextareaState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, ClickEvent, Context, DragMoveEvent, Focusable, IntoElement, KeyDownEvent, Render,
-    Window, div, px,
+    AnyElement, ClickEvent, Context, DragMoveEvent, Entity, Focusable, IntoElement, KeyDownEvent,
+    Render, Window, div, px,
 };
 use jiff::Timestamp;
 use jiff::civil::Date;
@@ -30,7 +31,10 @@ use crate::views::clocks::{
     InspectorState, PickerState,
 };
 use crate::views::tasks::DropTarget;
-use crate::views::{placeholder, tasks};
+use crate::views::{
+    notes::{self, DraftKind, NameDraft, NoteTab, NotesState},
+    placeholder, tasks,
+};
 use crate::vim;
 
 /// The five top-level sections, in the same order as the egui app.
@@ -110,6 +114,7 @@ pub struct AppShell {
     clock_tick: u64,
     /// Generation of the tick loop currently allowed to run.
     clock_tick_running: Option<u64>,
+    notes: NotesState,
 }
 
 impl AppShell {
@@ -137,6 +142,7 @@ impl AppShell {
             clocks: ClockState::new(),
             clock_tick: 0,
             clock_tick_running: None,
+            notes: NotesState::new(),
         };
         shell.load_tasks();
         shell.load_clocks();
@@ -152,11 +158,15 @@ impl AppShell {
         if self.section == section {
             return;
         }
+        if self.section == Section::Notes {
+            self.flush_active_note(cx);
+        }
         self.section = section;
         match section {
             Section::Tasks => self.load_tasks(),
             Section::Clocks => self.load_clocks(),
-            Section::Notes | Section::Documents | Section::Projects => {}
+            Section::Notes => self.load_notes(),
+            Section::Documents | Section::Projects => {}
         }
         if section != Section::Clocks {
             self.invalidate_clock_tick();
@@ -1329,6 +1339,453 @@ impl AppShell {
         self.end_travel_now(travel_id, cx);
     }
 
+    // -----------------------------------------------------------------------
+    // Notes
+    // -----------------------------------------------------------------------
+
+    /// Resolve the notes root and rescan it. Tabs and the expanded set survive
+    /// because they are keyed by path.
+    fn load_notes(&mut self) {
+        let root = match self.store.notes_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.notes.root = None;
+                self.notes.entries.clear();
+                self.notes.error = Some(error.to_string());
+                return;
+            }
+        };
+        match self.store.notes_tree(&root) {
+            Ok(entries) => {
+                self.notes.root = Some(root);
+                self.notes.entries = entries;
+                self.notes.error = None;
+            }
+            Err(error) => {
+                self.notes.root = Some(root);
+                self.notes.entries.clear();
+                self.notes.error = Some(error.to_string());
+            }
+        }
+    }
+
+    pub(crate) fn toggle_notes_tree(&mut self, cx: &mut Context<Self>) {
+        self.notes.tree_open = !self.notes.tree_open;
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_notes_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if !self.notes.expanded.remove(&path) {
+            self.notes.expanded.insert(path.clone());
+        }
+        self.notes.selected = Some(path);
+        cx.notify();
+    }
+
+    /// Open a note in a tab, reusing the tab when the path is already open.
+    pub(crate) fn open_note(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.notes.selected = Some(path.clone());
+        if let Some(index) = self.notes.tab_index(&path) {
+            self.notes.active = Some(index);
+            let editor = self.notes.tabs[index].editor.clone();
+            editor.update(cx, |state, cx| state.focus(window, cx));
+            cx.notify();
+            return;
+        }
+        let Some(root) = self.notes.root.clone() else {
+            self.notes.error = Some("The notes folder is unavailable".into());
+            cx.notify();
+            return;
+        };
+        match self.store.read_note(&path, &root) {
+            Ok(text) => {
+                let editor =
+                    cx.new(|cx| TextareaState::new(window, cx).default_value(text.clone()));
+                let session = crate::vim::VimSession::new();
+                session.sync_readonly(&editor, cx);
+                cx.observe(&editor, |this: &mut AppShell, editor, cx| {
+                    this.note_edited(&editor, cx)
+                })
+                .detach();
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                self.notes.tabs.push(NoteTab {
+                    path,
+                    name,
+                    editor: editor.clone(),
+                    vim: session,
+                    preview: false,
+                    saved: text,
+                    dirty: false,
+                    generation: 0,
+                });
+                self.notes.active = Some(self.notes.tabs.len() - 1);
+                self.notes.error = None;
+                editor.update(cx, |state, cx| state.focus(window, cx));
+            }
+            Err(error) => self.notes.error = Some(error.to_string()),
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn activate_note_tab(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.notes.tab_index(&path) else {
+            return;
+        };
+        self.notes.active = Some(index);
+        let editor = self.notes.tabs[index].editor.clone();
+        editor.update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
+    }
+
+    pub(crate) fn close_note_tab_by_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.save_note(&path, cx);
+        let Some(index) = self.notes.tab_index(&path) else {
+            return;
+        };
+        self.notes.tabs.remove(index);
+        self.notes.active = match (self.notes.tabs.is_empty(), self.notes.active) {
+            (true, _) => None,
+            (false, Some(active)) if active > index => Some(active - 1),
+            (false, Some(active)) if active == index => Some(index.min(self.notes.tabs.len() - 1)),
+            (false, other) => other,
+        };
+        cx.notify();
+    }
+
+    /// A textarea notification. Only a value that differs from the last write
+    /// marks the tab dirty and schedules the debounce.
+    fn note_edited(&mut self, editor: &Entity<TextareaState>, cx: &mut Context<Self>) {
+        let Some(index) = self.notes.tabs.iter().position(|tab| tab.editor == *editor) else {
+            return;
+        };
+        let value = editor.read(cx).value().to_string();
+        let tab = &mut self.notes.tabs[index];
+        if value == tab.saved {
+            if tab.dirty {
+                tab.dirty = false;
+                cx.notify();
+            }
+            return;
+        }
+        tab.dirty = true;
+        tab.generation = tab.generation.wrapping_add(1);
+        let generation = tab.generation;
+        let path = tab.path.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(notes::AUTOSAVE).await;
+            this.update(cx, |this, cx| this.autosave_note(&path, generation, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// A debounce that already lost its race (a newer edit bumped the
+    /// generation) bows out.
+    fn autosave_note(&mut self, path: &Path, generation: u64, cx: &mut Context<Self>) {
+        let Some(index) = self.notes.tab_index(path) else {
+            return;
+        };
+        if self.notes.tabs[index].generation != generation {
+            return;
+        }
+        self.save_note(path, cx);
+    }
+
+    /// Write a dirty tab through core's atomic write.
+    fn save_note(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let Some(index) = self.notes.tab_index(path) else {
+            return;
+        };
+        if !self.notes.tabs[index].dirty {
+            return;
+        }
+        let Some(root) = self.notes.root.clone() else {
+            return;
+        };
+        let value = self.notes.tabs[index].editor.read(cx).value().to_string();
+        match self.store.write_note(path, &root, &value) {
+            Ok(()) => {
+                let tab = &mut self.notes.tabs[index];
+                tab.saved = value;
+                tab.dirty = false;
+                self.notes.error = None;
+            }
+            Err(error) => self.notes.error = Some(error.to_string()),
+        }
+        cx.notify();
+    }
+
+    fn save_active_note(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.notes.active_tab().map(|tab| tab.path.clone()) else {
+            return;
+        };
+        self.save_note(&path, cx);
+    }
+
+    fn close_active_note(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.notes.active_tab().map(|tab| tab.path.clone()) else {
+            return;
+        };
+        self.close_note_tab_by_path(path, cx);
+    }
+
+    /// Save the open note when the section is left.
+    fn flush_active_note(&mut self, cx: &mut Context<Self>) {
+        self.save_active_note(cx);
+    }
+
+    pub(crate) fn toggle_note_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.notes.active else {
+            return;
+        };
+        let Some(tab) = self.notes.tabs.get_mut(index) else {
+            return;
+        };
+        tab.preview = !tab.preview;
+        let editor = tab.editor.clone();
+        editor.update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Start the inline name field for a new note or folder.
+    pub(crate) fn begin_note_draft(
+        &mut self,
+        kind: DraftKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.notes.draft.is_some() {
+            return;
+        }
+        let Some(root) = self.notes.root.clone() else {
+            self.notes.error = Some("The notes folder is unavailable".into());
+            cx.notify();
+            return;
+        };
+        let target = self.notes.selected_dir(&root);
+        let placeholder = match kind {
+            DraftKind::Note => "Note name",
+            DraftKind::Folder => "Folder name",
+            DraftKind::Rename => "New name",
+        };
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.notes.draft = Some(NameDraft {
+            kind,
+            target,
+            input,
+        });
+        self.notes.error = None;
+        cx.notify();
+    }
+
+    pub(crate) fn begin_note_rename(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(name) = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+        else {
+            return;
+        };
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(name));
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.notes.draft = Some(NameDraft {
+            kind: DraftKind::Rename,
+            target: path,
+            input,
+        });
+        self.notes.error = None;
+        cx.notify();
+    }
+
+    pub(crate) fn handle_note_draft_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                cx.stop_propagation();
+                self.cancel_note_draft(cx);
+            }
+            "enter" => {
+                cx.stop_propagation();
+                self.commit_note_draft(window, cx);
+            }
+            _ => {}
+        }
+    }
+
+    fn commit_note_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = &self.notes.draft else {
+            return;
+        };
+        let kind = draft.kind;
+        let target = draft.target.clone();
+        let name = draft.input.read(cx).value().trim().to_string();
+        let Some(root) = self.notes.root.clone() else {
+            self.notes.error = Some("The notes folder is unavailable".into());
+            cx.notify();
+            return;
+        };
+        if name.is_empty() {
+            self.notes.error = Some("A name is required".into());
+            cx.notify();
+            return;
+        }
+        let result = match kind {
+            DraftKind::Note => self.store.create_note(&root, &target, &name),
+            DraftKind::Folder => self.store.create_folder(&root, &target, &name),
+            DraftKind::Rename => self.store.rename_note(&target, &root, &name),
+        };
+        match result {
+            Ok(created) => {
+                if kind == DraftKind::Rename {
+                    self.remap_note_paths(&target, &created);
+                } else {
+                    self.notes.expanded.insert(target);
+                    if kind == DraftKind::Note {
+                        self.open_note(created.clone(), window, cx);
+                    }
+                }
+                self.notes.selected = Some(created);
+                self.notes.draft = None;
+                self.notes.error = None;
+                self.load_notes();
+            }
+            Err(error) => self.notes.error = Some(error.to_string()),
+        }
+        cx.notify();
+    }
+
+    /// Follow a rename (file or folder) through open tabs, the selection and
+    /// the expanded set.
+    fn remap_note_paths(&mut self, from: &Path, to: &Path) {
+        for tab in &mut self.notes.tabs {
+            if let Some(path) = remap_path(&tab.path, from, to) {
+                tab.path = path;
+                tab.name = tab
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_default();
+            }
+        }
+        if let Some(selected) = &self.notes.selected
+            && let Some(path) = remap_path(selected, from, to)
+        {
+            self.notes.selected = Some(path);
+        }
+        let expanded: Vec<PathBuf> = self
+            .notes
+            .expanded
+            .iter()
+            .filter_map(|path| remap_path(path, from, to))
+            .collect();
+        self.notes.expanded = expanded.into_iter().collect();
+    }
+
+    fn cancel_note_draft(&mut self, cx: &mut Context<Self>) {
+        if self.notes.draft.take().is_some() {
+            self.notes.error = None;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn ask_delete_note(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.notes.confirm = Some(path);
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_delete_note(&mut self, cx: &mut Context<Self>) {
+        if self.notes.confirm.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn confirm_delete_note(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(root) = self.notes.root.clone() else {
+            return;
+        };
+        match self.store.delete_note(&path, &root) {
+            Ok(()) => {
+                let active_path = self.notes.active_tab().map(|tab| tab.path.clone());
+                self.notes.tabs.retain(|tab| !tab.path.starts_with(&path));
+                self.notes.active = active_path
+                    .and_then(|path| self.notes.tabs.iter().position(|tab| tab.path == path));
+                if self.notes.active.is_none() && !self.notes.tabs.is_empty() {
+                    self.notes.active = Some(self.notes.tabs.len() - 1);
+                }
+                if self
+                    .notes
+                    .selected
+                    .as_deref()
+                    .is_some_and(|selected| selected.starts_with(&path))
+                {
+                    self.notes.selected = None;
+                }
+                self.notes.confirm = None;
+                self.notes.error = None;
+                self.load_notes();
+            }
+            Err(error) => self.notes.error = Some(error.to_string()),
+        }
+        cx.notify();
+    }
+
+    /// Keys routed to the active note before the textarea sees them.
+    pub(crate) fn handle_notes_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.notes.active else {
+            return;
+        };
+        let Some(tab) = self.notes.tabs.get(index) else {
+            return;
+        };
+        if tab.preview {
+            return;
+        }
+        let editor = tab.editor.clone();
+        if !editor.read(cx).focus_handle(cx).is_focused(window) {
+            return;
+        }
+        let outcome = self.notes.tabs[index]
+            .vim
+            .handle_key(event, &editor, window, cx);
+        if outcome.handled {
+            cx.stop_propagation();
+            cx.notify();
+        }
+        match outcome.ex {
+            Some(vim::ExCommand::Write) => self.save_active_note(cx),
+            Some(vim::ExCommand::Close) => self.close_active_note(cx),
+            None => {
+                if event.keystroke.key == "escape" && !outcome.handled {
+                    cx.stop_propagation();
+                    self.close_active_note(cx);
+                }
+            }
+        }
+    }
+
     fn titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.tokens;
         div()
@@ -1421,15 +1878,7 @@ impl AppShell {
             Section::Tasks => self.tasks_body(cx),
             Section::Clocks => clocks::clocks_view(&mut self.clocks, self.use_24h, &t, window, cx)
                 .into_any_element(),
-            Section::Notes => placeholder::message(
-                "notes-placeholder",
-                Icon::StickyNote,
-                "Notes",
-                "Not ported yet. Notes will read your markdown files in a later stage of the \
-                 migration; nothing here touches them.",
-                &t,
-            )
-            .into_any_element(),
+            Section::Notes => notes::notes_view(&self.notes, &t, window, cx).into_any_element(),
             Section::Documents => placeholder::message(
                 "documents-placeholder",
                 Icon::FileText,
@@ -1505,6 +1954,17 @@ impl Default for AppShell {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Rewrite a path that lives under `from` so it lives under `to` instead.
+/// Returns `None` for unrelated paths.
+fn remap_path(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    let rest = path.strip_prefix(from).ok()?;
+    Some(if rest.as_os_str().is_empty() {
+        to.to_path_buf()
+    } else {
+        to.join(rest)
+    })
 }
 
 impl Render for AppShell {

@@ -38,7 +38,7 @@ fn every_section_renders_its_body(cx: &mut TestAppContext) {
 
     let expected = [
         (Section::Clocks, "clocks-view"),
-        (Section::Notes, "notes-placeholder"),
+        (Section::Notes, "notes-view"),
         (Section::Documents, "documents-placeholder"),
         (Section::Projects, "projects-placeholder"),
         (Section::Tasks, "board-view"),

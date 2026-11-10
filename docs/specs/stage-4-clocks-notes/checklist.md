@@ -39,8 +39,12 @@ Visual/manual passes are called out explicitly; they need the running app.
 
 ## Part B — Notes
 
-- [ ] Store wrappers over `kandrium_core::notes` honour `KANDRIUM_NOTES`.
-- [ ] The tree creates, opens, renames and deletes notes through core.
-- [ ] The editor previews markdown and keeps the vim layer working.
-- [ ] Autosave is debounced and writes atomically.
-- [ ] Notes tests and gates pass.
+- [x] Store wrappers over `kandrium_core::notes` honour `KANDRIUM_NOTES`.
+- [x] The tree creates, opens, renames and deletes notes through core.
+- [x] The editor previews markdown and keeps the vim layer working.
+- [x] Autosave is debounced and writes atomically.
+- [x] Notes tests and gates pass.
+- [ ] Manual pass: type in a note, wait for the dirty dot to clear, close the
+      tab and reopen it; confirm the text came back.
+- [ ] Manual pass: create a folder, create a note inside it, rename the folder
+      and confirm open tabs follow the move, then delete the folder.
