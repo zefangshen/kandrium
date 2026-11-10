@@ -1641,13 +1641,26 @@ impl KeyOutcome {
 }
 
 /// One description field's vim state and the glue to a gpui textarea.
-#[derive(Default)]
 pub struct VimSession {
     state: VimState,
     /// Caret (character index) the textarea reported after our last write.
     /// When it changes on its own the input moved (click, arrow), so the next
     /// key adopts its position instead of the stored vim cursor.
     expected_caret: Option<usize>,
+    /// The user's vim preference. When off the session is a plain textarea:
+    /// no keys are consumed and the buffer is never read-only.
+    enabled: bool,
+}
+
+impl Default for VimSession {
+    fn default() -> Self {
+        Self {
+            state: VimState::default(),
+            expected_caret: None,
+            // egui's `SavedState.vim_mode` defaults to on.
+            enabled: true,
+        }
+    }
 }
 
 impl VimSession {
@@ -1659,36 +1672,76 @@ impl VimSession {
         self.state.mode
     }
 
-    /// Whether the textarea should accept plain typing.
-    pub fn is_insert(&self) -> bool {
-        self.state.mode == VimMode::Insert
+    /// Whether vim is on for this editor.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
     }
 
-    /// Label shown in the mode strip.
+    /// Whether the textarea should accept plain typing.
+    pub fn is_insert(&self) -> bool {
+        !self.enabled || self.state.mode == VimMode::Insert
+    }
+
+    /// Whether the textarea must be read-only. A disabled session is never
+    /// read-only, so typing behaves like a plain editor.
+    pub fn readonly(&self) -> bool {
+        self.enabled && self.state.mode != VimMode::Insert
+    }
+
+    /// Follow the shell's vim preference. Re-enabling starts in Normal mode;
+    /// disabling drops the transient command state and hands the buffer back
+    /// to plain typing.
+    pub fn set_enabled(&mut self, on: bool, input: &Entity<TextareaState>, cx: &mut App) {
+        if self.enabled != on {
+            self.enabled = on;
+            self.state = VimState::default();
+            self.expected_caret = None;
+        }
+        self.sync_readonly(input, cx);
+    }
+
+    /// Label shown in the mode strip. A disabled session shows `vim` so the
+    /// badge still reads as the toggle.
     pub fn mode_label(&self) -> &'static str {
-        self.state.mode.label()
+        if self.enabled {
+            self.state.mode.label()
+        } else {
+            "vim"
+        }
     }
 
     /// Keys of the command in progress (`d`, `f`, ...), for the strip.
     pub fn pending(&self) -> String {
-        self.state.cmd_buf.iter().collect()
+        if self.enabled {
+            self.state.cmd_buf.iter().collect()
+        } else {
+            String::new()
+        }
     }
 
     /// Text typed after `:` while the command line is open.
     pub fn ex_line(&self) -> Option<&str> {
-        self.state.ex.as_deref()
+        if self.enabled {
+            self.state.ex.as_deref()
+        } else {
+            None
+        }
     }
 
     /// Message for an unknown `:` command, shown until the next `:`.
     pub fn ex_error(&self) -> Option<&str> {
-        self.state.ex_error.as_deref()
+        if self.enabled {
+            self.state.ex_error.as_deref()
+        } else {
+            None
+        }
     }
 
     /// Keep the textarea editable only in Insert mode. Read-only keeps focus,
     /// the caret and mouse selection, so Normal/Visual can use the same input
     /// for display and for our own caret writes.
     pub fn sync_readonly(&self, input: &Entity<TextareaState>, cx: &mut App) {
-        let readonly = self.state.mode != VimMode::Insert;
+        let readonly = self.readonly();
         input.update(cx, |state, cx| state.set_readonly(readonly, cx));
     }
 
@@ -1703,6 +1756,9 @@ impl VimSession {
         window: &mut Window,
         cx: &mut App,
     ) -> KeyOutcome {
+        if !self.enabled {
+            return KeyOutcome::default();
+        }
         let outcome = self.apply_key(event, input, window, cx);
         self.sync_readonly(input, cx);
         outcome

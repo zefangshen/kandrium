@@ -25,6 +25,7 @@ use pdf_render::{Event as PdfEvent, PdfWorker};
 use smallvec::smallvec;
 
 use crate::assets::{Icon, icon};
+use crate::settings::{self, TreePanel};
 use crate::store::Store;
 use crate::theme::{Text, TextStyled, Tokens};
 use crate::views::card_modal::{self, EditSession, ModalContext};
@@ -81,6 +82,12 @@ impl Section {
         }
     }
 
+    /// Inverse of [`Section::id`], used by the settings store. `None` for a key
+    /// this build does not know (a file written by a newer build).
+    pub fn from_key(key: &str) -> Option<Section> {
+        Section::ALL.into_iter().find(|section| section.id() == key)
+    }
+
     pub fn icon(self) -> Icon {
         match self {
             Section::Tasks => Icon::FolderKanban,
@@ -120,6 +127,11 @@ pub struct AppShell {
     clock_tick_running: Option<u64>,
     notes: NotesState,
     documents: DocumentsState,
+    /// Persisted UI preferences (section, vim, tree widths and collapse flags).
+    settings: settings::Settings,
+    settings_path: PathBuf,
+    /// The user's vim preference, shared by every editor.
+    vim_mode: bool,
 }
 
 impl AppShell {
@@ -130,8 +142,24 @@ impl AppShell {
 
     /// Build the shell over a specific store (the headless tests use this).
     pub fn with_store(store: Store) -> Self {
+        let settings_path = store
+            .path
+            .parent()
+            .map(|parent| parent.join(settings::FILE_NAME))
+            .unwrap_or_else(|| PathBuf::from(settings::FILE_NAME));
+        let settings = settings::Settings::load(&settings_path);
+
+        let mut notes = NotesState::new();
+        notes.tree_open = settings.tree_open(TreePanel::Notes);
+        notes.tree_w = settings.tree_width(TreePanel::Notes);
+        let mut documents = DocumentsState::new();
+        documents.tree_open = settings.tree_open(TreePanel::Documents);
+        documents.tree_w = settings.tree_width(TreePanel::Documents);
+        let section = settings.section();
+        let vim_mode = settings.vim_mode();
+
         let mut shell = Self {
-            section: Section::Tasks,
+            section,
             tokens: Tokens::dark(),
             use_24h: true,
             store,
@@ -147,17 +175,98 @@ impl AppShell {
             clocks: ClockState::new(),
             clock_tick: 0,
             clock_tick_running: None,
-            notes: NotesState::new(),
-            documents: DocumentsState::new(),
+            notes,
+            documents,
+            settings,
+            settings_path,
+            vim_mode,
         };
         shell.load_tasks();
         shell.load_clocks();
+        match section {
+            Section::Notes => shell.load_notes(),
+            Section::Documents => shell.load_documents(),
+            _ => {}
+        }
         shell
+    }
+
+    fn settings_path(&self) -> PathBuf {
+        self.settings_path.clone()
+    }
+
+    /// Copy the live preferences into the settings map and write it. Called
+    /// only from user actions, never per frame.
+    fn persist_settings(&mut self) {
+        self.settings.set_vim_mode(self.vim_mode);
+        self.settings.set_section(self.section);
+        self.settings
+            .set_tree_open(TreePanel::Notes, self.notes.tree_open);
+        self.settings
+            .set_tree_width(TreePanel::Notes, self.notes.tree_w);
+        self.settings
+            .set_tree_open(TreePanel::Documents, self.documents.tree_open);
+        self.settings
+            .set_tree_width(TreePanel::Documents, self.documents.tree_w);
+        let path = self.settings_path();
+        if let Err(error) = self.settings.save(&path) {
+            kandrium_core::logging::warn!("could not write settings {}: {error}", path.display());
+        }
+    }
+
+    /// Flip the vim preference and apply it to every open editor immediately.
+    pub(crate) fn toggle_vim_mode(&mut self, cx: &mut Context<Self>) {
+        self.vim_mode = !self.vim_mode;
+        let enabled = self.vim_mode;
+        if let Some(session) = self.editing.as_mut() {
+            let description = session.description.clone();
+            session.vim.set_enabled(enabled, &description, cx);
+        }
+        for tab in &mut self.notes.tabs {
+            let editor = tab.editor.clone();
+            tab.vim.set_enabled(enabled, &editor, cx);
+        }
+        for tab in &mut self.documents.tabs {
+            if let (Some(vim), Some(editor)) = (tab.vim.as_mut(), tab.editor.clone()) {
+                vim.set_enabled(enabled, &editor, cx);
+            }
+        }
+        self.persist_settings();
+        cx.notify();
+    }
+
+    /// Live width while the tree splitter is dragged.
+    pub(crate) fn set_notes_tree_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        let width = settings::clamp_tree_width(width);
+        if (self.notes.tree_w - width).abs() > 0.5 {
+            self.notes.tree_w = width;
+            cx.notify();
+        }
+    }
+
+    /// Live width while the tree splitter is dragged.
+    pub(crate) fn set_documents_tree_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        let width = settings::clamp_tree_width(width);
+        if (self.documents.tree_w - width).abs() > 0.5 {
+            self.documents.tree_w = width;
+            cx.notify();
+        }
+    }
+
+    /// Persist after a splitter drag ends.
+    pub(crate) fn finish_tree_resize(&mut self, cx: &mut Context<Self>) {
+        self.persist_settings();
+        cx.notify();
     }
 
     /// Currently selected section.
     pub fn section(&self) -> Section {
         self.section
+    }
+
+    /// Whether vim editing is on for every editor.
+    pub fn vim_mode(&self) -> bool {
+        self.vim_mode
     }
 
     fn select(&mut self, section: Section, cx: &mut Context<Self>) {
@@ -182,6 +291,7 @@ impl AppShell {
         if section != Section::Clocks {
             self.invalidate_clock_tick();
         }
+        self.persist_settings();
         cx.notify();
     }
 
@@ -371,9 +481,9 @@ impl AppShell {
         });
         title.update(cx, |state, cx| state.focus(window, cx));
         // Vim starts in Normal mode: the description only accepts plain typing
-        // after `i`, so it starts read-only.
-        let vim = crate::vim::VimSession::new();
-        vim.sync_readonly(&description, cx);
+        // after `i`, so it starts read-only unless the preference is off.
+        let mut vim = crate::vim::VimSession::new();
+        vim.set_enabled(self.vim_mode, &description, cx);
         let focus = cx.focus_handle();
 
         self.editing = Some(EditSession {
@@ -1382,6 +1492,7 @@ impl AppShell {
 
     pub(crate) fn toggle_notes_tree(&mut self, cx: &mut Context<Self>) {
         self.notes.tree_open = !self.notes.tree_open;
+        self.persist_settings();
         cx.notify();
     }
 
@@ -1412,8 +1523,8 @@ impl AppShell {
             Ok(text) => {
                 let editor =
                     cx.new(|cx| TextareaState::new(window, cx).default_value(text.clone()));
-                let session = crate::vim::VimSession::new();
-                session.sync_readonly(&editor, cx);
+                let mut session = crate::vim::VimSession::new();
+                session.set_enabled(self.vim_mode, &editor, cx);
                 cx.observe(&editor, |this: &mut AppShell, editor, cx| {
                     this.note_edited(&editor, cx)
                 })
@@ -1886,6 +1997,7 @@ impl AppShell {
     pub(crate) fn toggle_documents_tree(&mut self, cx: &mut Context<Self>) {
         self.documents.tree_open = !self.documents.tree_open;
         self.save_documents_session();
+        self.persist_settings();
         cx.notify();
     }
 
@@ -1947,8 +2059,6 @@ impl AppShell {
                 Ok(text) => {
                     let editor =
                         cx.new(|cx| TextareaState::new(window, cx).default_value(text.clone()));
-                    let session = crate::vim::VimSession::new();
-                    session.sync_readonly(&editor, cx);
                     cx.observe(&editor, |this: &mut AppShell, editor, cx| {
                         this.doc_tab_edited(&editor, cx)
                     })
@@ -1956,7 +2066,11 @@ impl AppShell {
                     self.documents
                         .tabs
                         .push(DocTab::markdown(path, name, text, editor.clone()));
-                    self.documents.active = Some(self.documents.tabs.len() - 1);
+                    let index = self.documents.tabs.len() - 1;
+                    if let Some(vim) = self.documents.tabs[index].vim.as_mut() {
+                        vim.set_enabled(self.vim_mode, &editor, cx);
+                    }
+                    self.documents.active = Some(index);
                     self.documents.error = None;
                     editor.update(cx, |state, cx| state.focus(window, cx));
                 }
@@ -3140,5 +3254,51 @@ impl Render for AppShell {
                     ),
             )
             .children(overlay)
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    fn seeded_db(dir: &Path) -> PathBuf {
+        let path = dir.join("kandrium.db");
+        let mut db = kandrium_core::open_db(&path).expect("open temp db");
+        kandrium_core::bootstrap(&mut db, &path).expect("bootstrap temp db");
+        path
+    }
+
+    /// A stored file is applied at boot: section, vim preference and the tree
+    /// widths/flags land on the state the views render from.
+    #[test]
+    fn with_store_applies_saved_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seeded_db(dir.path());
+        std::fs::write(
+            dir.path().join(settings::FILE_NAME),
+            "section=clocks\nvim_mode=0\nnotes_tree_width=310\n\
+             documents_tree_open=0\nprojects_tree_width=200\n",
+        )
+        .unwrap();
+
+        let shell = AppShell::with_store(Store::open_path(path));
+        assert_eq!(shell.section(), Section::Clocks);
+        assert!(!shell.vim_mode());
+        assert_eq!(shell.notes.tree_w, 310.0);
+        assert!(!shell.documents.tree_open);
+        assert_eq!(shell.settings.tree_width(TreePanel::Projects), 200.0);
+    }
+
+    /// No file means the defaults egui ships: Tasks, vim on, both trees open at
+    /// the design-system width.
+    #[test]
+    fn with_store_defaults_without_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seeded_db(dir.path());
+        let shell = AppShell::with_store(Store::open_path(path));
+        assert_eq!(shell.section(), Section::Tasks);
+        assert!(shell.vim_mode());
+        assert_eq!(shell.notes.tree_w, settings::DEFAULT_TREE_W);
+        assert!(shell.documents.tree_open);
     }
 }

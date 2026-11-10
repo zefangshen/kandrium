@@ -186,7 +186,7 @@ pub fn modal(ctx: ModalContext<'_>, cx: &mut Context<AppShell>) -> AnyElement {
                 }),
         );
     if !preview {
-        panel = panel.child(mode_strip(session, t));
+        panel = panel.child(mode_strip(session, t, cx));
     }
 
     // Project picker (normal cards) or area-board picker (project cards).
@@ -327,9 +327,11 @@ fn field_label(label: &'static str, t: &Tokens) -> impl IntoElement {
         .child(label)
 }
 
-/// Mode badge, pending keys or the `:` command line, and a short hint.
-fn mode_strip(session: &EditSession, t: &Tokens) -> impl IntoElement {
+/// Mode badge (also the vim on/off toggle), pending keys or the `:` command
+/// line, and a short hint.
+fn mode_strip(session: &EditSession, t: &Tokens, cx: &mut Context<AppShell>) -> impl IntoElement {
     let vim = &session.vim;
+    let enabled = vim.is_enabled();
     let mut row = div()
         .id("card-description-mode")
         .test_support()
@@ -338,13 +340,20 @@ fn mode_strip(session: &EditSession, t: &Tokens) -> impl IntoElement {
         .gap(px(8.))
         .child(
             div()
+                .id("card-description-vim-toggle")
+                .test_support()
                 .px(px(6.))
                 .py(px(1.))
                 .rounded(px(4.))
                 .bg(t.panel)
                 .text(Text::SmallStrong)
-                .text_color(t.text_muted)
-                .child(vim.mode_label()),
+                .text_color(if enabled { t.text_muted } else { t.text_faint })
+                .cursor_pointer()
+                .hover(|style| style.bg(t.hover))
+                .child(vim.mode_label())
+                .on_click(
+                    cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_vim_mode(cx)),
+                ),
         );
     if let Some(line) = vim.ex_line() {
         row = row.child(
@@ -376,7 +385,11 @@ fn mode_strip(session: &EditSession, t: &Tokens) -> impl IntoElement {
             .flex_1()
             .text(Text::Small)
             .text_color(t.text_faint)
-            .child("i insert · Esc normal · :w save"),
+            .child(if enabled {
+                "i insert · Esc normal · :w save"
+            } else {
+                "click the badge for vim"
+            }),
     )
 }
 

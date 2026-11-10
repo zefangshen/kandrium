@@ -87,7 +87,7 @@ existing `Section::id()` values; unknown section values resolve to `Tasks`.
 ### 2.3 Shell wiring (`crates/app-gpui/src/app.rs`)
 
 - New fields on `AppShell`: `settings: Settings`, `settings_path: PathBuf`,
-  `vim_mode: bool`, `tree_drag: Option<TreeDrag>`.
+  `vim_mode: bool`.
 - `with_store` builds the path from `store.path.parent()` (fall back to the
   current directory), loads settings, seeds `vim_mode`, `section`,
   `notes.tree_open/tree_w` and `documents.tree_open/tree_w`, then loads the

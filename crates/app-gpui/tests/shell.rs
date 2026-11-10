@@ -11,6 +11,7 @@ use gpui_kit::px;
 use gpui_kit::test::TestWindowExt;
 
 use kandrium_app_gpui::app::{AppShell, Section};
+use kandrium_app_gpui::settings::{Settings, TreePanel};
 use kandrium_app_gpui::store::Store;
 
 /// A bootstrapped database (schema + seed) in the temp directory.
@@ -700,4 +701,60 @@ fn card_modal_colon_write_saves_without_closing(cx: &mut TestAppContext) {
             "Esc in Normal mode closes the editor"
         )
     });
+}
+
+/// The shell writes section, tree collapse and the vim preference to
+/// `gpui-settings.conf` next to the database; with vim off the description
+/// takes plain typing and needs no `i`.
+#[gpui::test]
+fn settings_file_records_section_tree_and_vim(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    cx.update(gpui_kit::init);
+    let settings_path = dir.path().join(kandrium_app_gpui::settings::FILE_NAME);
+
+    let store = Store::open_path(path.clone());
+    let board_id = store.boards().expect("boards")[0].id.clone();
+    let card_id = store.board(&board_id).expect("board").columns[0].ordered_cards()[0]
+        .id
+        .clone();
+
+    let (_view, cx) =
+        cx.add_window_view(|_window, _cx| AppShell::with_store(Store::open_path(path.clone())));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    // Section and tree flag.
+    cx.update(|window, cx| window.click("nav-notes", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, cx| window.click("notes-collapse", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    let saved = Settings::load(&settings_path);
+    assert_eq!(saved.section(), Section::Notes);
+    assert!(!saved.tree_open(TreePanel::Notes));
+
+    // Vim preference from the card modal's mode badge.
+    cx.update(|window, cx| window.click("nav-tasks", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, cx| window.click(format!("board-card-{card_id}"), cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, cx| window.click("card-description-vim-toggle", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    let saved = Settings::load(&settings_path);
+    assert!(!saved.vim_mode(), "turning vim off must be persisted");
+
+    // Plain typing without `i`, then save.
+    cx.update(|window, cx| window.click("card-description-field", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, cx| window.press("cmd-a", cx));
+    cx.update(|window, cx| window.input("plain typing", cx));
+    cx.update(|window, cx| window.click("card-modal-save", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    assert_eq!(
+        saved_description(&path, &board_id, &card_id),
+        "plain typing",
+        "with vim off the description must accept typing directly"
+    );
 }

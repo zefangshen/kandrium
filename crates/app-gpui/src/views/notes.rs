@@ -20,7 +20,8 @@ use gpui_kit::base::text::markdown;
 use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, App, ClickEvent, Context, Entity, TestSupportExt, Window, div, px, rgba,
+    AnyElement, App, ClickEvent, Context, CursorStyle, DragMoveEvent, Entity, Render,
+    TestSupportExt, Window, div, px, rgba,
 };
 
 use kandrium_core::notes::NoteEntry;
@@ -77,6 +78,8 @@ pub struct NotesState {
     pub tabs: Vec<NoteTab>,
     pub active: Option<usize>,
     pub tree_open: bool,
+    /// Expanded tree width in points; persisted by the shell.
+    pub tree_w: f32,
     pub error: Option<String>,
     pub draft: Option<NameDraft>,
     /// Path waiting for a delete confirmation.
@@ -93,6 +96,7 @@ impl Default for NotesState {
             tabs: Vec::new(),
             active: None,
             tree_open: true,
+            tree_w: TREE_W,
             error: None,
             draft: None,
             confirm: None,
@@ -142,9 +146,50 @@ pub fn notes_view(
         .child(tree_panel(state, t, cx));
 
     if state.tree_open {
-        row = row.child(div().w(px(1.)).h_full().bg(t.divider));
+        row = row
+            .child(tree_splitter(t))
+            .child(div().w(px(1.)).h_full().bg(t.divider));
     }
-    row.child(content(state, t, cx)).into_any_element()
+    row.on_drag_move::<NotesTreeDrag>(cx.listener(
+        |this, event: &DragMoveEvent<NotesTreeDrag>, _window, cx| {
+            let width = f32::from(event.event.position.x) - f32::from(event.bounds.origin.x);
+            this.set_notes_tree_width(width, cx);
+        },
+    ))
+    .on_drop::<NotesTreeDrag>(cx.listener(|this, _drag: &NotesTreeDrag, _window, cx| {
+        this.finish_tree_resize(cx);
+    }))
+    .child(content(state, t, cx))
+    .into_any_element()
+}
+
+/// Drawn as a wider hit area than its 1 px rule. Dragging reports the pointer
+/// x back to the shell, which clamps and persists the width.
+fn tree_splitter(t: &Tokens) -> AnyElement {
+    div()
+        .id("notes-tree-splitter")
+        .test_support()
+        .w(px(5.))
+        .h_full()
+        .flex_none()
+        .cursor(CursorStyle::ResizeLeftRight)
+        .hover(|style| style.bg(t.hover))
+        .on_drag(NotesTreeDrag, |_drag, _offset, _window, cx| {
+            cx.new(|_| TreeDragGhost)
+        })
+        .child(div().w(px(1.)).h_full().bg(t.divider))
+        .into_any_element()
+}
+
+/// Payload for a tree-splitter drag. Only its type selects the listener.
+pub struct NotesTreeDrag;
+
+struct TreeDragGhost;
+
+impl Render for TreeDragGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().w(px(1.)).h(px(1.))
+    }
 }
 
 /// Header (collapse, new note, new folder), optional name field, tree rows.
@@ -180,7 +225,7 @@ fn tree_panel(state: &NotesState, t: &Tokens, cx: &mut Context<AppShell>) -> Any
     let mut panel = div()
         .id("notes-tree")
         .test_support()
-        .w(px(TREE_W))
+        .w(px(state.tree_w))
         .h_full()
         .flex()
         .flex_col()
@@ -532,7 +577,7 @@ fn content(state: &NotesState, t: &Tokens, cx: &mut Context<AppShell>) -> AnyEle
         );
     } else {
         body = body
-            .child(mode_strip(tab, t))
+            .child(mode_strip(tab, t, cx))
             .child(
                 div()
                     .id("note-editor")
@@ -577,9 +622,11 @@ fn tab_action(
         .into_any_element()
 }
 
-/// Mode badge, pending keys, ex line or error, and a short hint.
-fn mode_strip(tab: &NoteTab, t: &Tokens) -> AnyElement {
+/// Mode badge (also the vim on/off toggle), pending keys, ex line or error,
+/// and a short hint.
+fn mode_strip(tab: &NoteTab, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
     let vim = &tab.vim;
+    let enabled = vim.is_enabled();
     let mut row = div()
         .id("note-mode")
         .test_support()
@@ -592,13 +639,20 @@ fn mode_strip(tab: &NoteTab, t: &Tokens) -> AnyElement {
         .border_color(t.divider)
         .child(
             div()
+                .id("note-vim-toggle")
+                .test_support()
                 .px(px(6.))
                 .py(px(1.))
                 .rounded(px(4.))
                 .bg(t.panel)
                 .text(Text::SmallStrong)
-                .text_color(t.text_muted)
-                .child(vim.mode_label()),
+                .text_color(if enabled { t.text_muted } else { t.text_faint })
+                .cursor_pointer()
+                .hover(|style| style.bg(t.hover))
+                .child(vim.mode_label())
+                .on_click(
+                    cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_vim_mode(cx)),
+                ),
         );
     if let Some(line) = vim.ex_line() {
         row = row.child(
@@ -630,7 +684,11 @@ fn mode_strip(tab: &NoteTab, t: &Tokens) -> AnyElement {
             .flex_1()
             .text(Text::Small)
             .text_color(t.text_faint)
-            .child("Esc normal · i insert · :w save · :q close"),
+            .child(if enabled {
+                "Esc normal · i insert · :w save · :q close"
+            } else {
+                "click the badge for vim"
+            }),
     )
     .into_any_element()
 }

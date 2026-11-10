@@ -20,8 +20,8 @@ use gpui_kit::base::text::markdown;
 use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, App, Bounds, ClickEvent, Context, Entity, Pixels, Point, RenderImage, Rgba,
-    ScrollHandle, TestSupportExt, Window, div, point, px, rgba, size,
+    AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, DragMoveEvent, Entity, Pixels,
+    Point, RenderImage, Rgba, ScrollHandle, TestSupportExt, Window, div, point, px, rgba, size,
 };
 
 use kandrium_core::documents::{AnnotationKind, DocAnnotation, DocEntry};
@@ -292,6 +292,8 @@ pub struct DocumentsState {
     pub tabs: Vec<DocTab>,
     pub active: Option<usize>,
     pub tree_open: bool,
+    /// Expanded tree width in points; persisted by the shell.
+    pub tree_w: f32,
     pub error: Option<String>,
     pub draft: Option<DocDraft>,
     /// Path waiting for a delete confirmation.
@@ -314,6 +316,7 @@ impl Default for DocumentsState {
             tabs: Vec::new(),
             active: None,
             tree_open: true,
+            tree_w: TREE_W,
             error: None,
             draft: None,
             confirm: None,
@@ -500,9 +503,49 @@ pub fn documents_view(
         .child(tree_panel(state, t, cx));
 
     if state.tree_open {
-        row = row.child(div().w(px(1.)).h_full().bg(t.divider));
+        row = row
+            .child(tree_splitter(t))
+            .child(div().w(px(1.)).h_full().bg(t.divider));
     }
-    row.child(content(state, t, window, cx)).into_any_element()
+    row.on_drag_move::<DocumentsTreeDrag>(cx.listener(
+        |this, event: &DragMoveEvent<DocumentsTreeDrag>, _window, cx| {
+            let width = f32::from(event.event.position.x) - f32::from(event.bounds.origin.x);
+            this.set_documents_tree_width(width, cx);
+        },
+    ))
+    .on_drop::<DocumentsTreeDrag>(cx.listener(|this, _drag: &DocumentsTreeDrag, _window, cx| {
+        this.finish_tree_resize(cx);
+    }))
+    .child(content(state, t, window, cx))
+    .into_any_element()
+}
+
+/// A 5 px grab lane drawing the same 1 px rule as the plain divider.
+fn tree_splitter(t: &Tokens) -> AnyElement {
+    div()
+        .id("documents-tree-splitter")
+        .test_support()
+        .w(px(5.))
+        .h_full()
+        .flex_none()
+        .cursor(CursorStyle::ResizeLeftRight)
+        .hover(|style| style.bg(t.hover))
+        .on_drag(DocumentsTreeDrag, |_drag, _offset, _window, cx| {
+            cx.new(|_| TreeDragGhost)
+        })
+        .child(div().w(px(1.)).h_full().bg(t.divider))
+        .into_any_element()
+}
+
+/// Payload for a tree-splitter drag. Only its type selects the listener.
+pub struct DocumentsTreeDrag;
+
+struct TreeDragGhost;
+
+impl Render for TreeDragGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().w(px(1.)).h(px(1.))
+    }
 }
 
 /// Header (collapse, new file, new folder, upload), the inline create row and
@@ -539,7 +582,7 @@ fn tree_panel(state: &mut DocumentsState, t: &Tokens, cx: &mut Context<AppShell>
     let mut panel = div()
         .id("documents-tree")
         .test_support()
-        .w(px(TREE_W))
+        .w(px(state.tree_w))
         .h_full()
         .flex()
         .flex_col()
@@ -998,7 +1041,7 @@ fn markdown_body(
     }
 
     let editor = tab.editor.clone().expect("markdown tab has an editor");
-    let mode = mode_strip(tab, t);
+    let mode = mode_strip(tab, t, cx);
     let readonly = tab.vim.as_ref().is_none_or(|vim| !vim.is_insert());
     div()
         .id("doc-editor-wrap")
@@ -1023,11 +1066,13 @@ fn markdown_body(
         .into_any_element()
 }
 
-/// Mode badge, pending keys, ex line or error, and a short hint.
-fn mode_strip(tab: &DocTab, t: &Tokens) -> AnyElement {
+/// Mode badge (also the vim on/off toggle), pending keys, ex line or error,
+/// and a short hint.
+fn mode_strip(tab: &DocTab, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
     let Some(vim) = &tab.vim else {
         return div().into_any_element();
     };
+    let enabled = vim.is_enabled();
     let mut row = div()
         .id("doc-mode")
         .test_support()
@@ -1040,13 +1085,20 @@ fn mode_strip(tab: &DocTab, t: &Tokens) -> AnyElement {
         .border_color(t.divider)
         .child(
             div()
+                .id("doc-vim-toggle")
+                .test_support()
                 .px(px(6.))
                 .py(px(1.))
                 .rounded(px(4.))
                 .bg(t.panel)
                 .text(Text::SmallStrong)
-                .text_color(t.text_muted)
-                .child(vim.mode_label()),
+                .text_color(if enabled { t.text_muted } else { t.text_faint })
+                .cursor_pointer()
+                .hover(|style| style.bg(t.hover))
+                .child(vim.mode_label())
+                .on_click(
+                    cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_vim_mode(cx)),
+                ),
         );
     if let Some(line) = vim.ex_line() {
         row = row.child(
@@ -1078,7 +1130,11 @@ fn mode_strip(tab: &DocTab, t: &Tokens) -> AnyElement {
             .flex_1()
             .text(Text::Small)
             .text_color(t.text_faint)
-            .child("Esc normal · i insert · :w save · :q close"),
+            .child(if enabled {
+                "Esc normal · i insert · :w save · :q close"
+            } else {
+                "click the badge for vim"
+            }),
     )
     .into_any_element()
 }

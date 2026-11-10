@@ -8,6 +8,7 @@
 pub mod anim;
 pub mod app;
 pub mod assets;
+pub mod settings;
 pub mod store;
 pub mod theme;
 pub mod views;

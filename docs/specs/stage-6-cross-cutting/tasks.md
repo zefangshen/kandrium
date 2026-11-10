@@ -4,23 +4,23 @@ Order is strict: settings → watcher → packaging, one commit per part.
 
 ## Part 1 — settings persistence
 
-- [ ] `crates/app-gpui/src/settings.rs`: `Settings` over a `BTreeMap`
+- [x] `crates/app-gpui/src/settings.rs`: `Settings` over a `BTreeMap`
       (unknown keys preserved), `TreePanel`, defaults, 160–420 px width clamp,
       `load`/`save` via `fsutil::write_atomic`, unit tests (missing file,
       roundtrip + unknown key, garbage width/section).
-- [ ] `Section::from_key` in `app.rs`, mirroring `Section::id`.
-- [ ] `AppShell`: `settings`, `settings_path`, `vim_mode`, `tree_drag`
-      fields; load and seed in `with_store`; `persist_settings`; persist on
-      section change, tree toggles, vim toggle, resize end.
-- [ ] `NotesState.tree_w` / `DocumentsState.tree_w`, used by `tree_panel`;
+- [x] `Section::from_key` in `app.rs`, mirroring `Section::id`.
+- [x] `AppShell`: `settings`, `settings_path`, `vim_mode` fields; load and
+      seed in `with_store`; `persist_settings`; persist on section change,
+      tree toggles, vim toggle, resize end.
+- [x] `NotesState.tree_w` / `DocumentsState.tree_w`, used by `tree_panel`;
       4 px splitter with drag-to-resize on both trees.
-- [ ] `VimSession`: `enabled` (manual `Default`), `set_enabled`, `readonly`,
+- [x] `VimSession`: `enabled` (manual `Default`), `set_enabled`, `readonly`,
       disabled labels/empty pending; seed at all three editor creation sites.
-- [ ] Handlers `handle_card_key`, `handle_notes_key`, `handle_documents_key`
+- [x] Handlers `handle_card_key`, `handle_notes_key`, `handle_documents_key`
       short-circuit when vim is off (`Esc` closes).
-- [ ] Vim badge toggle in the card modal, Notes and Documents mode strips
+- [x] Vim badge toggle in the card modal, Notes and Documents mode strips
       (`card-description-vim-toggle`, `note-vim-toggle`, `doc-vim-toggle`).
-- [ ] `cargo fmt`, clippy, tests; commit part 1.
+- [x] `cargo fmt`, clippy, tests; commit part 1.
 
 ## Part 2 — data_version watcher
 
