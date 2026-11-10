@@ -46,8 +46,23 @@ pub const SCHEMA_V7_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../migrations/0007_project_source.sql"
 ));
+/// Additive v8 step (Clocks section city list).
+pub const SCHEMA_V8_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../migrations/0008_clocks.sql"
+));
+/// Additive v9 step (people attached to saved Clocks cities).
+pub const SCHEMA_V9_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../migrations/0009_clock_people.sql"
+));
+/// Additive v10 step (temporary travel windows for Clocks people).
+pub const SCHEMA_V10_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../migrations/0010_clock_travels.sql"
+));
 /// Latest schema version. Must match the number of entries in the migration set.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// The ordered migration set. `rusqlite_migration` tracks the applied version
 /// in `PRAGMA user_version`, so v1 databases upgrade through only the missing
@@ -63,6 +78,9 @@ pub(crate) fn migrations() -> Migrations<'static> {
         M::up(SCHEMA_V5_SQL),
         M::up(SCHEMA_V6_SQL),
         M::up(SCHEMA_V7_SQL),
+        M::up(SCHEMA_V8_SQL),
+        M::up(SCHEMA_V9_SQL),
+        M::up(SCHEMA_V10_SQL),
     ])
 }
 
@@ -212,6 +230,157 @@ mod tests {
             })
             .unwrap();
         assert_eq!(boards, 1);
+    }
+
+    /// A v7 database only gains the additive v8 clocks table; existing rows
+    /// stay untouched and the clocks list starts empty.
+    #[test]
+    fn v7_database_gains_the_clocks_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open_db(&dir.path().join("t.db")).unwrap();
+        Migrations::new(vec![
+            M::up(SCHEMA_SQL),
+            M::up(SCHEMA_V2_SQL),
+            M::up(SCHEMA_V3_SQL),
+            M::up(SCHEMA_V4_SQL),
+            M::up(SCHEMA_V5_SQL),
+            M::up(SCHEMA_V6_SQL),
+            M::up(SCHEMA_V7_SQL),
+        ])
+        .to_latest(&mut db)
+        .unwrap();
+        db.execute(
+            "INSERT INTO boards (id, title, position) VALUES ('b1', 'Board', 0)",
+            [],
+        )
+        .unwrap();
+
+        run_schema(&mut db).unwrap();
+
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let tables: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'clocks'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 1);
+        let clocks: i64 = db
+            .query_row("SELECT COUNT(*) FROM clocks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(clocks, 0);
+        let boards: i64 = db
+            .query_row("SELECT COUNT(*) FROM boards WHERE id = 'b1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(boards, 1);
+    }
+
+    /// A v8 database only gains the additive v9 people table; saved clocks
+    /// and their order stay untouched and no people are seeded.
+    #[test]
+    fn v8_database_gains_the_clock_people_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open_db(&dir.path().join("t.db")).unwrap();
+        Migrations::new(vec![
+            M::up(SCHEMA_SQL),
+            M::up(SCHEMA_V2_SQL),
+            M::up(SCHEMA_V3_SQL),
+            M::up(SCHEMA_V4_SQL),
+            M::up(SCHEMA_V5_SQL),
+            M::up(SCHEMA_V6_SQL),
+            M::up(SCHEMA_V7_SQL),
+            M::up(SCHEMA_V8_SQL),
+        ])
+        .to_latest(&mut db)
+        .unwrap();
+        db.execute_batch(
+            "INSERT INTO clocks (id, tz_identifier, position, created_at)
+             VALUES ('clock_tokyo', 'Asia/Tokyo', 0, '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+
+        run_schema(&mut db).unwrap();
+
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let tables: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'clock_people'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 1);
+        let people: i64 = db
+            .query_row("SELECT COUNT(*) FROM clock_people", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(people, 0);
+        let clocks: i64 = db
+            .query_row("SELECT COUNT(*) FROM clocks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(clocks, 1);
+    }
+
+    /// A v9 database only gains the additive v10 travel table; saved clocks,
+    /// residents and their order stay untouched and no travel is seeded.
+    #[test]
+    fn v9_database_gains_the_clock_travels_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open_db(&dir.path().join("t.db")).unwrap();
+        Migrations::new(vec![
+            M::up(SCHEMA_SQL),
+            M::up(SCHEMA_V2_SQL),
+            M::up(SCHEMA_V3_SQL),
+            M::up(SCHEMA_V4_SQL),
+            M::up(SCHEMA_V5_SQL),
+            M::up(SCHEMA_V6_SQL),
+            M::up(SCHEMA_V7_SQL),
+            M::up(SCHEMA_V8_SQL),
+            M::up(SCHEMA_V9_SQL),
+        ])
+        .to_latest(&mut db)
+        .unwrap();
+        db.execute_batch(
+            "INSERT INTO clocks (id, tz_identifier, position, created_at)
+                 VALUES ('clock_tokyo', 'Asia/Tokyo', 0, '2026-01-01T00:00:00Z');
+             INSERT INTO clock_people (id, name, home_clock_id, position, created_at)
+                 VALUES ('person_ana', 'Ana', 'clock_tokyo', 0, '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+
+        run_schema(&mut db).unwrap();
+
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let tables: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'clock_travels'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 1);
+        let travels: i64 = db
+            .query_row("SELECT COUNT(*) FROM clock_travels", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(travels, 0);
+        let people: i64 = db
+            .query_row("SELECT COUNT(*) FROM clock_people", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(people, 1);
     }
 
     /// A v1 database (user_version = 1, only the v1 tables) upgrades through

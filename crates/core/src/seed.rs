@@ -126,6 +126,11 @@ pub fn seed(db: &Connection) -> Result<()> {
         "[0]",
     )?;
 
+    // Fresh installs also get the reference clock trio. Existing databases
+    // never reach here (the board guard above returns early), so user data is
+    // left untouched.
+    crate::clocks::seed_defaults(&tx)?;
+
     tx.commit()?;
     Ok(())
 }
