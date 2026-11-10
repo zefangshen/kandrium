@@ -14,6 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
+use kandrium_core::documents::{self, AnnotationDoc, DocEntry};
 use kandrium_core::notes::{self, NoteEntry};
 use kandrium_core::{
     Board, BoardWithColumns, CardStatus, Clock, CreateCardBody, Person, ProjectChoice, Travel,
@@ -269,6 +270,88 @@ impl Store {
 
     pub fn delete_note(&self, path: &Path, root: &Path) -> StoreResult<()> {
         notes::delete_path(path, root).map_err(|e| e.to_string())
+    }
+
+    // -----------------------------------------------------------------------
+    // Documents — same filesystem layer, PDFs plus Markdown and annotation
+    // sidecars. No database handle involved.
+    // -----------------------------------------------------------------------
+
+    /// The documents root (`KANDRIUM_DOCS` honoured), created when missing and
+    /// canonicalized so tab paths can be stored relative to it.
+    pub fn documents_root(&self) -> StoreResult<PathBuf> {
+        let root = documents::ensure_root().map_err(|e| e.to_string())?;
+        std::fs::canonicalize(root).map_err(|e| e.to_string())
+    }
+
+    pub fn documents_tree(&self, root: &Path) -> StoreResult<Vec<DocEntry>> {
+        documents::scan_tree(root).map_err(|e| e.to_string())
+    }
+
+    pub fn read_document(&self, path: &Path, root: &Path) -> StoreResult<String> {
+        documents::read_text(path, root).map_err(|e| e.to_string())
+    }
+
+    pub fn write_document(&self, path: &Path, root: &Path, text: &str) -> StoreResult<()> {
+        documents::write_text(path, root, text).map_err(|e| e.to_string())
+    }
+
+    /// Create a Markdown file inside `parent` (bare names gain `.md`).
+    pub fn create_markdown(&self, parent: &Path, root: &Path, name: &str) -> StoreResult<PathBuf> {
+        documents::create_markdown(parent, root, name).map_err(|e| e.to_string())
+    }
+
+    pub fn create_doc_folder(
+        &self,
+        parent: &Path,
+        root: &Path,
+        name: &str,
+    ) -> StoreResult<PathBuf> {
+        documents::create_folder(parent, root, name).map_err(|e| e.to_string())
+    }
+
+    /// Copy files into `dest`, never overwriting (`-2`, `-3`, …). A failed
+    /// file is reported in its slot so the rest of the batch still lands.
+    pub fn import_documents(
+        &self,
+        sources: &[PathBuf],
+        dest: &Path,
+        root: &Path,
+    ) -> StoreResult<Vec<(PathBuf, Option<String>)>> {
+        let mut results = Vec::with_capacity(sources.len());
+        for source in sources {
+            let outcome = documents::import_file(source, dest, root)
+                .map(|path| (path, None))
+                .unwrap_or_else(|e| (source.clone(), Some(e.to_string())));
+            results.push(outcome);
+        }
+        Ok(results)
+    }
+
+    pub fn rename_document(
+        &self,
+        path: &Path,
+        root: &Path,
+        new_name: &str,
+    ) -> StoreResult<PathBuf> {
+        documents::rename_path(path, root, new_name).map_err(|e| e.to_string())
+    }
+
+    pub fn delete_document(&self, path: &Path, root: &Path) -> StoreResult<()> {
+        documents::delete_path(path, root).map_err(|e| e.to_string())
+    }
+
+    pub fn load_annotations(&self, pdf: &Path, root: &Path) -> StoreResult<AnnotationDoc> {
+        documents::load_annotations(pdf, root).map_err(|e| e.to_string())
+    }
+
+    pub fn save_annotations(
+        &self,
+        pdf: &Path,
+        root: &Path,
+        doc: &AnnotationDoc,
+    ) -> StoreResult<()> {
+        documents::save_annotations(pdf, root, doc).map_err(|e| e.to_string())
     }
 
     /// Projects offered by the card modal's project picker.
