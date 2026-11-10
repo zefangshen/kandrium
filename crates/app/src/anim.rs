@@ -644,7 +644,9 @@ fn lerp_pos(a: Pos2, b: Pos2, t: f32) -> Pos2 {
     Pos2::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
 }
 
-fn lerp_rect(a: Rect, b: Rect, t: f32) -> Rect {
+/// Interpolate every edge of a rect (used by the board rig and the Clocks
+/// grid reflow).
+pub fn lerp_rect(a: Rect, b: Rect, t: f32) -> Rect {
     Rect {
         min: lerp_pos(a.min, b.min, t),
         max: lerp_pos(a.max, b.max, t),

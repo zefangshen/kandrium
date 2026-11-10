@@ -31,6 +31,12 @@ pub enum ConfirmAction {
     DeleteProject(String),
     /// Projects page: folder id to delete (recursive).
     DeleteProjectFolder(String),
+    /// Clocks page: remove a saved city.
+    DeleteClock(String),
+    /// Clocks page: remove a person from their city.
+    DeletePerson(String),
+    /// Clocks page: delete one travel history row.
+    DeleteTravel(String),
 }
 
 /// What happened this frame.

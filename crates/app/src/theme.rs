@@ -199,6 +199,11 @@ pub fn small_strong() -> TextStyle {
     TextStyle::Name("small-strong".into())
 }
 
+/// Monospace 20: clock numerals (tabular digits, fixed width per glyph).
+pub fn clock_time() -> TextStyle {
+    TextStyle::Name("clock-time".into())
+}
+
 /// Resolve a [`TextStyle`] to a concrete [`FontId`] using the ui's current
 /// style, for painter-drawn text (`layout_no_wrap`).
 pub fn font_id(ui: &egui::Ui, style: TextStyle) -> FontId {
@@ -400,7 +405,8 @@ pub fn apply_visuals(ctx: &Context, dark: bool) {
         // Text styles — the single source of truth for app font sizes.
         // Standard styles: Small 13 (regular), Body 16 (regular),
         // Button 16 (medium), Heading 20 (semibold), Monospace 16.
-        // Named styles: "strong" = semibold 16, "small-strong" = semibold 13.
+        // Named styles: "strong" = semibold 16, "small-strong" = semibold 13,
+        // "clock-time" = monospace 20.
         let medium_family = FontFamily::Name("medium".into());
         let semibold_family = FontFamily::Name("semibold".into());
         style.text_styles = [
@@ -417,6 +423,7 @@ pub fn apply_visuals(ctx: &Context, dark: bool) {
                 small_strong(),
                 FontId::new(13.0, FontFamily::Name("semibold".into())),
             ),
+            (clock_time(), FontId::monospace(20.0)),
         ]
         .into();
     });

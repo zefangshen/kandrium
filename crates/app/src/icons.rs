@@ -42,6 +42,7 @@ static ICONS: &[(&str, &[u8])] = &[
         "folder-open",
         include_bytes!("../assets/icons/folder-open.svg"),
     ),
+    ("globe", include_bytes!("../assets/icons/globe.svg")),
     (
         "folder-plus",
         include_bytes!("../assets/icons/folder-plus.svg"),
@@ -50,9 +51,11 @@ static ICONS: &[(&str, &[u8])] = &[
         "highlighter",
         include_bytes!("../assets/icons/highlighter.svg"),
     ),
+    ("house", include_bytes!("../assets/icons/house.svg")),
     ("minus", include_bytes!("../assets/icons/minus.svg")),
     ("moon", include_bytes!("../assets/icons/moon.svg")),
     ("pencil", include_bytes!("../assets/icons/pencil.svg")),
+    ("plane", include_bytes!("../assets/icons/plane.svg")),
     ("plus", include_bytes!("../assets/icons/plus.svg")),
     (
         "rotate-ccw",
@@ -73,6 +76,7 @@ static ICONS: &[(&str, &[u8])] = &[
     ("sun", include_bytes!("../assets/icons/sun.svg")),
     ("trash-2", include_bytes!("../assets/icons/trash-2.svg")),
     ("upload", include_bytes!("../assets/icons/upload.svg")),
+    ("users", include_bytes!("../assets/icons/users.svg")),
     ("x", include_bytes!("../assets/icons/x.svg")),
 ];
 

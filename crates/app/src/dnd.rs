@@ -57,6 +57,74 @@ impl DropZone {
     }
 }
 
+/// A wrapping grid drop target: the grid bounds plus its laid-out slots in
+/// row-major order (the dragged item included, so a row never disappears).
+///
+/// Unlike [`DropZone`] this resolves an index in both axes, so a pointer
+/// chooses the row by its half-open vertical band and then the position
+/// within that row by x.
+#[derive(Clone, Debug)]
+pub struct GridZone {
+    pub rect: Rect,
+    pub slots: Vec<(String, Rect)>,
+}
+
+impl GridZone {
+    /// Row-major insertion index for a pointer inside the grid. Rows are
+    /// derived from the slot tops, so the caller needs no column count.
+    ///
+    /// Pass the *laid-out* slots (one per grid position) rather than a
+    /// reflowed preview: the bands only stay stable under the pointer if the
+    /// geometry does not change while cards make room.
+    pub fn insertion_index(&self, pos: egui::Pos2) -> usize {
+        let Some((_, first)) = self.slots.first() else {
+            return 0;
+        };
+        let mut row_starts = vec![0usize];
+        let mut row_top = first.top();
+        for (index, (_, rect)) in self.slots.iter().enumerate().skip(1) {
+            if (rect.top() - row_top).abs() > 1.0 {
+                row_starts.push(index);
+                row_top = rect.top();
+            }
+        }
+
+        // Rows are half-open vertical bands: the pointer belongs to the first
+        // row whose bottom-to-next-top gap still lies below it. Anchoring the
+        // boundary to the GAP (not the row's own centre) keeps the whole row
+        // selectable — a pointer over the lower half of a card must not jump
+        // to the next row. The last row is unbounded below.
+        let mut row = row_starts.len() - 1;
+        for candidate in 0..row_starts.len() {
+            let end = row_starts
+                .get(candidate + 1)
+                .copied()
+                .unwrap_or(self.slots.len());
+            let bottom = self.slots[end - 1].1.bottom();
+            let boundary = row_starts
+                .get(candidate + 1)
+                .map(|&next| (bottom + self.slots[next].1.top()) * 0.5)
+                .unwrap_or(f32::INFINITY);
+            if pos.y < boundary {
+                row = candidate;
+                break;
+            }
+        }
+
+        let start = row_starts[row];
+        let end = row_starts.get(row + 1).copied().unwrap_or(self.slots.len());
+        let before = self.slots[start..end]
+            .iter()
+            .filter(|(_, rect)| rect.center().x < pos.x)
+            .count();
+        start + before
+    }
+
+    pub fn contains(&self, pos: egui::Pos2) -> bool {
+        self.rect.contains(pos)
+    }
+}
+
 /// Mutable drag state living in the app.
 #[derive(Clone, Debug)]
 pub struct Drag {
@@ -173,6 +241,79 @@ mod tests {
     fn empty_zone_inserts_at_zero() {
         let z = zone(&[]);
         assert_eq!(z.insertion_index(pos2(100.0, 300.0)), 0);
+    }
+
+    #[test]
+    fn grid_insertion_walks_rows_then_columns() {
+        let slot = |x: f32, y: f32| Rect::from_min_size(pos2(x, y), egui::vec2(200.0, 156.0));
+        let grid = GridZone {
+            rect: Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(624.0, 324.0)),
+            slots: vec![
+                ("a".into(), slot(0.0, 0.0)),
+                ("b".into(), slot(212.0, 0.0)),
+                ("c".into(), slot(424.0, 0.0)),
+                ("d".into(), slot(0.0, 168.0)),
+                ("e".into(), slot(212.0, 168.0)),
+            ],
+        };
+        // Row 0: before a, between a/b, after c.
+        assert_eq!(grid.insertion_index(pos2(10.0, 10.0)), 0);
+        assert_eq!(grid.insertion_index(pos2(210.0, 10.0)), 1);
+        assert_eq!(grid.insertion_index(pos2(600.0, 10.0)), 3);
+        // Row 1: before d, between d/e, after e.
+        assert_eq!(grid.insertion_index(pos2(10.0, 300.0)), 3);
+        assert_eq!(grid.insertion_index(pos2(210.0, 300.0)), 4);
+        assert_eq!(grid.insertion_index(pos2(600.0, 300.0)), 5);
+        // Above the first row center and below the last row's own center.
+        assert_eq!(grid.insertion_index(pos2(210.0, 70.0)), 1);
+        assert_eq!(grid.insertion_index(pos2(210.0, 260.0)), 4);
+        // Outside the grid rect is rejected by `contains`, not the index.
+        assert!(!grid.contains(pos2(10.0, -10.0)));
+        assert!(grid.contains(pos2(10.0, 10.0)));
+    }
+
+    /// A row owns its whole card height, not just the half above its
+    /// vertical centre. The previous rule switched rows at the centre of the
+    /// row's own extent, so dipping into the lower half of a first-row card
+    /// already resolved to the second row — the seam that broke cross-row
+    /// drags (the target index jumped by a whole row while the pointer was
+    /// still over the same card).
+    #[test]
+    fn grid_row_bands_use_the_row_gap_not_the_row_center() {
+        let slot = |x: f32, y: f32| Rect::from_min_size(pos2(x, y), egui::vec2(200.0, 156.0));
+        let grid = GridZone {
+            rect: Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(624.0, 324.0)),
+            slots: vec![
+                ("a".into(), slot(0.0, 0.0)),
+                ("b".into(), slot(212.0, 0.0)),
+                ("c".into(), slot(424.0, 0.0)),
+                ("d".into(), slot(0.0, 168.0)),
+                ("e".into(), slot(212.0, 168.0)),
+            ],
+        };
+
+        // Lower half of the first row stays in the first row.
+        assert_eq!(grid.insertion_index(pos2(210.0, 100.0)), 1);
+        assert_eq!(grid.insertion_index(pos2(210.0, 155.0)), 1);
+        // The inter-row gap keeps resolving to the row above until its
+        // midpoint, then flips to the next row.
+        assert_eq!(grid.insertion_index(pos2(210.0, 160.0)), 1);
+        assert_eq!(grid.insertion_index(pos2(210.0, 165.0)), 4);
+        // Second row keeps its own full height, including its bottom edge.
+        assert_eq!(grid.insertion_index(pos2(210.0, 300.0)), 4);
+        assert_eq!(grid.insertion_index(pos2(10.0, 323.0)), 3);
+    }
+
+    #[test]
+    fn single_row_grid_counts_only_x() {
+        let slot = |x: f32| Rect::from_min_size(pos2(x, 0.0), egui::vec2(200.0, 156.0));
+        let grid = GridZone {
+            rect: Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(412.0, 156.0)),
+            slots: vec![("a".into(), slot(0.0)), ("b".into(), slot(212.0))],
+        };
+        assert_eq!(grid.insertion_index(pos2(10.0, 10.0)), 0);
+        assert_eq!(grid.insertion_index(pos2(300.0, 10.0)), 1);
+        assert_eq!(grid.insertion_index(pos2(900.0, 10.0)), 2);
     }
 
     #[test]

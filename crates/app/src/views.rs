@@ -7,3 +7,4 @@ pub mod documents;
 pub mod notes;
 pub mod notes_highlight;
 pub mod projects;
+pub mod wclock;

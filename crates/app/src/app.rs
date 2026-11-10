@@ -17,7 +17,7 @@ use kandrium_core::{
 use crate::anim;
 use crate::dnd::{self, ColKey, Drag, DropZone};
 use crate::theme;
-use crate::views::{all_board, archive, board, documents, notes, projects};
+use crate::views::{all_board, archive, board, documents, notes, projects, wclock};
 use crate::watcher;
 use crate::widgets::{card_modal, confirm};
 
@@ -58,6 +58,7 @@ enum Section {
     Projects,
     Notes,
     Documents,
+    Clocks,
 }
 
 /// The currently loaded board (real or virtual).
@@ -131,6 +132,9 @@ struct SavedState {
     /// Vim-style modal keys in markdown editors (on unless turned off).
     #[serde(default = "default_true")]
     vim_mode: bool,
+    /// Clocks section: 24-hour time (Kwora defaults to 12-hour).
+    #[serde(default)]
+    clocks_use_24h: bool,
 }
 
 /// Serde default for booleans that must start `true` in older saved sessions.
@@ -156,6 +160,7 @@ impl Default for SavedState {
             projects_tree_open: true,
             projects_docs_open: true,
             vim_mode: true,
+            clocks_use_24h: false,
         }
     }
 }
@@ -195,6 +200,9 @@ pub struct KandriumApp {
 
     // Documents section
     documents_state: documents::DocumentsState,
+
+    // Clocks section (read-only in Phase 1)
+    clocks_state: wclock::WorldClockState,
 
     // Drag and drop
     drag: Option<Drag>,
@@ -276,6 +284,7 @@ impl KandriumApp {
             notes_state: notes::NotesState::new(),
             projects_state: projects::ProjectsState::new(),
             documents_state: documents::DocumentsState::new(),
+            clocks_state: wclock::WorldClockState::new(),
             drag: None,
             zones: Vec::new(),
             settle_gap: None,
@@ -416,6 +425,9 @@ impl KandriumApp {
 
         // Keep the Projects tree in sync with kanban/external changes too.
         self.projects_state.reload(&db);
+        if self.saved.section == Section::Clocks {
+            self.clocks_state.reload(&db);
+        }
 
         drop(db);
         self.reconcile_editing();
@@ -666,6 +678,21 @@ impl KandriumApp {
                 }
                 self.reload_silent();
             }
+            confirm::ConfirmAction::DeleteClock(id) => {
+                self.run("Remove clock failed", |db| {
+                    kandrium_core::clocks::remove_clock(db, &id)
+                });
+            }
+            confirm::ConfirmAction::DeletePerson(id) => {
+                self.run("Remove person failed", |db| {
+                    kandrium_core::clocks::remove_person(db, &id)
+                });
+            }
+            confirm::ConfirmAction::DeleteTravel(id) => {
+                self.run("Remove trip failed", |db| {
+                    kandrium_core::clocks::remove_travel(db, &id)
+                });
+            }
             confirm::ConfirmAction::DeleteProjectFolder(id) => {
                 let root = self.projects_state.root().to_path_buf();
                 let db = self.db.clone();
@@ -760,11 +787,12 @@ impl KandriumApp {
 
             // Row 1: top-level sections.
             ui.horizontal(|ui| {
-                const SECTIONS: [Section; 4] = [
+                const SECTIONS: [Section; 5] = [
                     Section::Tasks,
                     Section::Projects,
                     Section::Notes,
                     Section::Documents,
+                    Section::Clocks,
                 ];
                 let segments = [
                     theme::Segment {
@@ -782,6 +810,10 @@ impl KandriumApp {
                     theme::Segment {
                         label: "Documents",
                         icon: "folder",
+                    },
+                    theme::Segment {
+                        label: "Clocks",
+                        icon: "globe",
                     },
                 ];
                 let selected = SECTIONS
@@ -1077,6 +1109,92 @@ impl KandriumApp {
                         message,
                         confirm_label: "Delete".to_string(),
                         action: confirm::ConfirmAction::DeleteDocPath(path),
+                    });
+                }
+                return;
+            }
+            Section::Clocks => {
+                let db = self.db.clone();
+                self.clocks_state.ensure_loaded(&db);
+                let actions = wclock::show(ui, &mut self.clocks_state, self.saved.clocks_use_24h);
+                if let Some(use_24h) = actions.set_use_24h {
+                    self.saved.clocks_use_24h = use_24h;
+                }
+                if let Some(zone) = actions.add_zone {
+                    self.run("Add clock failed", |db| {
+                        kandrium_core::clocks::add_clock(db, &zone).map(|_| ())
+                    });
+                }
+                if let Some(ids) = actions.reorder_ids {
+                    self.run("Reorder clocks failed", |db| {
+                        kandrium_core::clocks::reorder_clocks(db, &ids)
+                    });
+                }
+                if let Some((id, city)) = actions.remove_clock {
+                    self.confirm = Some(confirm::ConfirmRequest {
+                        title: "Remove clock".to_string(),
+                        message: format!(
+                            "Remove {city} from the Clocks page? The saved city will be deleted."
+                        ),
+                        confirm_label: "Remove".to_string(),
+                        action: confirm::ConfirmAction::DeleteClock(id),
+                    });
+                }
+                if let Some((clock_id, name)) = actions.add_person {
+                    self.run("Add person failed", |db| {
+                        kandrium_core::clocks::add_person(db, &clock_id, &name).map(|_| ())
+                    });
+                }
+                if let Some((id, name)) = actions.rename_person {
+                    self.run("Rename person failed", |db| {
+                        kandrium_core::clocks::rename_person(db, &id, &name)
+                    });
+                }
+                if let Some((id, name)) = actions.remove_person {
+                    self.confirm = Some(confirm::ConfirmRequest {
+                        title: "Remove person".to_string(),
+                        message: format!(
+                            "Remove {name} from this city? Their initials will disappear from the clock."
+                        ),
+                        confirm_label: "Remove".to_string(),
+                        action: confirm::ConfirmAction::DeletePerson(id),
+                    });
+                }
+                if let Some(request) = actions.start_travel {
+                    self.run("Move failed", |db| {
+                        kandrium_core::clocks::start_travel(
+                            db,
+                            &request.person_id,
+                            &request.destination_clock_id,
+                            request.starts_at,
+                            request.ends_at,
+                        )
+                        .map(|_| ())
+                    });
+                }
+                if let Some(id) = actions.end_travel {
+                    self.run("End trip failed", |db| {
+                        kandrium_core::clocks::end_travel(db, &id)
+                    });
+                }
+                if let Some((id, ends_at)) = actions.extend_travel {
+                    self.run("Extend trip failed", |db| {
+                        kandrium_core::clocks::extend_travel(db, &id, ends_at)
+                    });
+                }
+                if let Some((id, name)) = actions.remove_travel {
+                    self.confirm = Some(confirm::ConfirmRequest {
+                        title: "Remove trip".to_string(),
+                        message: format!(
+                            "Remove {name}'s travel entry? The trip history will be deleted."
+                        ),
+                        confirm_label: "Remove".to_string(),
+                        action: confirm::ConfirmAction::DeleteTravel(id),
+                    });
+                }
+                if let Some((person_id, clock_id)) = actions.relocate_person {
+                    self.run("Relocate failed", |db| {
+                        kandrium_core::clocks::relocate_person(db, &person_id, &clock_id)
                     });
                 }
                 return;
@@ -1938,6 +2056,61 @@ mod tests {
             (r.left() - title_x).abs() <= 1.0,
             "title left {} should start at measured title_x {title_x}",
             r.left()
+        );
+    }
+
+    /// Five top-level segments must fit the toolbar's content width at the
+    /// 940 px minimum window size.
+    #[test]
+    fn five_section_segments_fit_the_minimum_window_width() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply_visuals(&ctx, false);
+
+        let segments = [
+            theme::Segment {
+                label: "Tasks",
+                icon: "square-kanban",
+            },
+            theme::Segment {
+                label: "Projects",
+                icon: "folder-kanban",
+            },
+            theme::Segment {
+                label: "Notes",
+                icon: "sticky-note",
+            },
+            theme::Segment {
+                label: "Documents",
+                icon: "folder",
+            },
+            theme::Segment {
+                label: "Clocks",
+                icon: "globe",
+            },
+        ];
+        let available = 940.0 - 2.0 * f32::from(TOOLBAR_H_MARGIN);
+        let mut measured = 0.0_f32;
+
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ctx| {
+            let content = egui::Rect::from_min_size(
+                egui::pos2(f32::from(TOOLBAR_H_MARGIN), 0.0),
+                egui::vec2(available, 300.0),
+            );
+            let mut ui = egui::Ui::new(
+                ctx.clone(),
+                egui::Id::new("sections-940"),
+                egui::UiBuilder::new().max_rect(content),
+            );
+            theme::segmented_control(&mut ui, &segments, 0);
+            measured = ui.min_rect().width();
+        });
+        out.textures_delta.clear();
+
+        assert!(
+            measured <= available,
+            "five segments measured {measured} px, exceeding the {available} px \
+             content width at the 940 px minimum window size"
         );
     }
 }
