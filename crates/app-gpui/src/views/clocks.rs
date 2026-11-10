@@ -1364,9 +1364,7 @@ mod tests {
     fn cross_row_move_is_a_complete_permutation() {
         let grid = StaticGrid::new(0.0, 0.0, 940.0, 5);
         let (x, y) = grid.slot_origin(3);
-        let hover = grid
-            .slot_at(x + 1.0, y + 10.0)
-            .expect("inside");
+        let hover = grid.slot_at(x + 1.0, y + 10.0).expect("inside");
         assert_eq!(hover, 3);
         let order = reordered(&ids(5), 1, hover);
         assert_eq!(order, vec!["c0", "c2", "c3", "c1", "c4"]);
@@ -1379,7 +1377,7 @@ mod tests {
     fn preview_placeholder_is_the_static_hover_slot() {
         let (placements, placeholder) = preview_slots(5, Some(1), Some(3));
         assert_eq!(placeholder, Some(3));
-        let mut by_target = vec![None; 5];
+        let mut by_target = [None; 5];
         for (source, target) in placements {
             by_target[target] = Some(source);
         }
@@ -1410,7 +1408,7 @@ mod tests {
 
     #[test]
     fn search_matches_zone_or_resident() {
-        let entries = vec![entry("a", "Europe/Kyiv", &["Ada Lovelace"])];
+        let entries = [entry("a", "Europe/Kyiv", &["Ada Lovelace"])];
         assert!(matches_search(&entries[0], "kyiv"));
         assert!(matches_search(&entries[0], "europe"));
         assert!(matches_search(&entries[0], "ada"));

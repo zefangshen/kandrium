@@ -17,8 +17,8 @@ use crate::app::AppShell;
 use crate::assets::{Icon, icon};
 use crate::theme::{Text, TextStyled, Tokens};
 use crate::views::clocks::{
-    ClockEntry, ClockState, ConfirmKind, FormKind, PersonStatus, city_label, picker_rows,
-    starts_label, until_label, zone_is_added,
+    ClockState, ConfirmKind, FormKind, PersonStatus, city_label, picker_rows, starts_label,
+    until_label, zone_is_added,
 };
 
 /// Full-section scrim with a centred panel.
@@ -305,7 +305,7 @@ pub fn inspector(
         );
     }
     for status in &people.residents {
-        residents = residents.child(resident_row(state, entry, status, t, cx));
+        residents = residents.child(resident_row(state, status, t, cx));
     }
 
     let mut visitors = div().flex().flex_col().gap(px(2.));
@@ -449,7 +449,6 @@ fn section_label(label: &str, t: &Tokens) -> AnyElement {
 
 fn resident_row(
     state: &ClockState,
-    entry: &ClockEntry,
     status: &PersonStatus,
     t: &Tokens,
     cx: &mut Context<AppShell>,
