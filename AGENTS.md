@@ -33,7 +33,7 @@ Workspace, edition 2024. All comments, identifiers, and docs are in English.
   `archive_all_cards` remains. Preserve the names and schemas of the exposed
   tools — MCP clients may depend on them.
 - The SQL schema lives as numbered files at the workspace root
-  (`migrations/0001_initial_schema.sql` … `migrations/0007_project_source.sql`)
+  (`migrations/0001_initial_schema.sql` … `migrations/0010_clock_travels.sql`)
   and is embedded into `crates/core/src/db/migrations.rs` at compile time.
   `db::run_schema` applies them through `rusqlite_migration` via
   `PRAGMA user_version`. v1 (`0001_initial_schema.sql`) is identical in shape
@@ -47,7 +47,8 @@ Workspace, edition 2024. All comments, identifiers, and docs are in English.
   adds `area_card_order`, the unified display order for non-project boards; v6
   adds the reversible `projects.archived` / `archived_at` flag; v7 adds the
   free-form `projects.source` reference (local path or URL) shown on the
-  Overview. The `db` module is split into `db/connection.rs` (open/path/legacy
+  Overview; v8–v10 add the Clocks data (`clocks`, then `clock_people`, then
+  `clock_travels`). The `db` module is split into `db/connection.rs` (open/path/legacy
   migration/bootstrap), `db/migrations.rs` (schema + runner), and
   `db/backup.rs` (snapshots + integrity). `db::bootstrap(&mut Connection,
   &Path)` is the single boot path for both front-ends: it runs
@@ -154,7 +155,7 @@ importer) and historical reference comments.
 ```sh
 cargo run -p kandrium-app          # desktop app (also: just run)
 cargo run -p kandrium-mcp          # MCP stdio server
-cargo test --workspace             # ~185 tests, must stay green
+cargo test --workspace             # 264 tests, must stay green
 cargo clippy --workspace           # must be warning-free
 cargo fmt
 cargo packager --release           # build Kandrium.app + DMG (packager.json)
@@ -261,6 +262,31 @@ shell (screen capture blocked) — ask the user to confirm UI changes.
   offer the same actions in their context menu. New files are Markdown only
   (`.md`/`.markdown`); PDFs are added by upload. Open tabs persist as
   root-relative paths; Markdown editor mode is per tab, not persisted.
+
+- **Clocks** (`views/wclock.rs`, core `clocks.rs`) is the fifth section: one
+  vertically scrolling page of city cards with search, a 12/24-hour toggle,
+  and a city picker over `jiff`'s bundled IANA database. Cards keep the
+  three-across width (`(available − 2 gaps) / 3`, 160 px floor) and wrap onto
+  further rows — there is no pagination. Dragging a card reorders cities via
+  the shared `dnd::GridZone` insertion index and `anim` reflow/snap-back
+  curves, then `clocks::reorder_clocks` (complete permutation); the
+  "Move earlier / Move later" menu items stay as a fallback and drag is only
+  offered while the search is empty. Cities, people, and travel windows live
+  in SQLite (`clocks`, `clock_people`, `clock_travels`, schema v8–v10); every
+  mutation goes through `kandrium-core`. Placement is pure:
+  `placement_at` / `placement_for` pick the latest-starting trip whose window
+  contains the frame's instant (`starts_at <= now < ends_at`, end exclusive;
+  an open-ended trip never expires). A trip keeps the person's home
+  (`home_clock_id`) and records the current city as `origin_clock_id`; ending
+  early writes `ends_at`, and relocation cancels trips to the old and new
+  home. Removing a person cascades their travel rows. Removing a clock stays
+  blocked while it has residents (`ON DELETE RESTRICT`), but active visits to
+  that city are cancelled first and both clock references fall to NULL
+  (`ON DELETE SET NULL`) so trip history survives. The view caches rows and
+  resolved zones and takes one `Timestamp::now()` per frame: a single
+  `request_repaint_after` targets the nearer of the next minute and the
+  nearest pending travel start/expiry. Expiry is evaluated from `now` against
+  the cached rows — never by polling the database on the tick.
 
 ## Headless UI tests
 

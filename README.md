@@ -6,6 +6,8 @@ Kandrium is a local-first Kanban desktop app with a companion [Model Context Pro
 - **MCP server over stdio** exposing 13 tools for board/column-archive/card operations
 - **Multi-process sync** — changes made through MCP appear in the running app automatically
 - **Virtual "All" board** that aggregates every card into To Do / In Progress / Done with its own ordering
+- **Notes, Documents, and Projects** alongside the board — Markdown notes with vim-modal editing, PDF/Markdown documents, and project workspaces with their own board and files
+- **Clocks** — a world-clock page with saved cities, residents, visitors, and temporary travel/relocation
 - **Local SQLite storage** (WAL mode), no account and no network
 
 ## Features
@@ -15,6 +17,10 @@ Kandrium is a local-first Kanban desktop app with a companion [Model Context Pro
 - Drag-and-drop cards and columns with animated reflow and settle flights
 - Card editor modal, inline column creation, archive/restore, and per-column "archive all"
 - Archived view as a filterable data table
+- Notes: Markdown files with debounced autosave and vim-modal editing (also used in project docs and the card description)
+- Documents: PDFs with annotation sidecars and Markdown files, organized in folders with upload and inline creation
+- Projects: a folder/project tree, one board per project, short unique identifiers, a tabbed Overview/Tasks detail pane, and per-project documents
+- Clocks: searchable city list, 12/24-hour toggle, three cities per page, residents and visitors, and per-person travel windows that expire on their own
 - Dark / light appearance (persisted)
 - One-click MCP access: create, move, update, archive, and query cards from an AI assistant
 
@@ -62,7 +68,7 @@ cargo build --release -p kandrium-app
 ## Test and lint
 
 ```sh
-cargo test --workspace     # ~185 tests, including headless egui geometry tests
+cargo test --workspace     # 264 tests, including headless egui geometry tests
 cargo clippy --workspace
 cargo fmt
 ```
@@ -101,7 +107,14 @@ the MCP transport.
 | Database | `KANDRIUM_DB` env var, else `<data_dir>/kandrium/kandrium.db` |
 | Backups | `<database parent>/backups/` |
 | Logs | `KANDRIUM_LOG_DIR` env var, else `<data_dir>/kandrium/logs/` |
+| Notes root | `KANDRIUM_NOTES` env var, else `<data_dir>/kandrium/notes/` |
+| Documents root | `KANDRIUM_DOCS` env var, else `<data_dir>/kandrium/documents/` |
+| Projects root | `KANDRIUM_PROJECTS` env var, else `<data_dir>/kandrium/projects/` |
 | Legacy Electron DB (importer source) | `KANDRIUM_OLD_DB` env var, else `<data_dir>/planly/planly.db` |
+
+Clocks are stored in SQLite (schema v8–v10: `clocks`, `clock_people`,
+`clock_travels`) and have no environment variable of their own. Notes,
+documents, and project files do not live in the database.
 
 On macOS `<data_dir>` is `~/Library/Application Support`, so the default
 database is `~/Library/Application Support/kandrium/kandrium.db`.
