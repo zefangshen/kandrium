@@ -4361,7 +4361,12 @@ fn apply_document_event(tab: &mut DocTab, event: PdfEvent) {
         PdfEvent::Text { page, text } => {
             tab.page_texts.insert(page, text);
         }
-        PdfEvent::Failed { message, .. } => {
+        PdfEvent::Failed { page, message } => {
+            // The failure does not carry a scale, so drop every in-flight
+            // request for the page: the spinner must stop and a retry must not
+            // be mistaken for a render that is already running.
+            tab.pending
+                .retain(|(pending_page, _)| *pending_page != page);
             if tab.error.is_none() {
                 tab.error = Some(message);
             }
@@ -4577,5 +4582,43 @@ mod settings_tests {
                 assert!(shell.pending_sync, "still dragging, still deferred");
             })
         });
+    }
+
+    /// A failed render must clear every in-flight request for that page: the
+    /// spinner stops and a retry is not mistaken for an operation already
+    /// running. Requests for other pages stay untouched.
+    #[test]
+    fn pdf_failure_clears_the_failed_page_only() {
+        let path = PathBuf::from("missing.pdf");
+        let (worker, events) = pdf_render::PdfWorker::open(path.clone(), || {});
+        let mut tab = DocTab::pdf(
+            path.clone(),
+            "missing.pdf".to_string(),
+            worker,
+            events,
+            Vec::new(),
+        );
+        tab.pending.insert((3, 500));
+        tab.pending.insert((3, 1000));
+        tab.pending.insert((4, 1000));
+
+        apply_document_event(
+            &mut tab,
+            pdf_render::Event::Failed {
+                page: 3,
+                message: "boom".to_string(),
+            },
+        );
+
+        assert!(
+            !tab.pending.contains(&(3, 500)) && !tab.pending.contains(&(3, 1000)),
+            "both scales of the failed page must leave the in-flight set"
+        );
+        assert!(
+            tab.pending.contains(&(4, 1000)),
+            "another page's request must keep running"
+        );
+        assert_eq!(tab.pending.len(), 1);
+        assert_eq!(tab.error.as_deref(), Some("boom"));
     }
 }
