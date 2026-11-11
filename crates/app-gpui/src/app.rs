@@ -4151,19 +4151,6 @@ impl AppShell {
             .bg(t.titlebar)
             .border_b_1()
             .border_color(t.border)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(icon(Icon::FolderKanban, 16., t.accent))
-                    .child(
-                        div()
-                            .text(Text::Strong)
-                            .text_color(t.text)
-                            .child("Kandrium"),
-                    ),
-            )
             .child(self.section_control(cx))
             .child(div().flex_1())
             .child(
