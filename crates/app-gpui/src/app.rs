@@ -1735,7 +1735,7 @@ impl AppShell {
             ProjectDocDraftKind::File => self
                 .store
                 .create_project_doc(&root, &id, &folder, &name)
-                .map(|created| Some(created)),
+                .map(Some),
             ProjectDocDraftKind::Folder => self
                 .store
                 .create_project_doc_folder(&root, &id, &folder, &name)
