@@ -41,7 +41,7 @@ fn every_section_renders_its_body(cx: &mut TestAppContext) {
         (Section::Clocks, "clocks-view"),
         (Section::Notes, "notes-view"),
         (Section::Documents, "documents-view"),
-        (Section::Projects, "projects-placeholder"),
+        (Section::Projects, "projects-view"),
         (Section::Tasks, "board-view"),
     ];
     for (section, body) in expected {

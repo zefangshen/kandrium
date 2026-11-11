@@ -35,6 +35,11 @@ use crate::views::clocks::{
 };
 use crate::views::documents::{self, DocDraft, DocDraftKind, DocKind, DocTab, DocumentsState};
 use crate::views::documents_pdf;
+use crate::views::projects::{
+    self, DetailEditor, DocDraft as ProjectDocDraft, DocDraftKind as ProjectDocDraftKind,
+    ProjectConfirm, ProjectConfirmKind, ProjectDocTab, ProjectDraft, ProjectDraftKind, ProjectTab,
+    ProjectsState, TitleEdit as ProjectTitleEdit, folder_name, project_folder, sibling_projects,
+};
 use crate::views::tasks::DropTarget;
 use crate::views::{
     notes::{self, DraftKind, NameDraft, NoteTab, NotesState},
@@ -127,6 +132,10 @@ pub struct AppShell {
     clock_tick_running: Option<u64>,
     notes: NotesState,
     documents: DocumentsState,
+    projects: ProjectsState,
+    /// Board currently loaded into `board` for a project's Tasks tab. Kept
+    /// separate from `active_board_id` so the Tasks section is unaffected.
+    project_board_shown: Option<String>,
     /// Persisted UI preferences (section, vim, tree widths and collapse flags).
     settings: settings::Settings,
     settings_path: PathBuf,
@@ -162,6 +171,9 @@ impl AppShell {
         let mut documents = DocumentsState::new();
         documents.tree_open = settings.tree_open(TreePanel::Documents);
         documents.tree_w = settings.tree_width(TreePanel::Documents);
+        let mut projects = ProjectsState::new();
+        projects.tree_open = settings.tree_open(TreePanel::Projects);
+        projects.tree_w = settings.tree_width(TreePanel::Projects);
         let section = settings.section();
         let vim_mode = settings.vim_mode();
 
@@ -184,6 +196,8 @@ impl AppShell {
             clock_tick_running: None,
             notes,
             documents,
+            projects,
+            project_board_shown: None,
             settings,
             settings_path,
             vim_mode,
@@ -197,6 +211,7 @@ impl AppShell {
         match section {
             Section::Notes => shell.load_notes(),
             Section::Documents => shell.load_documents(),
+            Section::Projects => shell.load_projects(),
             _ => {}
         }
         shell
@@ -219,6 +234,10 @@ impl AppShell {
             .set_tree_open(TreePanel::Documents, self.documents.tree_open);
         self.settings
             .set_tree_width(TreePanel::Documents, self.documents.tree_w);
+        self.settings
+            .set_tree_open(TreePanel::Projects, self.projects.tree_open);
+        self.settings
+            .set_tree_width(TreePanel::Projects, self.projects.tree_w);
         let path = self.settings_path();
         if let Err(error) = self.settings.save(&path) {
             kandrium_core::logging::warn!("could not write settings {}: {error}", path.display());
@@ -242,6 +261,16 @@ impl AppShell {
                 vim.set_enabled(enabled, &editor, cx);
             }
         }
+        if let Some(editor) = self.projects.detail_editor.as_mut() {
+            let description = editor.description.clone();
+            editor.vim.set_enabled(enabled, &description, cx);
+        }
+        for tab in &mut self.projects.tabs {
+            if let ProjectTab::Doc(doc) = tab {
+                let editor = doc.editor.clone();
+                doc.vim.set_enabled(enabled, &editor, cx);
+            }
+        }
         self.persist_settings();
         cx.notify();
     }
@@ -262,6 +291,21 @@ impl AppShell {
             self.documents.tree_w = width;
             cx.notify();
         }
+    }
+
+    /// Live width while the project tree splitter is dragged.
+    pub(crate) fn set_projects_tree_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        let width = settings::clamp_tree_width(width);
+        if (self.projects.tree_w - width).abs() > 0.5 {
+            self.projects.tree_w = width;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn toggle_projects_tree(&mut self, cx: &mut Context<Self>) {
+        self.projects.tree_open = !self.projects.tree_open;
+        self.persist_settings();
+        cx.notify();
     }
 
     /// Persist after a splitter drag ends.
@@ -291,13 +335,18 @@ impl AppShell {
             self.flush_documents(cx);
             self.save_documents_session();
         }
+        if self.section == Section::Projects {
+            self.save_project_description(cx);
+            self.flush_project_docs(cx);
+            self.project_board_shown = None;
+        }
         self.section = section;
         match section {
             Section::Tasks => self.load_tasks(),
             Section::Clocks => self.load_clocks(),
             Section::Notes => self.load_notes(),
             Section::Documents => self.load_documents(),
-            Section::Projects => {}
+            Section::Projects => self.load_projects(),
         }
         if section != Section::Clocks {
             self.invalidate_clock_tick();
@@ -669,16 +718,1035 @@ impl AppShell {
     }
 
     fn reload_active_board(&mut self) {
-        if let Some(id) = self.active_board_id.clone()
-            && let Err(error) = self.load_board(&id)
-        {
+        self.reload_displayed_board();
+    }
+
+    /// Reload whichever board the current section is showing: a project's
+    /// board while its Tasks tab is open, otherwise the Tasks board.
+    fn reload_displayed_board(&mut self) {
+        let target = self
+            .project_board_shown
+            .clone()
+            .or_else(|| self.active_board_id.clone());
+        let Some(id) = target else {
+            return;
+        };
+        let result = if self.project_board_shown.is_some() {
+            self.load_project_board(&id)
+        } else {
+            self.load_board(&id)
+        };
+        if let Err(error) = result {
             self.board_error = Some(error);
         }
     }
 
+    /// Load a project's board into the shared surface without touching
+    /// `active_board_id`; the Tasks section keeps its own board selection.
+    fn load_project_board(&mut self, id: &str) -> Result<(), String> {
+        match self.store.board(id) {
+            Ok(board) => {
+                self.project_board_shown = Some(board.id.clone());
+                self.board = Some(board);
+                self.board_error = None;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Point the shared board surface at the project Tasks tab when it is
+    /// active, and release it when it is not.
+    fn sync_project_board(&mut self) {
+        match self.projects.project_board_id().map(str::to_string) {
+            Some(want) if self.project_board_shown.as_deref() == Some(want.as_str()) => {}
+            Some(want) => {
+                if let Err(error) = self.load_project_board(&want) {
+                    self.board_error = Some(error);
+                }
+            }
+            None => self.project_board_shown = None,
+        }
+    }
+
     // -----------------------------------------------------------------------
-    // Clocks
+    // Projects
     // -----------------------------------------------------------------------
+
+    /// Reload the tree and archived list, keeping a valid selection. Project
+    /// tabs are rebuilt only when the selected project actually changes.
+    fn load_projects(&mut self) {
+        let root = match self.store.projects_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.projects.error = Some(error.clone());
+                return;
+            }
+        };
+        // `read_dir` reports canonical child paths. Canonicalize the root once
+        // so `rel_path` (used by every doc read/write) strips successfully even
+        // when the configured root runs through a symlink (`/tmp`, `/var`).
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        let tree = match self.store.project_tree() {
+            Ok(tree) => tree,
+            Err(error) => {
+                self.projects.error = Some(error.clone());
+                return;
+            }
+        };
+        let archived = match self.store.archived_projects() {
+            Ok(archived) => archived,
+            Err(error) => {
+                self.projects.error = Some(error.clone());
+                return;
+            }
+        };
+        self.projects.root = Some(root);
+        self.projects.tree = tree;
+        self.projects.archived = archived;
+        self.projects.error = None;
+
+        let selected_valid = self.projects.selected.as_deref().is_some_and(|id| {
+            kandrium_core::projects::find_project(&self.projects.tree, id).is_some()
+                || self
+                    .projects
+                    .archived
+                    .iter()
+                    .any(|project| project.id == id)
+        });
+        if !selected_valid {
+            self.projects.selected = if self.projects.show_archived {
+                self.projects
+                    .archived
+                    .first()
+                    .map(|project| project.id.clone())
+            } else {
+                projects::first_project(&self.projects.tree).map(|project| project.id.clone())
+            };
+        }
+
+        if self.projects.tabs_project != self.projects.selected {
+            let keep_tasks = self.projects.active_is_tasks() && self.projects.selected.is_some();
+            self.projects.tabs = vec![ProjectTab::Overview, ProjectTab::Tasks];
+            self.projects.active = if keep_tasks { 1 } else { 0 };
+            self.projects.tabs_project = self.projects.selected.clone();
+            self.projects.detail_editor = None;
+            self.projects.title_edit = None;
+            self.projects.doc_draft = None;
+            self.projects.doc_folder = PathBuf::new();
+        }
+        self.reload_project_detail();
+    }
+
+    /// Read the selected project, its summary and its document tree.
+    fn reload_project_detail(&mut self) {
+        let (Some(root), Some(id)) = (self.projects.root.clone(), self.projects.selected.clone())
+        else {
+            self.projects.detail = None;
+            self.projects.summary = None;
+            self.projects.files.clear();
+            return;
+        };
+        match self.store.project(&id) {
+            Ok(project) => {
+                self.projects.summary = self.store.project_summary(&root, &id).ok();
+                self.projects.files = self.store.project_files(&root, &id).unwrap_or_default();
+                self.projects.detail = Some(project);
+            }
+            Err(error) => {
+                self.projects.error = Some(error);
+                self.projects.detail = None;
+                self.projects.summary = None;
+                self.projects.files.clear();
+            }
+        }
+    }
+
+    /// Create the Overview inputs once the selected project is known. Called
+    /// from the render path, which is the first place with a window.
+    fn ensure_project_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.projects.detail.clone() else {
+            self.projects.detail_editor = None;
+            return;
+        };
+        if self
+            .projects
+            .detail_editor
+            .as_ref()
+            .is_some_and(|editor| editor.project_id == project.id)
+        {
+            return;
+        }
+        let identifier =
+            cx.new(|cx| InputState::new(window, cx).default_value(project.identifier.clone()));
+        let source = cx.new(|cx| InputState::new(window, cx).default_value(project.source.clone()));
+        let description =
+            cx.new(|cx| TextareaState::new(window, cx).default_value(project.description.clone()));
+        let mut vim = crate::vim::VimSession::new();
+        vim.set_enabled(self.vim_mode, &description, cx);
+        self.projects.detail_editor = Some(DetailEditor {
+            project_id: project.id.clone(),
+            identifier,
+            source,
+            description,
+            vim,
+            saved_description: project.description,
+        });
+    }
+
+    fn ensure_project_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.projects.filter_input.is_some() {
+            return;
+        }
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter projects"));
+        cx.subscribe_in(
+            &input,
+            window,
+            |this: &mut AppShell, input, event: &InputEvent, _window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.projects.filter = input.read(cx).value().to_string();
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+        self.projects.filter_input = Some(input);
+    }
+
+    pub(crate) fn select_project(
+        &mut self,
+        id: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.projects.selected.as_deref() == Some(id) {
+            return;
+        }
+        self.save_project_description(cx);
+        self.flush_project_docs(cx);
+        self.projects.selected = Some(id.to_string());
+        self.projects.selected_folder = project_folder(&self.projects.tree, id).or_else(|| {
+            self.projects
+                .archived
+                .iter()
+                .find(|p| p.id == id)
+                .and_then(|p| p.folder_id.clone())
+        });
+        let keep_tasks = self.projects.active_is_tasks();
+        self.projects.tabs = vec![ProjectTab::Overview, ProjectTab::Tasks];
+        self.projects.active = if keep_tasks { 1 } else { 0 };
+        self.projects.tabs_project = Some(id.to_string());
+        self.projects.detail_editor = None;
+        self.projects.title_edit = None;
+        self.projects.doc_draft = None;
+        self.projects.doc_folder = PathBuf::new();
+        self.projects.confirm = None;
+        self.reload_project_detail();
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_project_folder(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.projects.expanded.remove(&id) {
+            self.projects.expanded.insert(id.clone());
+        }
+        self.projects.selected_folder = Some(id);
+        cx.notify();
+    }
+
+    pub(crate) fn show_active_projects(&mut self, cx: &mut Context<Self>) {
+        self.projects.show_archived = false;
+        self.projects.selected = None;
+        self.load_projects();
+        cx.notify();
+    }
+
+    pub(crate) fn show_archived_projects(&mut self, cx: &mut Context<Self>) {
+        self.projects.show_archived = true;
+        self.projects.selected = None;
+        self.load_projects();
+        cx.notify();
+    }
+
+    pub(crate) fn begin_project_draft(
+        &mut self,
+        kind: ProjectDraftKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.projects.draft.is_some() {
+            return;
+        }
+        let placeholder = match kind {
+            ProjectDraftKind::Project => "Project name",
+            ProjectDraftKind::Folder => "Folder name",
+            ProjectDraftKind::RenameFolder => "New name",
+        };
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.projects.draft = Some(ProjectDraft {
+            kind,
+            folder: self.projects.selected_folder.clone(),
+            input,
+        });
+        self.projects.error = None;
+        cx.notify();
+    }
+
+    pub(crate) fn begin_project_folder_rename(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(name) = folder_name(&self.projects.tree, id) else {
+            return;
+        };
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(name));
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.projects.draft = Some(ProjectDraft {
+            kind: ProjectDraftKind::RenameFolder,
+            folder: Some(id.to_string()),
+            input,
+        });
+        self.projects.error = None;
+        cx.notify();
+    }
+
+    pub(crate) fn handle_project_draft_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                cx.stop_propagation();
+                self.projects.draft = None;
+                cx.notify();
+            }
+            "enter" => {
+                cx.stop_propagation();
+                self.commit_project_draft(window, cx);
+            }
+            _ => {}
+        }
+    }
+
+    fn commit_project_draft(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = &self.projects.draft else {
+            return;
+        };
+        let kind = draft.kind;
+        let folder = draft.folder.clone();
+        let name = draft.input.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            self.projects.error = Some("A name is required".into());
+            cx.notify();
+            return;
+        }
+        let result: Result<Option<String>, String> = match kind {
+            ProjectDraftKind::Project => {
+                let Some(root) = self.projects.root.clone() else {
+                    self.projects.error = Some("The projects root is unavailable".into());
+                    cx.notify();
+                    return;
+                };
+                self.store
+                    .create_project(&root, &name, folder.as_deref())
+                    .map(|project| Some(project.id))
+            }
+            ProjectDraftKind::Folder => self
+                .store
+                .create_project_folder(&name, folder.as_deref())
+                .map(|folder| {
+                    self.projects.expanded.insert(folder.id.clone());
+                    self.projects.selected_folder = Some(folder.id.clone());
+                    None
+                }),
+            ProjectDraftKind::RenameFolder => {
+                let Some(id) = folder.as_deref() else {
+                    return;
+                };
+                self.store.rename_project_folder(id, &name).map(|_| None)
+            }
+        };
+        match result {
+            Ok(selected) => {
+                if let Some(id) = selected {
+                    self.projects.selected = Some(id);
+                }
+                self.projects.draft = None;
+                self.projects.error = None;
+                self.load_projects();
+            }
+            Err(error) => self.projects.error = Some(error),
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn begin_project_drag(&mut self, id: &str, cx: &mut Context<Self>) {
+        let from_folder = project_folder(&self.projects.tree, id);
+        self.projects.drag = Some(crate::views::projects::ProjectDragState {
+            id: id.to_string(),
+            from_folder,
+            hover: None,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn hover_project_drop(&mut self, target: &str, after: bool, cx: &mut Context<Self>) {
+        let Some(drag) = &mut self.projects.drag else {
+            return;
+        };
+        let hover = Some((target.to_string(), after));
+        if drag.hover != hover {
+            drag.hover = hover;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn drop_project(
+        &mut self,
+        drag: &crate::views::projects::ProjectDrag,
+        cx: &mut Context<Self>,
+    ) {
+        let hover = self
+            .projects
+            .drag
+            .as_ref()
+            .and_then(|session| session.hover.clone());
+        self.projects.drag = None;
+        let Some((target, after)) = hover else {
+            cx.notify();
+            return;
+        };
+        let siblings = sibling_projects(&self.projects.tree, drag.from_folder.as_deref());
+        if !siblings.contains(&target) || target == drag.id {
+            cx.notify();
+            return;
+        }
+        let mut order: Vec<String> = siblings.into_iter().filter(|id| id != &drag.id).collect();
+        let index = projects::insert_index(&order, &target, after);
+        order.insert(index, drag.id.clone());
+        if let Err(error) = self.store.reorder_project(&drag.id, index) {
+            self.projects.error = Some(error);
+        } else {
+            self.load_projects();
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn begin_project_title_edit(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.projects.detail.as_ref() else {
+            return;
+        };
+        if project.id != id {
+            return;
+        }
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(project.name.clone()));
+        input.update(cx, |state, cx| state.focus(window, cx));
+        cx.subscribe_in(
+            &input,
+            window,
+            |this: &mut AppShell, _, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } | InputEvent::Blur => {
+                    this.commit_project_title(window, cx)
+                }
+                _ => {}
+            },
+        )
+        .detach();
+        self.projects.title_edit = Some(ProjectTitleEdit {
+            project_id: id.to_string(),
+            input,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn project_title_clicked(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let now = std::time::Instant::now();
+        let double = self
+            .projects
+            .last_title_click
+            .as_ref()
+            .is_some_and(|(last_id, at)| {
+                last_id == id && now.duration_since(*at) < Duration::from_millis(400)
+            });
+        if double {
+            self.projects.last_title_click = None;
+            self.begin_project_title_edit(id, window, cx);
+        } else {
+            self.projects.last_title_click = Some((id.to_string(), now));
+        }
+    }
+
+    pub(crate) fn handle_project_title_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                cx.stop_propagation();
+                self.cancel_project_title(cx);
+            }
+            "enter" => {
+                cx.stop_propagation();
+                self.commit_project_title(window, cx);
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn commit_project_title(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = self.projects.title_edit.take() else {
+            return;
+        };
+        let name = edit.input.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            self.projects.error = Some("A project name is required".into());
+            cx.notify();
+            return;
+        }
+        match self.store.rename_project(&edit.project_id, &name) {
+            Ok(_) => {
+                self.projects.detail_editor = None;
+                self.projects.error = None;
+                // The board title follows the rename; force the Tasks tab to
+                // reload so its header is not stale.
+                self.project_board_shown = None;
+                self.load_projects();
+            }
+            Err(error) => self.projects.error = Some(error),
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_project_title(&mut self, cx: &mut Context<Self>) {
+        if self.projects.title_edit.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn save_project_fields(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = &self.projects.detail_editor else {
+            return;
+        };
+        let Some(project) = &self.projects.detail else {
+            return;
+        };
+        let identifier = editor.identifier.read(cx).value().trim().to_string();
+        let source = editor.source.read(cx).value().to_string();
+        let id = project.id.clone();
+        let mut error = None;
+        if identifier != project.identifier {
+            if let Err(message) = self.store.set_project_identifier(&id, &identifier) {
+                error = Some(message);
+            }
+        }
+        if error.is_none() && source != project.source {
+            if let Err(message) = self.store.set_project_source(&id, &source) {
+                error = Some(message);
+            }
+        }
+        if let Some(error) = error {
+            self.projects.error = Some(error);
+        } else {
+            self.projects.error = None;
+            self.projects.detail_editor = None;
+            self.load_projects();
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn set_project_status(&mut self, status: &str, cx: &mut Context<Self>) {
+        let Some(project) = &self.projects.detail else {
+            return;
+        };
+        let id = project.id.clone();
+        match self.store.update_project(&id, None, Some(status)) {
+            Ok(_) => {
+                self.projects.error = None;
+                self.reload_project_detail();
+            }
+            Err(error) => self.projects.error = Some(error),
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn save_project_description(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = &self.projects.detail_editor else {
+            return;
+        };
+        let Some(project) = &self.projects.detail else {
+            return;
+        };
+        let description = editor.description.read(cx).value().to_string();
+        if description == editor.saved_description {
+            return;
+        }
+        let id = project.id.clone();
+        match self.store.update_project(&id, Some(&description), None) {
+            Ok(_) => {
+                if let Some(editor) = self.projects.detail_editor.as_mut() {
+                    editor.saved_description = description;
+                }
+                self.projects.error = None;
+            }
+            Err(error) => self.projects.error = Some(error),
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn archive_selected_project(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = &self.projects.detail else {
+            return;
+        };
+        let id = project.id.clone();
+        match self.store.archive_project(&id) {
+            Ok(()) => {
+                self.projects.show_archived = false;
+                self.projects.selected = None;
+                self.load_projects();
+            }
+            Err(error) => self.projects.error = Some(error),
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn restore_selected_project(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = &self.projects.detail else {
+            return;
+        };
+        let id = project.id.clone();
+        match self.store.unarchive_project(&id) {
+            Ok(()) => {
+                self.projects.show_archived = false;
+                self.projects.selected = Some(id);
+                self.load_projects();
+            }
+            Err(error) => self.projects.error = Some(error),
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn ask_delete_selected_project(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = &self.projects.detail else {
+            return;
+        };
+        self.projects.confirm = Some(ProjectConfirm {
+            kind: ProjectConfirmKind::DeleteProject,
+            id: project.id.clone(),
+            name: project.name.clone(),
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn ask_delete_folder(&mut self, id: &str, name: &str, cx: &mut Context<Self>) {
+        self.projects.confirm = Some(ProjectConfirm {
+            kind: ProjectConfirmKind::DeleteFolder,
+            id: id.to_string(),
+            name: name.to_string(),
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_project_confirm(&mut self, cx: &mut Context<Self>) {
+        if self.projects.confirm.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn confirm_project_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(confirm) = self.projects.confirm.take() else {
+            return;
+        };
+        let Some(root) = self.projects.root.clone() else {
+            return;
+        };
+        let result = match confirm.kind {
+            ProjectConfirmKind::DeleteProject => {
+                if self.projects.selected.as_deref() == Some(confirm.id.as_str()) {
+                    self.projects.selected = None;
+                }
+                self.store.delete_project(&root, &confirm.id)
+            }
+            ProjectConfirmKind::DeleteFolder => {
+                self.projects.selected_folder = None;
+                self.store.delete_project_folder(&root, &confirm.id)
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.projects.error = None;
+                self.load_projects();
+            }
+            Err(error) => self.projects.error = Some(error),
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn activate_project_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.projects.tabs.len() || self.projects.active == index {
+            return;
+        }
+        if let Some(doc) = self.projects.active_doc_index() {
+            self.save_project_doc(doc, cx);
+        }
+        self.projects.active = index;
+        cx.notify();
+    }
+
+    // ---- Project documents -------------------------------------------------
+
+    pub(crate) fn open_project_doc(
+        &mut self,
+        rel: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self.projects.tab_index(&rel) {
+            self.projects.active = index;
+            if let Some(ProjectTab::Doc(doc)) = self.projects.tabs.get(index) {
+                let editor = doc.editor.clone();
+                editor.update(cx, |state, cx| state.focus(window, cx));
+            }
+            cx.notify();
+            return;
+        }
+        let (Some(root), Some(id)) = (self.projects.root.clone(), self.projects.selected.clone())
+        else {
+            return;
+        };
+        match self.store.read_project_doc(&root, &id, &rel) {
+            Ok(text) => {
+                let editor =
+                    cx.new(|cx| TextareaState::new(window, cx).default_value(text.clone()));
+                let mut session = crate::vim::VimSession::new();
+                session.set_enabled(self.vim_mode, &editor, cx);
+                cx.observe(&editor, |this: &mut AppShell, editor, cx| {
+                    this.project_doc_edited(&editor, cx)
+                })
+                .detach();
+                let name = rel
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                self.projects.tabs.push(ProjectTab::Doc(ProjectDocTab {
+                    rel,
+                    name,
+                    editor: editor.clone(),
+                    vim: session,
+                    preview: false,
+                    saved: text,
+                    dirty: false,
+                    generation: 0,
+                }));
+                self.projects.active = self.projects.tabs.len() - 1;
+                self.projects.error = None;
+                editor.update(cx, |state, cx| state.focus(window, cx));
+            }
+            Err(error) => self.projects.error = Some(error),
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn close_project_doc(&mut self, index: usize, cx: &mut Context<Self>) {
+        let closable: Vec<bool> = self
+            .projects
+            .tabs
+            .iter()
+            .map(ProjectTab::is_closable)
+            .collect();
+        let Some(active) = projects::close_index(&closable, self.projects.active, index) else {
+            return;
+        };
+        self.save_project_doc(index, cx);
+        self.projects.tabs.remove(index);
+        self.projects.active = active;
+        cx.notify();
+    }
+
+    fn project_doc_edited(&mut self, editor: &Entity<TextareaState>, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .projects
+            .tabs
+            .iter()
+            .position(|tab| matches!(tab, ProjectTab::Doc(doc) if doc.editor == *editor))
+        else {
+            return;
+        };
+        let value = editor.read(cx).value().to_string();
+        let ProjectTab::Doc(tab) = &mut self.projects.tabs[index] else {
+            return;
+        };
+        if value == tab.saved {
+            if tab.dirty {
+                tab.dirty = false;
+                cx.notify();
+            }
+            return;
+        }
+        tab.dirty = true;
+        tab.generation = tab.generation.wrapping_add(1);
+        let generation = tab.generation;
+        let rel = tab.rel.clone();
+        cx.notify();
+        let selected = self.projects.selected.clone();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(crate::views::projects::AUTOSAVE)
+                .await;
+            this.update(cx, |this, cx| {
+                if this.projects.selected == selected {
+                    this.autosave_project_doc(&rel, generation, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn autosave_project_doc(&mut self, rel: &Path, generation: u64, cx: &mut Context<Self>) {
+        let Some(index) = self.projects.tab_index(rel) else {
+            return;
+        };
+        if let Some(ProjectTab::Doc(tab)) = self.projects.tabs.get(index)
+            && tab.generation != generation
+        {
+            return;
+        }
+        self.save_project_doc(index, cx);
+    }
+
+    fn save_project_doc(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(ProjectTab::Doc(tab)) = self.projects.tabs.get(index) else {
+            return;
+        };
+        if !tab.dirty {
+            return;
+        }
+        let (Some(root), Some(id)) = (self.projects.root.clone(), self.projects.selected.clone())
+        else {
+            return;
+        };
+        let rel = tab.rel.clone();
+        let value = tab.editor.read(cx).value().to_string();
+        match self.store.write_project_doc(&root, &id, &rel, &value) {
+            Ok(()) => {
+                if let Some(ProjectTab::Doc(tab)) = self.projects.tabs.get_mut(index) {
+                    tab.saved = value;
+                    tab.dirty = false;
+                }
+                self.projects.error = None;
+            }
+            Err(error) => self.projects.error = Some(error),
+        }
+        cx.notify();
+    }
+
+    /// Write every dirty project document; called on project and section
+    /// switches so a tab close can never lose an edit.
+    pub(crate) fn flush_project_docs(&mut self, cx: &mut Context<Self>) {
+        for index in 0..self.projects.tabs.len() {
+            self.save_project_doc(index, cx);
+        }
+    }
+
+    pub(crate) fn toggle_project_doc_preview(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.projects.active_doc_index() else {
+            return;
+        };
+        let Some(ProjectTab::Doc(tab)) = self.projects.tabs.get_mut(index) else {
+            return;
+        };
+        tab.preview = !tab.preview;
+        let editor = tab.editor.clone();
+        editor.update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
+    }
+
+    pub(crate) fn handle_project_doc_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.projects.active_doc_index() else {
+            return;
+        };
+        let Some(ProjectTab::Doc(tab)) = self.projects.tabs.get(index) else {
+            return;
+        };
+        if tab.preview {
+            return;
+        }
+        let editor = tab.editor.clone();
+        if !editor.read(cx).focus_handle(cx).is_focused(window) {
+            return;
+        }
+        let outcome = match self.projects.tabs.get_mut(index) {
+            Some(ProjectTab::Doc(tab)) => tab.vim.handle_key(event, &editor, window, cx),
+            _ => return,
+        };
+        if outcome.handled {
+            cx.stop_propagation();
+            cx.notify();
+        }
+        match outcome.ex {
+            Some(vim::ExCommand::Write) => self.save_project_doc(index, cx),
+            Some(vim::ExCommand::Close) => self.close_project_doc(index, cx),
+            None => {
+                if event.keystroke.key == "escape" && !outcome.handled {
+                    cx.stop_propagation();
+                    self.close_project_doc(index, cx);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn handle_project_description_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = &self.projects.detail_editor else {
+            return;
+        };
+        let description = editor.description.clone();
+        if !description.read(cx).focus_handle(cx).is_focused(window) {
+            return;
+        }
+        let outcome = self
+            .projects
+            .detail_editor
+            .as_mut()
+            .map(|editor| editor.vim.handle_key(event, &description, window, cx));
+        let Some(outcome) = outcome else {
+            return;
+        };
+        if outcome.handled {
+            cx.stop_propagation();
+            cx.notify();
+        }
+        if matches!(outcome.ex, Some(vim::ExCommand::Write)) {
+            self.save_project_description(cx);
+        }
+    }
+
+    pub(crate) fn begin_project_doc_draft(
+        &mut self,
+        kind: ProjectDocDraftKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let folder = self.projects.doc_folder.clone();
+        self.begin_project_doc_draft_in(folder, kind, window, cx);
+    }
+
+    pub(crate) fn begin_project_doc_draft_in(
+        &mut self,
+        folder: PathBuf,
+        kind: ProjectDocDraftKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.projects.doc_draft.is_some() {
+            return;
+        }
+        let placeholder = match kind {
+            ProjectDocDraftKind::File => "name.md",
+            ProjectDocDraftKind::Folder => "Folder name",
+        };
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.projects.doc_draft = Some(ProjectDocDraft {
+            kind,
+            folder,
+            input,
+        });
+        self.projects.error = None;
+        cx.notify();
+    }
+
+    pub(crate) fn handle_project_doc_draft_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                cx.stop_propagation();
+                self.projects.doc_draft = None;
+                cx.notify();
+            }
+            "enter" => {
+                cx.stop_propagation();
+                self.commit_project_doc_draft(window, cx);
+            }
+            _ => {}
+        }
+    }
+
+    fn commit_project_doc_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = &self.projects.doc_draft else {
+            return;
+        };
+        let kind = draft.kind;
+        let folder = draft.folder.clone();
+        let name = draft.input.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            self.projects.error = Some("A name is required".into());
+            cx.notify();
+            return;
+        }
+        let (Some(root), Some(id)) = (self.projects.root.clone(), self.projects.selected.clone())
+        else {
+            return;
+        };
+        let result = match kind {
+            ProjectDocDraftKind::File => self
+                .store
+                .create_project_doc(&root, &id, &folder, &name)
+                .map(|created| Some(created)),
+            ProjectDocDraftKind::Folder => self
+                .store
+                .create_project_doc_folder(&root, &id, &folder, &name)
+                .map(|_| None),
+        };
+        match result {
+            Ok(created) => {
+                self.projects.doc_draft = None;
+                self.projects.doc_folder = folder;
+                self.projects.error = None;
+                self.reload_project_detail();
+                if let Some(created) = created
+                    && let Some(rel) = self.projects.rel_path(&created)
+                {
+                    self.open_project_doc(rel, window, cx);
+                }
+            }
+            Err(error) => self.projects.error = Some(error),
+        }
+        cx.notify();
+    }
 
     /// Read one consistent snapshot of cities, people and trips. Rendering and
     /// the minute tick work from this cache, so a tick never touches SQLite.
@@ -754,7 +1822,10 @@ impl AppShell {
     /// Whether the foreground section reads the database and therefore needs
     /// the external-change watcher. Notes and Documents are filesystem-backed.
     fn wants_watcher(&self) -> bool {
-        matches!(self.section, Section::Tasks | Section::Clocks)
+        matches!(
+            self.section,
+            Section::Tasks | Section::Clocks | Section::Projects
+        )
     }
 
     /// Stop the watcher thread and retire its pump loop.
@@ -819,10 +1890,15 @@ impl AppShell {
             self.pending_sync = true;
             return;
         }
+        if self.section == Section::Projects && self.projects.is_busy() {
+            self.pending_sync = true;
+            return;
+        }
         match self.section {
             Section::Tasks => self.load_tasks(),
             Section::Clocks => self.load_clocks(),
-            Section::Notes | Section::Documents | Section::Projects => return,
+            Section::Projects => self.load_projects(),
+            Section::Notes | Section::Documents => return,
         }
         cx.notify();
     }
@@ -3143,14 +4219,23 @@ impl AppShell {
                 }
                 element.into_any_element()
             }
-            Section::Projects => placeholder::message(
-                "projects-placeholder",
-                Icon::Folder,
-                "Projects",
-                "Not ported yet. The project tree, overview and documents land in a later stage.",
-                &t,
-            )
-            .into_any_element(),
+            Section::Projects => {
+                self.ensure_project_filter(window, cx);
+                self.ensure_project_editor(window, cx);
+                self.sync_project_board();
+                projects::projects_view(
+                    &self.projects,
+                    self.board
+                        .as_ref()
+                        .filter(|_| self.project_board_shown.is_some()),
+                    self.drop_target.as_ref(),
+                    self.dragging_card.as_deref(),
+                    &t,
+                    window,
+                    cx,
+                )
+                .into_any_element()
+            }
         }
     }
 
@@ -3305,7 +4390,11 @@ impl Render for AppShell {
         }
         // An external change that arrived mid-drag lands once the drop has
         // finished, so the board never rearranges under the pointer.
-        if self.pending_sync && self.dragging_card.is_none() && self.drop_target.is_none() {
+        if self.pending_sync
+            && self.dragging_card.is_none()
+            && self.drop_target.is_none()
+            && !(self.section == Section::Projects && self.projects.is_busy())
+        {
             self.pending_sync = false;
             self.apply_external_change(cx);
         }
@@ -3411,7 +4500,7 @@ mod settings_tests {
         let path = seeded_db(dir.path());
         cx.update(gpui_kit::init);
         let boot = path.clone();
-        let (view, mut cx) =
+        let (view, cx) =
             cx.add_window_view(move |_window, _cx| AppShell::with_store(Store::open_path(boot)));
         cx.update(|window, cx| window.render_frame(cx));
 
@@ -3452,7 +4541,7 @@ mod settings_tests {
         let path = seeded_db(dir.path());
         cx.update(gpui_kit::init);
         let boot = path.clone();
-        let (view, mut cx) =
+        let (view, cx) =
             cx.add_window_view(move |_window, _cx| AppShell::with_store(Store::open_path(boot)));
         cx.update(|window, cx| window.render_frame(cx));
 
