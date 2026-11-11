@@ -336,6 +336,7 @@ impl AppShell {
             self.save_documents_session();
         }
         if self.section == Section::Projects {
+            self.flush_project_fields(cx);
             self.save_project_description(cx);
             self.flush_project_docs(cx);
             self.project_board_shown = None;
@@ -920,6 +921,7 @@ impl AppShell {
         if self.projects.selected.as_deref() == Some(id) {
             return;
         }
+        self.flush_project_fields(cx);
         self.save_project_description(cx);
         self.flush_project_docs(cx);
         self.projects.selected = Some(id.to_string());
@@ -1238,34 +1240,44 @@ impl AppShell {
     }
 
     pub(crate) fn save_project_fields(&mut self, cx: &mut Context<Self>) {
-        let Some(editor) = &self.projects.detail_editor else {
+        if !self.flush_project_fields(cx) {
+            cx.notify();
             return;
+        }
+        self.projects.error = None;
+        self.projects.detail_editor = None;
+        self.load_projects();
+        cx.notify();
+    }
+
+    /// Persist the Overview identifier and source without closing the editor
+    /// or reloading the tree. Used by Save and whenever the project is about
+    /// to stop being displayed, so a valid edit is not silently dropped on a
+    /// switch (matching egui's commit-on-blur). Returns `false` when a field
+    /// was rejected; the message is left in `projects.error`.
+    fn flush_project_fields(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(editor) = &self.projects.detail_editor else {
+            return true;
         };
         let Some(project) = &self.projects.detail else {
-            return;
+            return true;
         };
         let identifier = editor.identifier.read(cx).value().trim().to_string();
         let source = editor.source.read(cx).value().to_string();
         let id = project.id.clone();
-        let mut error = None;
-        if identifier != project.identifier {
-            if let Err(message) = self.store.set_project_identifier(&id, &identifier) {
-                error = Some(message);
-            }
-        }
-        if error.is_none() && source != project.source {
-            if let Err(message) = self.store.set_project_source(&id, &source) {
-                error = Some(message);
-            }
-        }
-        if let Some(error) = error {
+        if identifier != project.identifier
+            && let Err(error) = self.store.set_project_identifier(&id, &identifier)
+        {
             self.projects.error = Some(error);
-        } else {
-            self.projects.error = None;
-            self.projects.detail_editor = None;
-            self.load_projects();
+            return false;
         }
-        cx.notify();
+        if source != project.source
+            && let Err(error) = self.store.set_project_source(&id, &source)
+        {
+            self.projects.error = Some(error);
+            return false;
+        }
+        true
     }
 
     pub(crate) fn set_project_status(&mut self, status: &str, cx: &mut Context<Self>) {
