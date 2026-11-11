@@ -1907,7 +1907,16 @@ impl AppShell {
         match self.section {
             Section::Tasks => self.load_tasks(),
             Section::Clocks => self.load_clocks(),
-            Section::Projects => self.load_projects(),
+            Section::Projects => {
+                self.load_projects();
+                // The tree/detail reload above does not touch the board
+                // surface. Refresh an open project board through the same
+                // displayed-board path as a drop; this only replaces
+                // `self.board`, so drafts, tabs and the detail editor stay.
+                if self.project_board_shown.is_some() {
+                    self.reload_displayed_board();
+                }
+            }
             Section::Notes | Section::Documents => return,
         }
         cx.notify();
