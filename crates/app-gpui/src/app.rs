@@ -47,7 +47,8 @@ use crate::views::{
 };
 use crate::vim;
 
-/// The five top-level sections, in the same order as the egui app.
+/// The five top-level sections. [`Section::ALL`] fixes the segmented
+/// control's order, which deliberately differs from the egui app.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
     Tasks,
@@ -60,10 +61,10 @@ pub enum Section {
 impl Section {
     pub const ALL: [Section; 5] = [
         Section::Tasks,
-        Section::Clocks,
+        Section::Projects,
         Section::Notes,
         Section::Documents,
-        Section::Projects,
+        Section::Clocks,
     ];
 
     pub fn label(self) -> &'static str {
