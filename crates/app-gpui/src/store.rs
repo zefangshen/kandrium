@@ -15,7 +15,11 @@
 use std::path::{Path, PathBuf};
 
 use kandrium_core::documents::{self, AnnotationDoc, DocEntry};
+use kandrium_core::fsutil::FsEntry;
 use kandrium_core::notes::{self, NoteEntry};
+use kandrium_core::projects::{
+    self as project_data, Project, ProjectFolder, ProjectNode, ProjectSummary,
+};
 use kandrium_core::{
     Board, BoardWithColumns, CardStatus, Clock, CreateCardBody, Person, ProjectChoice, Travel,
     add_clock, add_person, bootstrap, end_travel, extend_travel, get_all_board, get_board_readonly,
@@ -359,6 +363,135 @@ impl Store {
         list_project_choices(self.conn()?).map_err(|e| e.to_string())
     }
 
+    // -----------------------------------------------------------------------
+    // Projects — the tree lives in SQLite, documents on disk under
+    // `<projects root>/<project id>/`. All guards and atomic writes are core's.
+    // -----------------------------------------------------------------------
+
+    /// The projects root (`KANDRIUM_PROJECTS` honoured), created when missing.
+    pub fn projects_root(&self) -> StoreResult<PathBuf> {
+        project_data::ensure_root().map_err(|e| e.to_string())
+    }
+
+    pub fn project_tree(&self) -> StoreResult<Vec<ProjectNode>> {
+        project_data::list_tree(self.conn()?).map_err(|e| e.to_string())
+    }
+
+    pub fn project(&self, id: &str) -> StoreResult<Project> {
+        project_data::get_project(self.conn()?, id).map_err(|e| e.to_string())
+    }
+
+    pub fn project_summary(&self, root: &Path, id: &str) -> StoreResult<ProjectSummary> {
+        project_data::project_summary(self.conn()?, root, id).map_err(|e| e.to_string())
+    }
+
+    pub fn project_files(&self, root: &Path, id: &str) -> StoreResult<Vec<FsEntry>> {
+        project_data::project_files(root, id).map_err(|e| e.to_string())
+    }
+
+    pub fn archived_projects(&self) -> StoreResult<Vec<Project>> {
+        project_data::list_archived_projects(self.conn()?).map_err(|e| e.to_string())
+    }
+
+    /// Create a project with the blank template and its on-disk folder.
+    pub fn create_project(
+        &self,
+        root: &Path,
+        name: &str,
+        folder: Option<&str>,
+    ) -> StoreResult<Project> {
+        project_data::create_project(self.wconn()?, root, name, folder, "blank")
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn create_project_folder(
+        &self,
+        name: &str,
+        parent: Option<&str>,
+    ) -> StoreResult<ProjectFolder> {
+        project_data::create_folder(self.wconn()?, name, parent).map_err(|e| e.to_string())
+    }
+
+    pub fn rename_project_folder(&self, id: &str, name: &str) -> StoreResult<ProjectFolder> {
+        project_data::rename_folder(self.wconn()?, id, name).map_err(|e| e.to_string())
+    }
+
+    pub fn delete_project_folder(&self, root: &Path, id: &str) -> StoreResult<()> {
+        project_data::delete_folder(self.wconn()?, root, id).map_err(|e| e.to_string())
+    }
+
+    pub fn rename_project(&self, id: &str, name: &str) -> StoreResult<Project> {
+        project_data::rename_project(self.wconn()?, id, name).map_err(|e| e.to_string())
+    }
+
+    pub fn update_project(
+        &self,
+        id: &str,
+        description: Option<&str>,
+        status: Option<&str>,
+    ) -> StoreResult<Project> {
+        project_data::update_project(self.wconn()?, id, description, status)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn set_project_source(&self, id: &str, source: &str) -> StoreResult<Project> {
+        project_data::set_source(self.wconn()?, id, source).map_err(|e| e.to_string())
+    }
+
+    pub fn set_project_identifier(&self, id: &str, identifier: &str) -> StoreResult<Project> {
+        project_data::set_identifier(self.wconn()?, id, identifier).map_err(|e| e.to_string())
+    }
+
+    pub fn archive_project(&self, id: &str) -> StoreResult<()> {
+        project_data::archive_project(self.wconn()?, id).map_err(|e| e.to_string())
+    }
+
+    pub fn unarchive_project(&self, id: &str) -> StoreResult<()> {
+        project_data::unarchive_project(self.wconn()?, id).map_err(|e| e.to_string())
+    }
+
+    pub fn delete_project(&self, root: &Path, id: &str) -> StoreResult<()> {
+        project_data::delete_project(self.wconn()?, root, id).map_err(|e| e.to_string())
+    }
+
+    pub fn reorder_project(&self, id: &str, index: usize) -> StoreResult<()> {
+        project_data::reorder_project(self.wconn()?, id, index).map_err(|e| e.to_string())
+    }
+
+    pub fn read_project_doc(&self, root: &Path, id: &str, rel: &Path) -> StoreResult<String> {
+        project_data::read_doc(root, id, rel).map_err(|e| e.to_string())
+    }
+
+    pub fn write_project_doc(
+        &self,
+        root: &Path,
+        id: &str,
+        rel: &Path,
+        text: &str,
+    ) -> StoreResult<()> {
+        project_data::write_doc(root, id, rel, text).map_err(|e| e.to_string())
+    }
+
+    pub fn create_project_doc(
+        &self,
+        root: &Path,
+        id: &str,
+        parent_rel: &Path,
+        name: &str,
+    ) -> StoreResult<PathBuf> {
+        project_data::create_doc_file(root, id, parent_rel, name).map_err(|e| e.to_string())
+    }
+
+    pub fn create_project_doc_folder(
+        &self,
+        root: &Path,
+        id: &str,
+        parent_rel: &Path,
+        name: &str,
+    ) -> StoreResult<PathBuf> {
+        project_data::create_doc_folder(root, id, parent_rel, name).map_err(|e| e.to_string())
+    }
+
     /// Move or reorder a card on the visible board. `move_area_card` keeps the
     /// unified area order and the mirrored-project-card semantics; it falls
     /// back to `move_card` on project boards and non-status columns.
@@ -404,5 +537,111 @@ impl Store {
             set_card_area(db, card_id, area_id).map_err(|e| e.to_string())?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kandrium_core::projects::find_project;
+
+    fn temp_store(dir: &Path) -> Store {
+        let path = dir.join("kandrium.db");
+        let mut db = kandrium_core::open_db(&path).expect("open temp db");
+        kandrium_core::bootstrap(&mut db, &path).expect("bootstrap temp db");
+        Store::open_path(path)
+    }
+
+    #[test]
+    fn project_crud_round_trips_through_core() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = temp_store(dir.path());
+        let root = dir.path().join("projects");
+
+        let folder = store
+            .create_project_folder("Work", None)
+            .expect("create folder");
+        let project = store
+            .create_project(&root, "Alpha Project", Some(&folder.id))
+            .expect("create project");
+
+        let tree = store.project_tree().expect("tree");
+        let tree = tree
+            .iter()
+            .find_map(|node| match node {
+                ProjectNode::Folder { id, children, .. } if *id == folder.id => Some(children),
+                _ => None,
+            })
+            .expect("folder in tree");
+        assert_eq!(tree.len(), 1);
+        assert_eq!(
+            find_project(tree, &project.id).map(|found| found.name.as_str()),
+            Some("Alpha Project")
+        );
+
+        store.archive_project(&project.id).expect("archive");
+        assert!(store.project_tree().expect("tree").iter().all(
+            |node| matches!(node, ProjectNode::Folder { children, .. } if children.is_empty())
+        ));
+        assert_eq!(store.archived_projects().expect("archived").len(), 1);
+        store.unarchive_project(&project.id).expect("restore");
+        assert!(find_project(&store.project_tree().expect("tree"), &project.id).is_some());
+    }
+
+    #[test]
+    fn reorder_moves_only_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = temp_store(dir.path());
+        let root = dir.path().join("projects");
+        let folder = store
+            .create_project_folder("Work", None)
+            .expect("create folder");
+
+        let first = store.create_project(&root, "First", None).expect("first");
+        let second = store.create_project(&root, "Second", None).expect("second");
+        let nested = store
+            .create_project(&root, "Nested", Some(&folder.id))
+            .expect("nested");
+
+        store.reorder_project(&second.id, 0).expect("reorder");
+        let tree = store.project_tree().expect("tree");
+        let root_projects: Vec<&str> = tree
+            .iter()
+            .filter_map(|node| match node {
+                ProjectNode::Project(project) => Some(project.id.as_str()),
+                ProjectNode::Folder { .. } => None,
+            })
+            .collect();
+        assert_eq!(root_projects, vec![second.id.as_str(), first.id.as_str()]);
+        assert!(find_project(&tree, &nested.id).is_some());
+    }
+
+    #[test]
+    fn project_documents_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = temp_store(dir.path());
+        let root = dir.path().join("projects");
+        let project = store.create_project(&root, "Docs", None).expect("project");
+
+        let created = store
+            .create_project_doc(&root, &project.id, Path::new(""), "notes.md")
+            .expect("create doc");
+        store
+            .write_project_doc(&root, &project.id, Path::new("notes.md"), "hello")
+            .expect("write");
+        assert_eq!(
+            store
+                .read_project_doc(&root, &project.id, Path::new("notes.md"))
+                .expect("read"),
+            "hello"
+        );
+        assert_eq!(created.file_name().unwrap(), "notes.md");
+        assert_eq!(
+            store
+                .project_files(&root, &project.id)
+                .expect("files")
+                .len(),
+            1
+        );
     }
 }
