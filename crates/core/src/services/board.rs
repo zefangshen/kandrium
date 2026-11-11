@@ -367,8 +367,10 @@ fn persist_area_order(db: &Connection, board_id: &str, plan: &AreaOrderPlan) -> 
         return Ok(());
     }
     // IMMEDIATE: the write lock is taken up front so a concurrent backfill in
-    // the other process (app vs MCP) cannot interleave between our reads and
-    // this write.
+    // the other process (app vs MCP) cannot interleave with this delete/upsert
+    // batch. The plan's reads happened before the transaction and are not
+    // covered by the lock; a mismatch is re-derived and rewritten on the next
+    // board read.
     let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)?;
     {
         let mut del =
