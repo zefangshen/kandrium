@@ -114,13 +114,15 @@ pub fn create_named_note(root: &Path, in_dir: &Path, name: &str) -> Result<PathB
     };
     let candidate = dir.join(&file_name);
     fsutil::guard(root, &candidate)?;
-    if candidate.exists() {
-        return Err(KandriumError::new(format!(
-            "\"{file_name}\" already exists"
-        )));
+    // Exclusive create: a file that appears between the guard and the write
+    // surfaces as `AlreadyExists` instead of being truncated.
+    match fsutil::create_new_file(&candidate) {
+        Ok(()) => Ok(candidate),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(KandriumError::new(
+            format!("\"{file_name}\" already exists"),
+        )),
+        Err(error) => Err(error.into()),
     }
-    fs::write(&candidate, "")?;
-    Ok(candidate)
 }
 
 /// Create a folder named `name` inside `in_dir`, with the same name rules as
@@ -237,7 +239,10 @@ mod tests {
         let kept = create_named_note(&f.root, &f.root, "todo.markdown").unwrap();
         assert!(kept.ends_with("todo.markdown"));
 
-        assert!(create_named_note(&f.root, &f.root, "Meeting notes").is_err());
+        fs::write(&note, "keep me").unwrap();
+        let collision = create_named_note(&f.root, &f.root, "Meeting notes").unwrap_err();
+        assert_eq!(collision.to_string(), "\"Meeting notes.md\" already exists");
+        assert_eq!(fs::read_to_string(&note).unwrap(), "keep me");
         assert!(create_named_note(&f.root, &f.root, "../escape").is_err());
 
         let folder = create_named_folder(&f.root, &f.root, "Archive").unwrap();

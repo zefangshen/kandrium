@@ -126,6 +126,20 @@ pub fn write_atomic(path: &Path, bytes: impl AsRef<[u8]>) -> Result<()> {
     Ok(())
 }
 
+/// Create a new empty file at `path` without ever clobbering an existing one.
+///
+/// This is a single `create_new` open, so a concurrently created file makes
+/// the call fail with [`std::io::ErrorKind::AlreadyExists`] instead of being
+/// truncated. Used by the "create with a name the user typed" paths, where a
+/// collision must be reported rather than silently resolved.
+pub fn create_new_file(path: &Path) -> std::io::Result<()> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    Ok(())
+}
+
 /// True when `path` has one of the given case-insensitive extensions.
 pub fn has_extension(path: &Path, exts: &[&str]) -> bool {
     path.extension()
@@ -257,6 +271,19 @@ mod tests {
         let missing = root.join("created.md");
         write_atomic(&missing, "fresh").unwrap();
         assert_eq!(fs::read_to_string(&missing).unwrap(), "fresh");
+    }
+
+    #[test]
+    fn create_new_file_refuses_to_clobber() {
+        let (_tmp, root) = fixture();
+        let path = root.join("note.md");
+        create_new_file(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "");
+
+        fs::write(&path, "existing").unwrap();
+        let error = create_new_file(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "existing");
     }
 
     #[test]
