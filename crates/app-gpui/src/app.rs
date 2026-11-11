@@ -488,11 +488,9 @@ impl AppShell {
         match result {
             Ok(()) => {
                 self.board_error = None;
-                if let Some(id) = self.active_board_id.clone()
-                    && let Err(error) = self.load_board(&id)
-                {
-                    self.board_error = Some(error);
-                }
+                // The board on screen may be a project's, so reload whatever
+                // the section is displaying rather than the Tasks board.
+                self.reload_displayed_board();
             }
             Err(error) => self.board_error = Some(error),
         }

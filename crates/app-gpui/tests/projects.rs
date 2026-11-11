@@ -86,6 +86,36 @@ fn a_project_renders_its_tree_overview_tasks_and_documents(cx: &mut TestAppConte
         assert!(window.find(format!("board-card-{}", card.id)).visible());
     });
 
+    // Dropping on the project's Tasks tab must reload the project board the
+    // section is showing, not the Tasks section's own board; otherwise the
+    // project cards disappear from the surface right after the drop.
+    let in_progress = board.columns[1].id.clone();
+    cx.update(|window, cx| {
+        window.drag_to(
+            format!("board-card-{}", card.id),
+            format!("board-column-{in_progress}"),
+            cx,
+        );
+    });
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, _cx| {
+        assert!(
+            window.find(format!("board-card-{}", card.id)).visible(),
+            "the project board must stay on screen after a drop on its Tasks tab"
+        );
+    });
+    let db = kandrium_core::open_db(&path).expect("open db");
+    let moved = kandrium_core::get_board_readonly(&db, &project.board_id).expect("board");
+    assert!(
+        moved
+            .columns
+            .iter()
+            .find(|column| column.id == in_progress)
+            .is_some_and(|column| column.cards.iter().any(|c| c.id == card.id)),
+        "the drop must move the card into the project board's second column"
+    );
+    drop(db);
+
     // Overview document rows open a document tab with the shared editor.
     cx.update(|window, cx| window.click("project-tab-0", cx));
     cx.update(|window, cx| window.render_frame(cx));
