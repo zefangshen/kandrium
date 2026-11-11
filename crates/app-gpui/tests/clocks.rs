@@ -37,6 +37,32 @@ fn day_window(zone: &str, date: jiff::civil::Date) -> (i64, i64) {
     )
 }
 
+/// The civil date currently in effect in `zone`.
+///
+/// A test that builds its window from the process-local date breaks after
+/// 23:00 in zones behind the destination: "today" locally is already
+/// "tomorrow" there, so the window has ended. Deriving the date in the zone
+/// that will own the window keeps the trip active at `now` at every hour.
+fn today_in(zone: &str) -> jiff::civil::Date {
+    let zone = resolve_zone(zone).expect("known zone");
+    jiff::Timestamp::now().to_zoned(zone).date()
+}
+
+/// The civil day containing `now` in `zone`, as a half-open second range.
+///
+/// The end is the next day's start rather than 23:59:59 so `now` stays
+/// strictly inside the window in its final second and `end_travel` cannot
+/// race the midnight boundary.
+fn active_window(zone: &str) -> (i64, i64) {
+    let zone = resolve_zone(zone).expect("known zone");
+    let today = jiff::Timestamp::now().to_zoned(zone.clone()).date();
+    let tomorrow = today.tomorrow().expect("next day");
+    (
+        day_start_seconds(today, &zone).expect("start"),
+        day_start_seconds(tomorrow, &zone).expect("next start"),
+    )
+}
+
 fn travel_for(store: &Store, person_id: &str) -> Vec<kandrium_core::Travel> {
     store
         .clock_data()
@@ -141,8 +167,15 @@ fn a_trip_can_be_assigned_extended_ended_and_removed() {
     store.add_person(&home, "Ada").expect("person");
     let person_id = store.clock_data().expect("clocks").people[0].id.clone();
 
-    let today = jiff::Zoned::now().date();
-    let (starts_at, ends_at) = day_window(&destination.tz_identifier, today);
+    let today = today_in(&destination.tz_identifier);
+    let (starts_at, ends_at) = active_window(&destination.tz_identifier);
+    // The trip must be running *now*: the old process-local date built a
+    // window that had already closed late in the evening.
+    let now = jiff::Timestamp::now().as_second();
+    assert!(
+        starts_at <= now && now < ends_at,
+        "the destination's window must contain now"
+    );
     store
         .start_travel(&person_id, &destination.id, starts_at, Some(ends_at))
         .expect("start trip");
@@ -186,15 +219,30 @@ fn relocation_cancels_trips_to_both_homes() {
     store.add_person(&old_home.id, "Ada").expect("person");
     let person_id = store.clock_data().expect("clocks").people[0].id.clone();
 
-    let today = jiff::Zoned::now().date();
-    let (starts_at, ends_at) = day_window(&new_home.tz_identifier, today);
+    let (starts_at, ends_at) = active_window(&new_home.tz_identifier);
+    let now = jiff::Timestamp::now().as_second();
+    assert!(
+        starts_at <= now && now < ends_at,
+        "the new home's window must contain now"
+    );
     store
         .start_travel(&person_id, &new_home.id, starts_at, Some(ends_at))
         .expect("trip to new home");
-    let (starts_at, ends_at) = day_window(
-        &elsewhere.tz_identifier,
-        today.tomorrow().expect("tomorrow"),
-    );
+    // A planned trip that begins only after the new-home window ends, so the
+    // two windows never compete for "now". Deriving the date from the first
+    // window's end keeps that true even when the two zones are on different
+    // civil days; if that instant still falls inside the unrelated zone's
+    // civil day, that day's window starts before the new-home window ends, so
+    // move to the next one.
+    let unrelated_zone = resolve_zone(&elsewhere.tz_identifier).expect("known zone");
+    let mut unrelated_date = jiff::Timestamp::from_second(ends_at + 1)
+        .expect("valid instant")
+        .to_zoned(unrelated_zone.clone())
+        .date();
+    if day_window(&elsewhere.tz_identifier, unrelated_date).0 <= ends_at {
+        unrelated_date = unrelated_date.tomorrow().expect("next day");
+    }
+    let (starts_at, ends_at) = day_window(&elsewhere.tz_identifier, unrelated_date);
     store
         .start_travel(&person_id, &elsewhere.id, starts_at, Some(ends_at))
         .expect("unrelated trip");
