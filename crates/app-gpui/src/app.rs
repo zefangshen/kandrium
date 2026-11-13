@@ -52,7 +52,7 @@ use crate::views::tasks::{
 use crate::views::{
     notes::{self, DraftKind, NameDraft, NoteTab},
     placeholder, tasks,
-    wiki::WikiState,
+    wiki::{self, TabKey, TabKind, WikiState},
 };
 use crate::vim;
 
@@ -72,11 +72,12 @@ pub enum Section {
 }
 
 impl Section {
-    pub const ALL: [Section; 5] = [
+    pub const ALL: [Section; 6] = [
         Section::Tasks,
         Section::Projects,
         Section::Notes,
         Section::Documents,
+        Section::Wiki,
         Section::Clocks,
     ];
 
@@ -495,7 +496,70 @@ impl AppShell {
         }
     }
 
-    /// Live width while the project tree splitter is dragged.
+    /// Live split while the Wiki vertical splitter is dragged. The share is
+    /// clamped so neither half can be squeezed away.
+    pub(crate) fn set_wiki_split(&mut self, share: f32, cx: &mut Context<Self>) {
+        let share = if share.is_finite() {
+            share.clamp(0.15, 0.85)
+        } else {
+            0.5
+        };
+        if (self.wiki.split - share).abs() > 0.001 {
+            self.wiki.split = share;
+            cx.notify();
+        }
+    }
+
+    /// Persist after a Wiki splitter drag ends.
+    pub(crate) fn finish_wiki_split(&mut self, cx: &mut Context<Self>) {
+        self.persist_settings();
+        cx.notify();
+    }
+
+    /// Collapse one Wiki tree half to its header, or expand it again.
+    pub(crate) fn toggle_wiki_half(&mut self, half: settings::WikiHalf, cx: &mut Context<Self>) {
+        match half {
+            settings::WikiHalf::Notes => {
+                self.wiki.notes_collapsed = !self.wiki.notes_collapsed;
+            }
+            settings::WikiHalf::Documents => {
+                self.wiki.docs_collapsed = !self.wiki.docs_collapsed;
+            }
+        }
+        self.persist_settings();
+        cx.notify();
+    }
+
+    /// Collapse the whole Wiki tree column to its rail, hiding both halves.
+    pub(crate) fn toggle_wiki_tree(&mut self, cx: &mut Context<Self>) {
+        self.wiki.notes.tree_open = !self.wiki.notes.tree_open;
+        self.wiki.documents.tree_open = self.wiki.notes.tree_open;
+        self.persist_settings();
+        cx.notify();
+    }
+
+    /// Show a tab picked in the merged row.
+    pub(crate) fn activate_wiki_tab(
+        &mut self,
+        key: TabKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match key.kind {
+            TabKind::Note => self.activate_note_tab(key.path, window, cx),
+            TabKind::Doc => self.activate_doc_tab(key.path, window, cx),
+        }
+    }
+
+    /// Close a tab picked in the merged row.
+    pub(crate) fn close_wiki_tab(&mut self, key: TabKey, cx: &mut Context<Self>) {
+        match key.kind {
+            TabKind::Note => self.close_note_tab_by_path(key.path, cx),
+            TabKind::Doc => self.close_doc_tab_by_path(key.path, cx),
+        }
+    }
+
+    /// Live split while the project tree splitter is dragged.
     pub(crate) fn set_projects_tree_width(&mut self, width: f32, cx: &mut Context<Self>) {
         let width = settings::clamp_tree_width(width);
         if (self.projects.tree_w - width).abs() > 0.5 {
@@ -4197,6 +4261,7 @@ impl AppShell {
         self.wiki.notes.selected = Some(path.clone());
         if let Some(index) = self.wiki.notes.tab_index(&path) {
             self.wiki.notes.active = Some(index);
+            self.wiki.set_active(TabKey::note(path.clone()));
             let editor = self.wiki.notes.tabs[index].editor.clone();
             editor.update(cx, |state, cx| state.focus(window, cx));
             cx.notify();
@@ -4236,6 +4301,9 @@ impl AppShell {
                     generation: 0,
                 });
                 self.wiki.notes.active = Some(self.wiki.notes.tabs.len() - 1);
+                if let Some(path) = self.wiki.notes.tabs.last().map(|tab| tab.path.clone()) {
+                    self.wiki.set_active(TabKey::note(path));
+                }
                 self.wiki.notes.error = None;
                 if self.wiki.notes.tabs.last().is_some_and(|tab| !tab.preview) {
                     editor.update(cx, |state, cx| state.focus(window, cx));
@@ -4256,6 +4324,7 @@ impl AppShell {
             return;
         };
         self.wiki.notes.active = Some(index);
+        self.wiki.set_active(TabKey::note(path));
         let editor = self.wiki.notes.tabs[index].editor.clone();
         if !self.wiki.notes.tabs[index].preview {
             editor.update(cx, |state, cx| state.focus(window, cx));
@@ -4277,6 +4346,7 @@ impl AppShell {
             }
             (false, other) => other,
         };
+        self.wiki.forget(&TabKey::note(path));
         cx.notify();
     }
 
@@ -4528,6 +4598,7 @@ impl AppShell {
             .filter_map(|path| remap_path(path, from, to))
             .collect();
         self.wiki.notes.expanded = expanded.into_iter().collect();
+        self.wiki.remap_paths(from, to);
     }
 
     fn cancel_note_draft(&mut self, cx: &mut Context<Self>) {
@@ -4564,6 +4635,7 @@ impl AppShell {
                 if self.wiki.notes.active.is_none() && !self.wiki.notes.tabs.is_empty() {
                     self.wiki.notes.active = Some(self.wiki.notes.tabs.len() - 1);
                 }
+                self.wiki.reconcile();
                 if self
                     .wiki
                     .notes
@@ -4736,6 +4808,7 @@ impl AppShell {
         self.wiki.documents.selected = Some(path.clone());
         if let Some(index) = self.wiki.documents.tab_index(&path) {
             self.wiki.documents.active = Some(index);
+            self.wiki.set_active(TabKey::document(path.clone()));
             if let Some(editor) = self.wiki.documents.tabs[index].editor.clone() {
                 editor.update(cx, |state, cx| state.focus(window, cx));
             }
@@ -4803,6 +4876,9 @@ impl AppShell {
         } else {
             self.wiki.documents.error = Some("Unsupported document type".into());
         }
+        if let Some(path) = self.wiki.documents.active_tab().map(|tab| tab.path.clone()) {
+            self.wiki.set_active(TabKey::document(path));
+        }
         self.save_documents_session();
         cx.notify();
     }
@@ -4817,6 +4893,7 @@ impl AppShell {
             return;
         };
         self.wiki.documents.active = Some(index);
+        self.wiki.set_active(TabKey::document(path));
         if let Some(editor) = self.wiki.documents.tabs[index].editor.clone() {
             editor.update(cx, |state, cx| state.focus(window, cx));
         }
@@ -4847,6 +4924,7 @@ impl AppShell {
             }
             (false, other) => other,
         };
+        self.wiki.forget(&TabKey::document(path));
         self.save_documents_session();
         cx.notify();
     }
@@ -5051,6 +5129,7 @@ impl AppShell {
             .filter_map(|path| remap_path(path, from, to))
             .collect();
         self.wiki.documents.expanded = expanded.into_iter().collect();
+        self.wiki.remap_paths(from, to);
     }
 
     pub(crate) fn ask_delete_document(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -5087,6 +5166,7 @@ impl AppShell {
                 if self.wiki.documents.active.is_none() && !self.wiki.documents.tabs.is_empty() {
                     self.wiki.documents.active = Some(self.wiki.documents.tabs.len() - 1);
                 }
+                self.wiki.reconcile();
                 if self
                     .wiki
                     .documents
@@ -5971,13 +6051,12 @@ impl AppShell {
                 }
                 element.into_any_element()
             }
-            // Temporary stopgap until the merged body lands: a settings file
-            // that still names Notes or Documents boots into Wiki, which shows
-            // the documents pane so the migrated user keeps their open tabs.
+            // Temporary stopgap: the merged body lands in this stage, and the
+            // cutover that retires Notes/Documents follows.
             Section::Wiki => {
                 self.pump_documents(cx);
                 self.restore_documents_session(window, cx);
-                let element = documents::documents_view(&mut self.wiki.documents, &t, window, cx);
+                let element = wiki::wiki_view(&mut self.wiki, &t, window, cx);
                 if self.wiki.documents.needs_repaint {
                     cx.notify();
                 }
@@ -6170,7 +6249,7 @@ impl Default for AppShell {
 
 /// Rewrite a path that lives under `from` so it lives under `to` instead.
 /// Returns `None` for unrelated paths.
-fn remap_path(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+pub(crate) fn remap_path(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
     let rest = path.strip_prefix(from).ok()?;
     Some(if rest.as_os_str().is_empty() {
         to.to_path_buf()

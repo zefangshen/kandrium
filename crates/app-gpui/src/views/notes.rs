@@ -202,34 +202,10 @@ impl Render for TreeDragGhost {
 /// Header (collapse, new note, new folder), optional name field, tree rows.
 fn tree_panel(state: &NotesState, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
     if !state.tree_open {
-        return div()
-            .id("notes-tree-rail")
-            .test_support()
-            .w(px(RAIL_W))
-            .h_full()
-            .flex()
-            .flex_col()
-            .items_center()
-            .pt(px(10.))
-            .border_r_1()
-            .border_color(t.divider)
-            .child(
-                div()
-                    .id("notes-expand")
-                    .test_support()
-                    .p(px(4.))
-                    .rounded(px(t.radius))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(t.hover))
-                    .on_click(
-                        cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_notes_tree(cx)),
-                    )
-                    .child(icon(Icon::ChevronRight, 14., t.text_muted)),
-            )
-            .into_any_element();
+        return tree_rail(t, cx);
     }
 
-    let mut panel = div()
+    div()
         .id("notes-tree")
         .test_support()
         .w(px(state.tree_w))
@@ -238,45 +214,99 @@ fn tree_panel(state: &NotesState, t: &Tokens, cx: &mut Context<AppShell>) -> Any
         .flex_col()
         .border_r_1()
         .border_color(t.divider)
+        .child(tree_header(t, cx, None))
+        .child(tree_body(state, t, cx))
+        .into_any_element()
+}
+
+/// The 30 px rail the whole tree column collapses to.
+pub(crate) fn tree_rail(t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
+    div()
+        .id("notes-tree-rail")
+        .test_support()
+        .w(px(RAIL_W))
+        .h_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .pt(px(10.))
+        .border_r_1()
+        .border_color(t.divider)
         .child(
             div()
-                .h(px(38.))
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .px(px(12.))
-                .border_b_1()
-                .border_color(t.divider)
-                .child(
-                    div()
-                        .flex_1()
-                        .text(Text::Label)
-                        .text_color(t.text_muted)
-                        .child("NOTES"),
-                )
-                .child(tree_action(
-                    "notes-new-note",
-                    Icon::FilePlus,
-                    t,
-                    cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.begin_note_draft(DraftKind::Note, window, cx)
-                    }),
-                ))
-                .child(tree_action(
-                    "notes-new-folder",
-                    Icon::FolderPlus,
-                    t,
-                    cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.begin_note_draft(DraftKind::Folder, window, cx)
-                    }),
-                ))
-                .child(tree_action(
-                    "notes-collapse",
-                    Icon::ChevronLeft,
-                    t,
+                .id("notes-expand")
+                .test_support()
+                .p(px(4.))
+                .rounded(px(t.radius))
+                .cursor_pointer()
+                .hover(|style| style.bg(t.hover))
+                .on_click(
                     cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_notes_tree(cx)),
-                )),
-        );
+                )
+                .child(icon(Icon::ChevronRight, 14., t.text_muted)),
+        )
+        .into_any_element()
+}
+
+/// The half's 38 px title row: name, new-note, new-folder, whole-tree collapse
+/// and an optional trailing control (the Wiki half toggle).
+pub(crate) fn tree_header(
+    t: &Tokens,
+    cx: &mut Context<AppShell>,
+    trailing: Option<AnyElement>,
+) -> AnyElement {
+    div()
+        .h(px(38.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .px(px(12.))
+        .border_b_1()
+        .border_color(t.divider)
+        .child(
+            div()
+                .flex_1()
+                .truncate()
+                .text(Text::Label)
+                .text_color(t.text_muted)
+                .child("NOTES"),
+        )
+        .child(tree_action(
+            "notes-new-note",
+            Icon::FilePlus,
+            t,
+            cx.listener(|this, _: &ClickEvent, window, cx| {
+                this.begin_note_draft(DraftKind::Note, window, cx)
+            }),
+        ))
+        .child(tree_action(
+            "notes-new-folder",
+            Icon::FolderPlus,
+            t,
+            cx.listener(|this, _: &ClickEvent, window, cx| {
+                this.begin_note_draft(DraftKind::Folder, window, cx)
+            }),
+        ))
+        .child(tree_action(
+            "notes-collapse",
+            Icon::ChevronLeft,
+            t,
+            cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_notes_tree(cx)),
+        ))
+        .children(trailing)
+        .into_any_element()
+}
+
+/// The inline name field, any error and the tree rows. Scrolls inside the
+/// height its parent gives it.
+pub(crate) fn tree_body(state: &NotesState, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
+    let mut panel = div()
+        .id("notes-tree-body")
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0();
 
     if let Some(draft) = &state.draft {
         let label = match draft.kind {
@@ -290,6 +320,7 @@ fn tree_panel(state: &NotesState, t: &Tokens, cx: &mut Context<AppShell>) -> Any
                 .test_support()
                 .flex()
                 .flex_col()
+                .flex_none()
                 .gap(px(4.))
                 .px(px(10.))
                 .py(px(8.))
@@ -313,6 +344,7 @@ fn tree_panel(state: &NotesState, t: &Tokens, cx: &mut Context<AppShell>) -> Any
             div()
                 .id("notes-error")
                 .test_support()
+                .flex_none()
                 .mx(px(8.))
                 .my(px(6.))
                 .p(px(8.))
@@ -328,6 +360,7 @@ fn tree_panel(state: &NotesState, t: &Tokens, cx: &mut Context<AppShell>) -> Any
         .id("notes-tree-rows")
         .test_support()
         .flex_1()
+        .min_h_0()
         .overflow_y_scroll();
     if state.entries.is_empty() && state.draft.is_none() {
         rows = rows.child(
@@ -500,6 +533,18 @@ fn content(
             .into_any_element();
     }
 
+    body = body.child(tab_strip(state, t, cx));
+
+    let Some(index) = state.active else {
+        return body.into_any_element();
+    };
+    body.child(detail_body(state, index, t, window, cx))
+        .into_any_element()
+}
+
+/// The note tab row. The merged Wiki section draws its own shared row, so this
+/// remains the Notes-only composition until the cutover.
+fn tab_strip(state: &NotesState, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
     let mut strip = crate::views::tab_strip(t);
     for (index, tab) in state.tabs.iter().enumerate() {
         let active = state.active == Some(index);
@@ -536,10 +581,27 @@ fn content(
                 ),
         );
     }
-    strip = strip.child(div().flex_1());
-    body = body.child(strip);
+    strip.child(div().flex_1()).into_any_element()
+}
 
-    let Some(tab) = state.active_tab() else {
+/// One note's head row, editor or preview, and status bar, below the tab row.
+pub(crate) fn detail_body(
+    state: &NotesState,
+    index: usize,
+    t: &Tokens,
+    window: &Window,
+    cx: &mut Context<AppShell>,
+) -> AnyElement {
+    let mut body = div()
+        .id("notes-detail")
+        .test_support()
+        .flex_1()
+        .min_h_0()
+        .min_w_0()
+        .flex()
+        .flex_col();
+
+    let Some(tab) = state.tabs.get(index) else {
         return body.into_any_element();
     };
     let preview = tab.preview;
