@@ -18,10 +18,10 @@ those rules.
 - **Projects**: DB-backed folder/project tree; each project owns a board, a
   document folder, an inline-editable overview (identifier, status,
   description, source) and mirrored "area" cards on normal boards.
-- **Wiki**: notes and documents in one split section, each with multi-tab
+- **Wiki**: wiki pages and documents in one split section, each with multi-tab
   editors/readers; Markdown (shared editor, preview, debounced autosave), PDFs
   (worker rendering, highlights, sticky notes in JSON sidecars).
-- **Markdown editing**: vim-modal by default in Wiki notes, project docs,
+- **Markdown editing**: vim-modal by default in Wiki pages, project docs,
   document `.md` tabs and the card description field.
 - **Data safety**: WAL + busy timeout, integrity check at boot, pre-migration
   and daily `VACUUM INTO` snapshots, atomic file writes, rotating logs and
@@ -38,7 +38,27 @@ those rules.
    first-class in the app but invisible to MCP clients, and `update_card`
    currently overwrites every field.
 3. **Find/filter** — search across the active board plus filters for the
-   Notes/Documents trees; only the Archived table has search today.
+   Wiki/Documents trees; only the Archived table has search today.
+
+## Decided: Wiki page root and agent model
+
+Specified in [.documents/specs/llm-wiki/plan.md](.documents/specs/llm-wiki/plan.md). Two
+decisions are settled and supersede the current-state wording below:
+
+- **`wiki/` is the page root.** There is no separate notes root. Compiled
+  pages live in `wiki/{sources,entities,concepts}` plus generated
+  `wiki/index.md`; hand-written pages live elsewhere under `wiki/`. The Wiki
+  section's tree halves are labeled **Sources** (documents root) and **Wiki**
+  (page root).
+- **Kandrium has no LLM client.** Shape B, the external-agent path, was
+  chosen. The agent reads sources and writes pages through MCP using versioned
+  instructions served by `get_wiki_instructions`. Kandrium owns hashing,
+  dedup/merge candidates, index rebuild, lint, link resolution, path guards,
+  and atomic writes.
+
+The existing 13 MCP tools keep their names and schemas; the wiki tools are
+additive. Where the current-state notes below say Notes, read Wiki once the
+layout change lands.
 
 ## Near-term work (ordered by value vs. risk)
 
@@ -87,11 +107,11 @@ those rules.
   semantic change needs a compatibility note because the current description
   promises "full replace".
 
-### 3. Find/filter across Tasks, Notes and Documents
+### 3. Find/filter across Tasks, Wiki and Documents
 
 - **Why**: only the Archived table has a search box
   (`crates/app/src/views/archive.rs`, `matches_filter` matches title only).
-  The board header has no quick filter, and the Notes/Documents trees have no
+  The board header has no quick filter, and the Wiki/Documents trees have no
   filter equivalent to the Projects tree's.
 - **Change**:
   - `crates/app/src/app.rs` // `views/board.rs`: a toolbar search box matching
@@ -123,7 +143,7 @@ those rules.
 
 - **Why**: `widgets/vim.rs` documents `/` search, marks, named registers, `%`,
   `>>`/`<<`, `s` and Visual-op repeat as deliberately absent; `:q!` is
-  rejected. `/` search is the most noticeable gap for editing notes/docs.
+  rejected. `/` search is the most noticeable gap for editing wiki pages/docs.
 - **Change**: implement `/` and `n`/`N` in `widgets/vim.rs` (buffer search,
   highlight matches, status-strip feedback), then `>>`/`<<` if cheap. Leave
   marks/registers explicitly out of scope for now.
@@ -184,14 +204,14 @@ those rules.
   columns being dropped from the All board and area ordering (see gaps).
 - **Undo journal** — a short-lived action log for archive/delete/move so
   destructive actions are reversible across app and MCP writes.
-- **External file watching** — watch Notes/Documents roots (e.g. `notify`) and
+- **External file watching** — watch Wiki/Documents roots (e.g. `notify`) and
   offer reload/conflict prompts; today only the SQLite DB is watched.
 - **Command palette / keyboard shortcuts** — quick capture, board switching,
   search launcher, and a shortcut reference; currently actions are mouse-first.
 - **Packaging and release** — universal macOS binary, code signing +
   notarization, version derived from one source, a Linux/Windows evaluation,
   and an update strategy (even if it is just a release checklist).
-- **MCP breadth** — read-only notes/documents search tools, batch card
+- **MCP breadth** — read-only wiki/document search tools, batch card
   operations, and project document access, keeping the existing tool names and
   schemas stable.
 
@@ -228,7 +248,7 @@ The Kwora world-clock port is planned separately in [clocks-plan.md](clocks-plan
 
 ### MCP surface
 
-- The server exposes exactly 13 tools; project CRUD, notes, documents, board
+- The server exposes exactly 13 tools; project CRUD, wiki pages, documents, board
   create/rename/delete and column create/rename/delete/move are app-only
   (`crates/mcp/src/main.rs` module doc and
   `crates/core/src/projects.rs` "No MCP tool exposes them yet").
@@ -249,7 +269,7 @@ The Kwora world-clock port is planned separately in [clocks-plan.md](clocks-plan
 - PDF selection is visual-only and there is no text search or annotation
   export/import (`crates/app/src/views/documents.rs` `Tool::Select` comments;
   `crates/app/src/pdf.rs` "no search").
-- Notes/Documents/Projects tree rows are rescanned on demand; external file
+- Wiki/Documents/Projects tree rows are rescanned on demand; external file
   changes are invisible until a rescan, and there is no conflict prompt.
 
 ### Persistence, sync and safety
@@ -266,8 +286,8 @@ The Kwora world-clock port is planned separately in [clocks-plan.md](clocks-plan
 ### Docs, tests and release
 
 - README drift: it says "~185 tests" while there are 211 `#[test]` functions;
-  its feature list and data-storage table predate Projects, Notes and
-  Documents (no `KANDRIUM_NOTES` / `KANDRIUM_DOCS` / `KANDRIUM_PROJECTS`
+  its feature list and data-storage table predate Projects, Wiki and
+  Documents (no `KANDRIUM_WIKI` / `KANDRIUM_DOCS` / `KANDRIUM_PROJECTS`
   entries). AGENTS.md is the current source of truth.
 - No `.github/workflows`; lint/test/migration checks are manual.
 - The only MCP test is the tool-router list; no stdio integration test
@@ -311,5 +331,5 @@ Additional checks by area:
 - **Headless UI tests**: `theme::install_fonts` + `theme::apply_visuals` first,
   clear `textures_delta`, and scan shapes for duplicate-ID warnings (see
   AGENTS.md).
-- **File-system work**: use `KANDRIUM_NOTES` / `KANDRIUM_DOCS` /
+- **File-system work**: use `KANDRIUM_WIKI` / `KANDRIUM_DOCS` /
   `KANDRIUM_PROJECTS` with temp dirs so tests never touch real user data.
