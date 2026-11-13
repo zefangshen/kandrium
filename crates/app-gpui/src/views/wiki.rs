@@ -220,9 +220,7 @@ pub fn wiki_view(
         .child(tree_column(state, t, window, cx));
 
     if state.notes.tree_open {
-        row = row
-            .child(tree_splitter(t))
-            .child(div().w(px(1.)).h_full().bg(t.divider));
+        row = row.child(tree_splitter(t));
     }
     row.on_drag_move::<WikiTreeDrag>(cx.listener(
         |this, event: &DragMoveEvent<WikiTreeDrag>, _window, cx| {
@@ -297,8 +295,6 @@ fn tree_column(
         .h_full()
         .flex()
         .flex_col()
-        .border_r_1()
-        .border_color(t.divider)
         .child(notes_half(state, notes_h, t, cx));
 
     if both {
