@@ -7,7 +7,7 @@ changes. User-facing overview lives in [README.md](README.md).
 
 Kandrium is a local-first Kanban app on a pure-Rust stack:
 
-- **gpui 0.9** desktop UI (`crates/app-gpui`, binary `kandrium-app`)
+- **gpui 0.9** desktop UI (`crates/app`, binary `kandrium-app`)
 - **rmcp 3.5** stdio MCP server (`crates/mcp`, binary `kandrium-mcp`)
 - **rusqlite 0.40** (bundled SQLite) shared data layer (`crates/core`, crate `kandrium-core`)
 - **pdf-render** PDF rasterization worker (`crates/pdf-render`)
@@ -24,7 +24,7 @@ Workspace, edition 2024. All comments, identifiers, and docs are in English.
   expose it from `lib.rs`.
 - The DB is SQLite WAL + `foreign_keys=ON` + 5 s busy timeout, so the app and
   MCP server processes share one file. The app detects external commits with a
-  background watcher (`crates/app-gpui/src/watcher.rs`).
+  background watcher (`crates/app/src/watcher.rs`).
 - Database work runs on the shell's worker path and reaches the UI through
   gpui entities/tasks; never mutate UI state from another thread. The shell
   re-reads the affected section after a watcher generation bump.
@@ -64,7 +64,7 @@ Workspace, edition 2024. All comments, identifiers, and docs are in English.
   hidden from the Tasks tabs (`list_boards`) with
   `NOT IN (SELECT board_id FROM projects)`; the Projects view re-adds the
   open project's board. The Projects view is
-  `crates/app-gpui/src/views/projects.rs`. Projects reorder by drag among
+  `crates/app/src/views/projects.rs`. Projects reorder by drag among
   their own siblings (`projects::reorder_project` rewrites
   `projects.position` for that parent only); folders keep their own order and
   render above projects, and drag is disabled while the filter box has text.
@@ -95,7 +95,7 @@ Workspace, edition 2024. All comments, identifiers, and docs are in English.
   closable tab per open Markdown/text document. Markdown documents are
   read/written through `projects::read_doc` / `write_doc` (root-guarded,
   `<projects_root>/<id>/`).
-- Markdown editing is vim-modal by default (`crates/app-gpui/src/vim.rs`),
+- Markdown editing is vim-modal by default (`crates/app/src/vim.rs`),
   used by Wiki notes, document tabs, project docs, and the card description.
   The vim engine owns motions, operators, text objects, ex commands (`:w`,
   `:q`, `:wq`, `:x`) and the undo stack; gpui supplies the editor and the key
@@ -176,7 +176,7 @@ OS.
 The bundle lives in the cleanable `target/`; if missing, recreate it:
 `Contents/MacOS/kandrium-app` as a copy of `target/debug/kandrium-app`, a
 `Contents/Resources/icon.icns` copied from
-`crates/app-gpui/assets/packaging/icon.icns`, and a bare `Contents/Info.plist`
+`crates/app/assets/packaging/icon.icns`, and a bare `Contents/Info.plist`
 (APPL, bundle id `app.kandrium.desktop.dev`, `CFBundleExecutable`
 `kandrium-app`, `CFBundleIconFile` `icon.icns`). Without the icon resource and
 key, LaunchServices shows the generic application icon in the Dock.
@@ -190,19 +190,19 @@ shell (screen capture blocked) — ask the user to confirm UI changes.
 - `gpui-kit` and `gpui-component` are pinned to `=0.9.1`. The Markdown
   highlighting grammar comes from the `tree-sitter-markdown` feature on
   `gpui-component`; do not add unrelated grammar features without a reason.
-- The shell is one `AppShell` entity (`crates/app-gpui/src/app.rs`). Sections
+- The shell is one `AppShell` entity (`crates/app/src/app.rs`). Sections
   are Tasks, Clocks, Wiki (notes + documents) and Projects. Views live under
-  `crates/app-gpui/src/views/`, reusable widgets under `src/views/` helpers or
+  `crates/app/src/views/`, reusable widgets under `src/views/` helpers or
   `gpui-kit`.
 - Every screen keeps its data in the shell's `Store`
-  (`crates/app-gpui/src/store.rs`); the store wraps core services and never
+  (`crates/app/src/store.rs`); the store wraps core services and never
   duplicates their rules.
 - Design tokens (colors, radii, typography, spacing) live in
-  `crates/app-gpui/src/theme.rs` as `Tokens`. Use the token fields, not literal
+  `crates/app/src/theme.rs` as `Tokens`. Use the token fields, not literal
   colors or sizes, and keep the single blue accent.
-- Icons are inline SVGs compiled in `crates/app-gpui/src/assets.rs` from
-  `crates/app-gpui/assets/icons/`. Do not add a second icon crate.
-- Drag and drop is hand-rolled in `crates/app-gpui/src/anim.rs` plus each
+- Icons are inline SVGs compiled in `crates/app/src/assets.rs` from
+  `crates/app/assets/icons/`. Do not add a second icon crate.
+- Drag and drop is hand-rolled in `crates/app/src/anim.rs` plus each
   view's drag session; easing constants live only there.
 - Use `ui.push_id`/`.id(...)` for loop-generated elements and stable test
   paths. Widgets that tests click need an `.id("...")` and `.test_support()`.
@@ -214,7 +214,7 @@ shell (screen capture blocked) — ask the user to confirm UI changes.
 ## Headless UI tests
 
 UI behaviour is tested without a GPU with `#[gpui::test]` and
-`TestAppContext` under `crates/app-gpui/tests/`. Build a shell with
+`TestAppContext` under `crates/app/tests/`. Build a shell with
 `AppShell::with_store` over a temp database, click stable element ids
 (`window.click("board-card-<id>", cx)`), press keys
 (`window.press("tab", cx)`) and assert through the store or rendered test

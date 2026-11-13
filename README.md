@@ -29,7 +29,7 @@ Kandrium is a local-first Kanban desktop app with a companion [Model Context Pro
 crates/
   core/       Shared data layer: SQLite schema, services, seed data,
               legacy-DB import, and the `kandrium-import` binary
-  app-gpui/   gpui desktop application (`kandrium-app`)
+  app/        gpui desktop application (`kandrium-app`)
   mcp/        stdio MCP server (`kandrium-mcp`) built on rmcp
   pdf-render/ PDF rasterization worker shared by the app
 ```
@@ -204,4 +204,4 @@ This builds the release binary and produces `Kandrium.app` plus
 
 Apache-2.0. See [LICENSE](LICENSE). Bundled Inter font files and Lucide icons
 ship under their own licenses, included alongside the assets in
-`crates/app-gpui/assets/`.
+`crates/app/assets/`.

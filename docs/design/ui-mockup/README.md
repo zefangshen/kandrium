@@ -70,7 +70,7 @@ row, no new state. `Expensive` = needs a component rethink or new plumbing.
 
 | Change | Cost | Notes |
 | --- | --- | --- |
-| Dark / light palette regrade | Cheap | `Tokens::dark/light` in `crates/app-gpui/src/theme.rs` (mirror the egui `crates/app/src/theme.rs`). Every widget reads tokens. |
+| Dark / light palette regrade | Cheap | `Tokens::dark/light` in `crates/app/src/theme.rs` (mirror the egui `crates/app/src/theme.rs`). Every widget reads tokens. |
 | `radius_lg: 8.0` for cards, columns, clock cards | Cheap | Add one field; controls keep 6. |
 | Section control restyle (neutral selected pill, accent icon) | Cheap | Single `section_control`; structure and hit areas stay. |
 | Titlebar status cluster (⌘K, local dot, date) | Cheap | Pure layout in the titlebar. |

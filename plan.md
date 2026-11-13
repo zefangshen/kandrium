@@ -9,7 +9,7 @@ those rules.
 
 - **Stack**: gpui 0.9 desktop app (binary `kandrium-app`), rmcp stdio MCP
   server, rusqlite (bundled SQLite) shared data layer and a PDF worker, all in
-  one workspace (`crates/core`, `crates/app-gpui`, `crates/mcp`,
+  one workspace (`crates/core`, `crates/app`, `crates/mcp`,
   `crates/pdf-render`).
 - **Tasks**: real boards with columns, drag-and-drop cards/columns, inline
   title editing, card modal (markdown description + due date + labels), a
