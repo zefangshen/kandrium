@@ -506,6 +506,77 @@ fn session_round_trip_is_root_relative(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn session_restores_the_active_path_and_ignores_the_tree_flag(cx: &mut TestAppContext) {
+    let root = case_dir("session-active");
+    let a = root.join("a.md");
+    fs::write(&a, "a").unwrap();
+    let b = root.join("b.md");
+    fs::write(&b, "b").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = seeded_db(dir.path());
+    let (_first, cx) = boot(cx, db.clone());
+    open_documents(cx);
+    expand(cx, &root);
+    cx.update(|window, cx| window.click(row_id(&a), cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, cx| window.click(row_id(&b), cx));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    let session = db
+        .parent()
+        .expect("db parent")
+        .join("gpui-documents.session");
+    let text = fs::read_to_string(&session).expect("session written");
+    assert!(
+        text.contains("active=session-active/b.md"),
+        "the active document is stored as a relative path, got: {text}"
+    );
+
+    // A second window restores both tabs with b active, even though the
+    // merged row would give b index 1 of the document subset.
+    let (_second, cx) = cx
+        .cx
+        .add_window_view(|_window, _cx| AppShell::with_store(Store::open_path(db.clone())));
+    open_documents(cx);
+    cx.update(|window, _cx| {
+        assert!(window.find(tab_id(&a)).visible());
+        assert!(window.find(tab_id(&b)).visible());
+        assert!(
+            window
+                .find(format!("documents-detail-{}", b.display()))
+                .visible(),
+            "the stored active path must be the rendered document"
+        );
+    });
+
+    // A pre-merge session stored an index; it still selects the document, and
+    // its `tree_open=0` never closes the tree now that settings own that flag.
+    fs::write(
+        &session,
+        "tree_open=0\nactive=1\nsession-active/a.md\nsession-active/b.md\n",
+    )
+    .unwrap();
+    let (_third, cx) = cx
+        .cx
+        .add_window_view(|_window, _cx| AppShell::with_store(Store::open_path(db.clone())));
+    open_documents(cx);
+    cx.update(|window, _cx| {
+        assert!(
+            window.find("wiki-documents-tree").visible(),
+            "tree openness comes from settings, not the session"
+        );
+        assert!(window.find(tab_id(&a)).visible());
+        assert!(
+            window
+                .find(format!("documents-detail-{}", b.display()))
+                .visible(),
+            "the legacy index still selects the second document"
+        );
+    });
+}
+
+#[gpui::test]
 fn tree_collapses_to_a_rail_and_expands_back(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let db = seeded_db(dir.path());

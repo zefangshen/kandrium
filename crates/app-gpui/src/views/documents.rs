@@ -300,7 +300,7 @@ pub struct DocumentsState {
     pub tool: Tool,
     /// Session file read on the first load, applied once a window exists.
     pub session_loaded: bool,
-    pub restore: Option<(bool, Option<usize>, Vec<String>)>,
+    pub restore: Option<(bool, Option<String>, Vec<String>)>,
     /// Set while a render/text request is outstanding; the shell repaints.
     pub needs_repaint: bool,
 }
@@ -425,15 +425,15 @@ pub fn visible_pages(top: f32, viewport_h: f32, row_h: f32, count: usize) -> Vec
 // Session
 // ---------------------------------------------------------------------------
 
-/// Session text: `tree_open`, active tab index, then one root-relative path
-/// per line. Plain text keeps the gpui shell free of a settings dependency
-/// while still persisting exactly what matters.
-pub fn format_session(tree_open: bool, active: Option<usize>, rels: &[String]) -> String {
+/// Session text: `tree_open`, the active document's root-relative path, then
+/// one root-relative path per line. Plain text keeps the gpui shell free of a
+/// settings dependency while still persisting exactly what matters.
+///
+/// Earlier builds stored a bare tab index in `active=`; [`parse_session`] still
+/// accepts that form for one release.
+pub fn format_session(tree_open: bool, active: Option<&str>, rels: &[String]) -> String {
     let mut out = format!("tree_open={}\n", if tree_open { 1 } else { 0 });
-    out.push_str(&format!(
-        "active={}\n",
-        active.map(|index| index.to_string()).unwrap_or_default()
-    ));
+    out.push_str(&format!("active={}\n", active.unwrap_or_default()));
     for rel in rels {
         out.push_str(rel);
         out.push('\n');
@@ -444,7 +444,7 @@ pub fn format_session(tree_open: bool, active: Option<usize>, rels: &[String]) -
 /// Parse [`format_session`] output. Only the two leading keyed lines are
 /// interpreted; everything else is a path, so a file name containing `=`
 /// survives. Unknown/missing keys fall back to `(tree open, no active tab)`.
-pub fn parse_session(text: &str) -> (bool, Option<usize>, Vec<String>) {
+pub fn parse_session(text: &str) -> (bool, Option<String>, Vec<String>) {
     let mut tree_open = true;
     let mut active = None;
     let mut rels = Vec::new();
@@ -458,7 +458,7 @@ pub fn parse_session(text: &str) -> (bool, Option<usize>, Vec<String>) {
                 continue;
             }
             if let Some(value) = line.strip_prefix("active=") {
-                active = value.parse::<usize>().ok();
+                active = (!value.is_empty()).then(|| value.to_string());
                 keyed += 1;
                 continue;
             }
@@ -850,18 +850,25 @@ pub(crate) fn detail_body(
     window: &mut Window,
     cx: &mut Context<AppShell>,
 ) -> AnyElement {
+    if index >= state.tabs.len() {
+        return div()
+            .id("documents-detail")
+            .test_support()
+            .flex_1()
+            .into_any_element();
+    }
+
     let mut body = div()
-        .id("documents-detail")
+        .id(format!(
+            "documents-detail-{}",
+            state.tabs[index].path.display()
+        ))
         .test_support()
         .flex_1()
         .min_h_0()
         .min_w_0()
         .flex()
         .flex_col();
-
-    if index >= state.tabs.len() {
-        return body.into_any_element();
-    }
 
     let markdown = state.tabs[index].kind == DocKind::Markdown;
     let preview = markdown && state.tabs[index].preview;
@@ -1137,8 +1144,11 @@ mod tests {
     #[test]
     fn session_round_trips() {
         let rels = vec!["papers/report.pdf".to_string(), "notes.md".to_string()];
-        let text = format_session(false, Some(1), &rels);
-        assert_eq!(parse_session(&text), (false, Some(1), rels));
+        let text = format_session(false, Some("notes.md"), &rels);
+        assert_eq!(
+            parse_session(&text),
+            (false, Some("notes.md".to_string()), rels)
+        );
     }
 
     #[test]
@@ -1148,12 +1158,20 @@ mod tests {
             parse_session("notes.md\n"),
             (true, None, vec!["notes.md".to_string()])
         );
-        // A non-numeric active index is ignored, and a path with `=` after the
-        // keyed header is preserved verbatim.
-        let (open, active, rels) = parse_session("tree_open=1\nactive=oops\nx=y.md\n");
+        // The active entry is a root-relative path, and a path with `=` after
+        // the keyed header is preserved verbatim.
+        let (open, active, rels) = parse_session("tree_open=1\nactive=papers/a=b.md\nx=y.md\n");
         assert!(open);
-        assert_eq!(active, None);
+        assert_eq!(active.as_deref(), Some("papers/a=b.md"));
         assert_eq!(rels, vec!["x=y.md".to_string()]);
+        // A build before the merge stored an index; it still parses as text,
+        // and the restore path falls back to it.
+        assert_eq!(
+            parse_session("tree_open=1\nactive=1\na.md\nb.md\n")
+                .1
+                .as_deref(),
+            Some("1")
+        );
         // Blank lines never become tabs.
         assert!(parse_session("\n\n").2.is_empty());
     }

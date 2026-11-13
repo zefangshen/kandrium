@@ -211,6 +211,7 @@ pub fn wiki_view(
     cx: &mut Context<AppShell>,
 ) -> AnyElement {
     state.reconcile();
+    state.documents.needs_repaint = false;
     let mut row = div()
         .id("wiki-view")
         .test_support()

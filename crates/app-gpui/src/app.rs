@@ -4697,10 +4697,11 @@ impl AppShell {
 
     /// Restore the tabs once a window exists. Missing files are dropped.
     fn restore_documents_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((tree_open, active, rels)) = self.wiki.documents.restore.take() else {
+        let Some((_tree_open, active, rels)) = self.wiki.documents.restore.take() else {
             return;
         };
-        self.wiki.documents.tree_open = tree_open;
+        // Tree openness is owned by the settings file now; the session flag is
+        // written for older builds and ignored here.
         let Some(root) = self.wiki.documents.root.clone() else {
             return;
         };
@@ -4710,12 +4711,20 @@ impl AppShell {
                 self.open_document(path, window, cx);
             }
         }
-        if let Some(index) = active {
-            self.wiki.documents.active = if self.wiki.documents.tabs.is_empty() {
-                None
-            } else {
-                Some(index.min(self.wiki.documents.tabs.len() - 1))
-            };
+        if let Some(value) = active {
+            let index = value
+                .parse::<usize>()
+                .ok()
+                .filter(|_| !self.wiki.documents.tabs.is_empty())
+                .map(|index| index.min(self.wiki.documents.tabs.len() - 1))
+                .or_else(|| {
+                    let path = documents::abs_path(&root, &value);
+                    self.wiki.documents.tab_index(&path)
+                });
+            self.wiki.documents.active = index;
+            if let Some(path) = self.wiki.documents.active_tab().map(|tab| tab.path.clone()) {
+                self.wiki.set_active(TabKey::document(path));
+            }
         }
         cx.notify();
     }
@@ -4732,11 +4741,12 @@ impl AppShell {
             .iter()
             .filter_map(|tab| documents::rel_path(&root, &tab.path))
             .collect();
-        let text = documents::format_session(
-            self.wiki.documents.tree_open,
-            self.wiki.documents.active,
-            &rels,
-        );
+        let active = self
+            .wiki
+            .documents
+            .active_tab()
+            .and_then(|tab| documents::rel_path(&root, &tab.path));
+        let text = documents::format_session(self.wiki.notes.tree_open, active.as_deref(), &rels);
         let _ = kandrium_core::fsutil::write_atomic(&self.documents_session_path(), text);
     }
 
