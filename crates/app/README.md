@@ -48,7 +48,7 @@ just bundle
 
 The root `packager.json` sets bundle id `app.kandrium.desktop`, version
 `0.1.0`, product name `Kandrium`, icons from
-`crates/app-gpui/assets/packaging/`, and macOS 10.15 as the minimum. Outputs:
+`crates/app/assets/packaging/`, and macOS 10.15 as the minimum. Outputs:
 
 ```text
 Kandrium.app
