@@ -718,4 +718,152 @@ mod tests {
             1
         );
     }
+
+    /// The shared bootstrap path is what the retired egui app wrote too, so a
+    /// database it created opens here with its seed intact.
+    #[test]
+    fn opens_a_database_written_by_the_shared_bootstrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kandrium.db");
+        let mut db = kandrium_core::open_db(&path).expect("open temp db");
+        kandrium_core::bootstrap(&mut db, &path).expect("bootstrap temp db");
+        drop(db);
+
+        let store = Store::open_path(path);
+        let boards = store.boards().expect("boards");
+        assert!(!boards.is_empty(), "seeded boards must stay readable");
+        let board = store.board(&boards[0].id).expect("board");
+        assert!(
+            !board.columns.is_empty(),
+            "seeded columns must stay readable"
+        );
+    }
+
+    /// The All board labels every card with the board it lives on.
+    #[test]
+    fn all_board_labels_a_card_with_its_home_board_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = temp_store(dir.path());
+        let board = store
+            .boards()
+            .expect("boards")
+            .into_iter()
+            .next()
+            .expect("board");
+        let column = store.board(&board.id).expect("board").columns[0].id.clone();
+        store.create_card(&column, "Labelled").expect("card");
+        let card = store
+            .board(&board.id)
+            .expect("board")
+            .columns
+            .iter()
+            .flat_map(|column| column.cards.iter())
+            .find(|card| card.title == "Labelled")
+            .cloned()
+            .expect("created card");
+
+        let all = store.all_board().expect("all board");
+        let label = all
+            .columns
+            .iter()
+            .flat_map(|column| column.cards.iter())
+            .find(|entry| entry.id == card.id)
+            .and_then(|entry| entry.meta_label.clone());
+        assert_eq!(label.as_deref(), Some(board.title.as_str()));
+    }
+
+    /// A project card filed onto a normal board joins that board's own order
+    /// and acts as a drop anchor, not as a read-only mirror.
+    #[test]
+    fn area_board_treats_a_filed_project_card_as_a_drop_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = temp_store(dir.path());
+        let root = dir.path().join("projects");
+        let project = store
+            .create_project(&root, "Filed Project", None)
+            .expect("project");
+        store
+            .create_card(
+                &store.board(&project.board_id).expect("board").columns[0].id,
+                "Filed",
+            )
+            .expect("project card");
+        let filed = store
+            .board(&project.board_id)
+            .expect("board")
+            .columns
+            .iter()
+            .flat_map(|column| column.cards.iter())
+            .find(|card| card.title == "Filed")
+            .cloned()
+            .expect("filed card");
+
+        let area = store
+            .boards()
+            .expect("boards")
+            .into_iter()
+            .next()
+            .expect("board");
+        let area_column = store.board(&area.id).expect("board").columns[0].id.clone();
+        store.create_card(&area_column, "Anchor").expect("anchor");
+        let anchor = store
+            .board(&area.id)
+            .expect("board")
+            .columns
+            .iter()
+            .flat_map(|column| column.cards.iter())
+            .find(|card| card.title == "Anchor")
+            .cloned()
+            .expect("anchor card");
+
+        store
+            .save_card(
+                &filed.id,
+                &CreateCardBody {
+                    title: filed.title.clone(),
+                    ..Default::default()
+                },
+                None,
+                Some(Some(&area.id)),
+            )
+            .expect("file card onto the area board");
+        let column = store
+            .board(&area.id)
+            .expect("board")
+            .columns
+            .into_iter()
+            .find(|column| column.mirrored.iter().any(|card| card.id == filed.id))
+            .expect("mirrored card");
+        assert!(
+            column
+                .ordered_cards()
+                .iter()
+                .any(|card| card.id == filed.id),
+            "a filed project card is part of the board's unified order"
+        );
+
+        store
+            .move_card(&filed.id, &area_column, Some(&anchor.id))
+            .expect("drop the mirror above the anchor");
+        let column = store
+            .board(&area.id)
+            .expect("board")
+            .columns
+            .into_iter()
+            .find(|column| column.id == area_column)
+            .expect("column");
+        let order = column.ordered_cards();
+        let filed_at = order
+            .iter()
+            .position(|card| card.id == filed.id)
+            .expect("filed card");
+        let anchor_at = order
+            .iter()
+            .position(|card| card.id == anchor.id)
+            .expect("anchor card");
+        assert!(
+            filed_at < anchor_at,
+            "the mirror is a real drop anchor: {filed_at} < {anchor_at}"
+        );
+    }
 }

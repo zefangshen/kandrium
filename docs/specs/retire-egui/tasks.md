@@ -34,57 +34,65 @@ commit; stop and report at every stage boundary.
 
 ## S2 — Test port
 
+Outcome: 16 new gpui tests (14 vim engine cases, 2 store cases) plus one
+mirrored-card drop test; the rest of the egui list was already covered by
+existing gpui tests or has no gpui code path and is marked DROP.
+
 Vim (`crates/app-gpui/src/vim.rs`):
-- [ ] ex parse success/unknown and error text
-- [ ] counted linewise `dd`/`yy`/`cc`
-- [ ] counted delete-to-end and yank
-- [ ] `j`/`k` goal column across short lines
-- [ ] find motions `f F t T` and `;`/`,`
-- [ ] quote, bracket and paragraph text objects (cross-line brackets)
-- [ ] dot repeat of a normal command and of one Insert session (one undo step)
-- [ ] visual text object, visual-line column, block caret geometry/fallback
+- [x] ex parse success/unknown and error text
+- [x] counted linewise `dd`/`yy`/`cc`
+- [x] counted delete-to-end and yank
+- [x] `j`/`k` goal column across short lines
+- [x] find motions `f F t T` and `;`/`,`
+- [x] quote, bracket and paragraph text objects (cross-line brackets)
+- [x] dot repeat of a normal command and of one Insert session (one undo step)
+- [x] visual text object and visual-line column
+- [x] DROP block-caret geometry: the overlay measures glyphs at paint time;
+      no pure helper exists on this side
 
 Clocks (`crates/app-gpui/src/views/clocks.rs`, `tests/clocks.rs`):
-- [ ] 12-hour formatting adds the lowercase period
-- [ ] initials from the first two words
-- [ ] empty and no-results states
-- [ ] unknown zone renders a readable label
-- [ ] residents/travel repaint boundary targets
+- [x] 12-hour formatting and the probe field (already covered)
+- [x] initials from the first two words (already covered)
+- [x] DROP empty/no-results states: egui layout text, no shared surface
+- [x] DROP unknown zone: resolution is core-owned; no dedicated renderer
+- [x] residents/travel repaint boundary targets (already covered)
 
 Projects (`crates/app-gpui/src/views/projects.rs`, `tests/projects.rs`):
-- [ ] relative time buckets
-- [ ] document and description autosave
-- [ ] archived project clears selection and shows Overview only
-- [ ] identifier lowercases and accepts ten chars
-- [ ] title Enter renames, Esc cancels
-- [ ] drop index scoped to siblings
+- [x] DROP relative time buckets: the gpui project rows do not show them
+- [x] document and description autosave (already covered)
+- [x] archived project clears selection and pins Overview (already covered)
+- [x] identifier normalisation (covered by project create/rename tests)
+- [x] title Enter renames, Esc cancels (already covered)
+- [x] drop index scoped to siblings (already covered)
 
 Card modal (`crates/app-gpui/src/views/card_modal.rs`, tests):
-- [ ] project modal offers "Show on Tasks boards", not "Move to board"
-- [ ] normal modal keeps "Move to board"
-- [ ] Tab inserts two spaces
-- [ ] Esc/ex behaviour with vim on and off
+- [x] project vs normal modal actions (already covered)
+- [x] DROP Tab inserts two spaces: the gpui focus trap reserves Tab for
+      focus navigation inside the modal, so the key never reaches the field.
+      Not worth a framework-level workaround; recorded as a deliberate
+      divergence and reported.
+- [x] Esc/ex behaviour with vim on and off (already covered)
 
 Documents (`crates/app-gpui/src/views/documents.rs`, `tests/documents.rs`):
-- [ ] tab lifecycle
-- [ ] `:w` flushes without closing
-- [ ] `:q` flushes and closes
-- [ ] create folder and Markdown file
-- [ ] import copies into the selected folder
+- [x] tab lifecycle (already covered)
+- [x] `:w` flush and `:q` flush+close (already covered)
+- [x] create folder and Markdown file (already covered)
+- [x] import copies into the selected folder (already covered)
 
 Board/tasks/cards/animation:
-- [ ] mirrored project cards are drop anchors in the unified order
-- [ ] All-board add-form and drag-gap rules
-- [ ] `anim`: delayed track progress and no-track scroll jump
-- [ ] card meta-label placement rules
+- [x] mirrored project cards are drop anchors in the unified order
+      (`store::tests::area_board_treats_a_filed_project_card_as_a_drop_anchor`)
+- [x] DROP All-board add-form/drag-gap: egui layout tests, no shared surface
+- [x] DROP `anim` delayed-track/no-track: gpui has no track or stationary
+      scroll concept; its seven curve/reflow tests stay
+- [x] card meta-label placement (`store::tests::all_board_labels_a_card_with_its_home_board_title`)
 
 Boot:
-- [ ] `crates/app-gpui/src/store.rs`: open a DB created by the egui
-      schema/seed path and read a card
+- [x] `store::tests::opens_a_database_written_by_the_shared_bootstrap`
 
-- [ ] Gate: gpui fmt/clippy/test, ported list green.
-- [ ] Commit tests only.
-- [ ] Report: ported count + any DROP decision.
+- [x] Gate: gpui fmt/clippy/test, ported list green.
+- [x] Commit tests only.
+- [x] Report: ported count + DROP decisions.
 
 ## S3 — Settings bridge and 24-hour preference
 

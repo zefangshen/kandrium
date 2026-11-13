@@ -2217,4 +2217,151 @@ mod tests {
         assert_eq!(diff("", "xy"), (0, 0, "xy".into()));
         assert_eq!(diff("abc", ""), (0, 3, String::new()));
     }
+
+    /// Like [`run`], but keeps the modal state so a test can inspect the
+    /// register and the mode.
+    fn run_state(text: &str, cursor: usize, keys: &str) -> (VimState, Buf) {
+        let mut state = VimState::default();
+        let mut b = Buf::new(text, cursor);
+        for ch in keys.chars() {
+            if ch == '\u{1b}' {
+                escape(&mut state, &mut b);
+            } else if state.mode == VimMode::Insert {
+                b.splice(b.cursor, b.cursor, &ch.to_string());
+                b.cursor += 1;
+            } else {
+                feed(&mut state, &mut b, ch);
+            }
+        }
+        (state, b)
+    }
+
+    fn body(b: &Buf) -> String {
+        b.chars.iter().collect()
+    }
+
+    #[test]
+    fn ex_parser_accepts_the_documented_commands() {
+        assert_eq!(parse_ex("w"), Ok(ExCommand::Write));
+        assert_eq!(parse_ex(" write "), Ok(ExCommand::Write));
+        assert_eq!(parse_ex("q"), Ok(ExCommand::Close));
+        assert_eq!(parse_ex("quit"), Ok(ExCommand::Close));
+        assert_eq!(parse_ex("wq"), Ok(ExCommand::Close));
+        assert_eq!(parse_ex("x"), Ok(ExCommand::Close));
+        assert_eq!(parse_ex("xit"), Ok(ExCommand::Close));
+        assert_eq!(parse_ex("q!"), Err("Not a command: :q!".to_string()));
+    }
+
+    #[test]
+    fn counted_linewise_operations_cover_n_lines() {
+        let (_, b) = run_state("a\nb\nc\nd", 0, "3dd");
+        assert_eq!(body(&b), "d");
+        let (state, b) = run_state("a\nb\nc", 0, "3cc");
+        assert_eq!(body(&b), "");
+        assert_eq!(state.mode, VimMode::Insert);
+        let (state, b) = run_state("a\nb\nc\nd", 0, "2yy");
+        assert_eq!(body(&b), "a\nb\nc\nd");
+        assert_eq!(state.register, "a\nb\n");
+    }
+
+    #[test]
+    fn counted_delete_to_end_and_yank() {
+        let (_, b) = run_state("abc\ndef\nghi", 1, "2D");
+        assert_eq!(body(&b), "a\nghi");
+        let (state, b) = run_state("abc\ndef\nghi", 1, "2C");
+        assert_eq!(body(&b), "a\nghi");
+        assert_eq!(state.mode, VimMode::Insert);
+        let (state, _) = run_state("a\nb\nc\nd", 0, "2Y");
+        assert_eq!(state.register, "a\nb\n");
+    }
+
+    #[test]
+    fn j_and_k_keep_the_goal_column() {
+        let (_, b) = run_state("abcdef\nxy\nabcdef", 2, "jj");
+        assert_eq!(b.cursor, 12);
+        let (_, b) = run_state("abcdef\nxy\nabcdef", 2, "jjk");
+        assert_eq!(b.cursor, 8);
+        let (_, b) = run_state("abcdef\nxy\nabcdef", 2, "jjkk");
+        assert_eq!(b.cursor, 2, "the goal column returns after a short line");
+    }
+
+    #[test]
+    fn find_char_motions_and_repeat() {
+        assert_eq!(run("abcxdef", 0, "fx").1, 3);
+        assert_eq!(run("abcxdef", 6, "Fx").1, 3);
+        assert_eq!(run("a x b x c", 0, "2fx").1, 6);
+        assert_eq!(run("a,b,c,d", 0, "f,;").1, 3);
+        assert_eq!(run("a,b,c,d", 0, "f,;,").1, 1);
+        assert_eq!(run("abc def", 0, "fz").1, 0, "a missing target is a no-op");
+    }
+
+    #[test]
+    fn find_char_motions_work_under_operators() {
+        assert_eq!(run("abcxdef", 0, "dfx").0, "def");
+        assert_eq!(run("abcxdef", 0, "dtx").0, "xdef");
+        assert_eq!(run("abcxdef", 0, "ctx").0, "xdef");
+    }
+
+    #[test]
+    fn dot_repeats_normal_commands() {
+        assert_eq!(run("abcdef", 0, "x.").0, "cdef");
+        assert_eq!(run("foo bar baz", 0, "dw.").0, "baz");
+        assert_eq!(run("a\nb\nc\nd\ne\nf", 0, "3dd.").0, "");
+    }
+
+    #[test]
+    fn dot_repeats_an_insert_session_in_one_undo_step() {
+        let mut state = VimState::default();
+        let mut b = Buf::new("abc", 0);
+        feed(&mut state, &mut b, 'i');
+        if let Some(rec) = state.recording.as_mut() {
+            rec.push_str("XY");
+        }
+        b.splice(b.cursor, b.cursor, "XY");
+        b.cursor = 2;
+        escape(&mut state, &mut b);
+        assert_eq!(body(&b), "XYabc");
+        feed(&mut state, &mut b, '.');
+        assert_eq!(body(&b), "XXYYabc");
+        feed(&mut state, &mut b, 'u');
+        assert_eq!(body(&b), "XYabc", "the replay undoes as one step");
+    }
+
+    #[test]
+    fn word_text_objects() {
+        assert_eq!(run("foo bar baz", 4, "diw").0, "foo  baz");
+        let (state, b) = run_state("foo bar", 4, "ciw");
+        assert_eq!(body(&b), "foo ");
+        assert_eq!(state.mode, VimMode::Insert);
+        assert_eq!(run("foo bar baz", 4, "daw").0, "foo baz");
+    }
+
+    #[test]
+    fn quote_text_objects() {
+        let quote = "say \"hi there\"";
+        assert_eq!(run(quote, 6, "di\"").0, "say \"\"");
+        assert_eq!(run(quote, 6, "da\"").0, "say ");
+    }
+
+    #[test]
+    fn bracket_text_objects_cross_lines() {
+        let (state, b) = run_state("f(a,\nb)", 2, "ci(");
+        assert_eq!(body(&b), "f()");
+        assert_eq!(state.mode, VimMode::Insert);
+    }
+
+    #[test]
+    fn paragraph_text_objects() {
+        assert_eq!(run("one\ntwo\n\nthree", 1, "dip").0, "\nthree");
+        assert_eq!(run("one\ntwo\n\nthree", 1, "dap").0, "three");
+    }
+
+    #[test]
+    fn visual_text_object_extends_the_selection() {
+        let (state, b) = run_state("foo bar", 0, "viw");
+        assert_eq!(state.mode, VimMode::Visual);
+        assert_eq!(state.anchor, 0);
+        assert_eq!(b.cursor, 2);
+        assert_eq!(body(&b), "foo bar");
+    }
 }
