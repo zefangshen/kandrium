@@ -857,6 +857,143 @@ pub fn format_clock(now: Timestamp, time_zone: &TimeZone, use_24h: bool) -> Cloc
     }
 }
 
+// ---------------------------------------------------------------------------
+// Time probe
+// ---------------------------------------------------------------------------
+
+/// Why a typed probe time could not be resolved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeError {
+    /// The field was committed with no text.
+    Empty,
+    /// The text is not a time this parser understands.
+    Format,
+    /// The time parsed but no such wall clock exists on that date
+    /// (`24:00`, `12:60`, `13:00 pm`, `0:00 am`).
+    OutOfRange,
+}
+
+impl std::fmt::Display for ProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProbeError::Empty => f.write_str("Enter a time like 14:30"),
+            ProbeError::Format => f.write_str("Enter a time like 14:30"),
+            ProbeError::OutOfRange => f.write_str("Enter a time between 00:00 and 23:59"),
+        }
+    }
+}
+
+/// Whether a wall-clock time is unambiguous, skipped or repeated in a zone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeAmbiguity {
+    /// Exactly one instant matches the wall clock.
+    Unique,
+    /// Spring forward: the wall clock never occurs on that date.
+    Gap,
+    /// Fall back: the wall clock occurs twice on that date.
+    Fold,
+}
+
+/// Today's date in `zone`, derived from the live instant.
+pub fn probe_date(now: Timestamp, zone: &TimeZone) -> Date {
+    now.to_zoned(zone.clone()).date()
+}
+
+/// Parse `text` as a wall-clock time on `date` in `zone`.
+///
+/// Accepts `H:mm`, `HH:mm`, `H.mm`, `HH.mm` and the 12-hour shapes `H:mm am`,
+/// `H am`, `H:mm pm` (the space is optional and the suffix is
+/// case-insensitive). 24-hour digits are accepted regardless of the app's
+/// preference, so `14:30` always means the same wall clock.
+///
+/// Ambiguous wall clocks resolve with jiff's `Disambiguation::Compatible`
+/// strategy — a gap shifts forward to the first real time after it, a fold
+/// takes the earlier occurrence — because that is what `to_zoned` does.
+pub fn parse_probe_time(
+    text: &str,
+    date: Date,
+    zone: &TimeZone,
+) -> std::result::Result<Timestamp, ProbeError> {
+    let text = text.trim().to_lowercase();
+    if text.is_empty() {
+        return Err(ProbeError::Empty);
+    }
+
+    let (clock, period) = if let Some(rest) = text.strip_suffix("am") {
+        (rest.trim(), Some(false))
+    } else if let Some(rest) = text.strip_suffix("pm") {
+        (rest.trim(), Some(true))
+    } else {
+        (text.as_str(), None)
+    };
+
+    let (hour_text, minute_text) = match clock.split_once([':', '.']) {
+        Some((hour, minute)) => (hour.trim(), Some(minute.trim())),
+        None => (clock.trim(), None),
+    };
+    if hour_text.is_empty() || hour_text.len() > 2 || !hour_text.chars().all(|c| c.is_ascii_digit())
+    {
+        return Err(ProbeError::Format);
+    }
+    let hour: i64 = hour_text.parse().map_err(|_| ProbeError::Format)?;
+    let minute: i64 = match minute_text {
+        Some(minute) => {
+            if minute.is_empty() || minute.len() > 2 || !minute.chars().all(|c| c.is_ascii_digit())
+            {
+                return Err(ProbeError::Format);
+            }
+            minute.parse().map_err(|_| ProbeError::Format)?
+        }
+        // `2 pm` means the top of the hour; a bare `2` stays ambiguous.
+        None if period.is_some() => 0,
+        None => return Err(ProbeError::Format),
+    };
+    if minute > 59 {
+        return Err(ProbeError::OutOfRange);
+    }
+
+    let hour = match period {
+        Some(pm) => {
+            if !(1..=12).contains(&hour) {
+                return Err(ProbeError::OutOfRange);
+            }
+            match (pm, hour) {
+                (false, 12) => 0,
+                (true, 12) => 12,
+                (false, hour) => hour,
+                (true, hour) => hour + 12,
+            }
+        }
+        None => {
+            if hour > 23 {
+                return Err(ProbeError::OutOfRange);
+            }
+            hour
+        }
+    };
+
+    let time = jiff::civil::Time::new(hour as i8, minute as i8, 0, 0)
+        .map_err(|_| ProbeError::OutOfRange)?;
+    date.to_datetime(time)
+        .to_zoned(zone.clone())
+        .map(|zoned| zoned.timestamp())
+        .map_err(|_| ProbeError::OutOfRange)
+}
+
+/// Classify a civil time in `zone` before it is disambiguated.
+pub fn probe_ambiguity(date: Date, time: jiff::civil::Time, zone: &TimeZone) -> ProbeAmbiguity {
+    match zone.to_ambiguous_zoned(date.to_datetime(time)).offset() {
+        jiff::tz::AmbiguousOffset::Unambiguous { .. } => ProbeAmbiguity::Unique,
+        jiff::tz::AmbiguousOffset::Gap { .. } => ProbeAmbiguity::Gap,
+        jiff::tz::AmbiguousOffset::Fold { .. } => ProbeAmbiguity::Fold,
+    }
+}
+
+/// The zone the app runs in. Captured once when a probe is opened.
+pub fn system_zone() -> TimeZone {
+    TimeZone::system()
+}
+
 /// `0` → `GMT`; otherwise `GMT` plus whole hours and, when present, minutes.
 pub fn format_offset(seconds: i32) -> String {
     if seconds == 0 {
@@ -1426,5 +1563,111 @@ mod tests {
 
     fn date(value: &str) -> Date {
         value.parse().unwrap()
+    }
+
+    fn probe_at(text: &str, day: &str, identifier: &str) -> Timestamp {
+        parse_probe_time(text, date(day), &zone(identifier)).expect("parse probe time")
+    }
+
+    #[test]
+    fn probe_time_accepts_both_clock_shapes_and_rejects_junk() {
+        let utc = zone("UTC");
+        let day = date("2026-11-05");
+        for text in ["9:05", "09:05", "9.05", "2:30 pm", "2:30pm", "2 pm"] {
+            assert!(
+                parse_probe_time(text, day, &utc).is_ok(),
+                "should accept {text}"
+            );
+        }
+        assert_eq!(
+            probe_at("2:30 pm", "2026-11-05", "UTC").as_second(),
+            instant("2026-11-05T14:30:00Z").as_second()
+        );
+        assert_eq!(
+            probe_at("2 pm", "2026-11-05", "UTC").as_second(),
+            instant("2026-11-05T14:00:00Z").as_second()
+        );
+
+        for text in [
+            "", "  ", "abc", "24:00", "12:60", "0:00 pm", "13:00 pm", "2",
+        ] {
+            let result = parse_probe_time(text, day, &utc);
+            assert!(result.is_err(), "should reject {text:?}: {result:?}");
+        }
+        assert_eq!(parse_probe_time("", day, &utc), Err(ProbeError::Empty));
+        assert_eq!(
+            parse_probe_time("24:00", day, &utc),
+            Err(ProbeError::OutOfRange)
+        );
+        assert_eq!(
+            parse_probe_time("13:00 pm", day, &utc),
+            Err(ProbeError::OutOfRange)
+        );
+        assert_eq!(parse_probe_time("abc", day, &utc), Err(ProbeError::Format));
+    }
+
+    #[test]
+    fn probe_date_reads_the_probe_zone_not_the_local_one() {
+        let at = instant("2026-03-08T04:30:00Z");
+        assert_eq!(probe_date(at, &zone("Europe/Paris")), date("2026-03-08"));
+        assert_eq!(
+            probe_date(at, &zone("America/Los_Angeles")),
+            date("2026-03-07")
+        );
+    }
+
+    #[test]
+    fn probe_resolves_a_dst_gap_forward_and_reports_it() {
+        let new_york = zone("America/New_York");
+        // 02:30 does not exist on 2026-03-08; the compatible strategy lands on
+        // the first real wall clock after the jump.
+        assert_eq!(
+            probe_at("2:30", "2026-03-08", "America/New_York").as_second(),
+            instant("2026-03-08T07:30:00Z").as_second()
+        );
+        assert_eq!(
+            probe_ambiguity(
+                date("2026-03-08"),
+                jiff::civil::Time::new(2, 30, 0, 0).unwrap(),
+                &new_york
+            ),
+            ProbeAmbiguity::Gap
+        );
+    }
+
+    #[test]
+    fn probe_picks_the_earlier_occurrence_in_a_fold_and_reports_it() {
+        let new_york = zone("America/New_York");
+        let time = jiff::civil::Time::new(1, 30, 0, 0).unwrap();
+        let day = date("2026-11-01");
+        assert_eq!(
+            probe_at("1:30", "2026-11-01", "America/New_York").as_second(),
+            instant("2026-11-01T05:30:00Z").as_second()
+        );
+        assert_eq!(probe_ambiguity(day, time, &new_york), ProbeAmbiguity::Fold);
+        // The second occurrence is exactly one hour later.
+        assert_eq!(
+            new_york
+                .to_ambiguous_zoned(day.to_datetime(time))
+                .later()
+                .unwrap()
+                .timestamp()
+                .as_second(),
+            instant("2026-11-01T06:30:00Z").as_second()
+        );
+    }
+
+    #[test]
+    fn probe_handles_half_hour_zones_and_round_trips_formatting() {
+        assert_eq!(
+            probe_at("9:00", "2026-01-01", "Asia/Kolkata").as_second(),
+            instant("2026-01-01T03:30:00Z").as_second()
+        );
+        let at = probe_at("2:30 pm", "2026-11-05", "Asia/Tokyo");
+        let text = format_clock(at, &zone("Asia/Tokyo"), false);
+        assert_eq!(text.time, "2:30");
+        assert_eq!(text.period.as_deref(), Some("pm"));
+        let text = format_clock(at, &zone("Asia/Tokyo"), true);
+        assert_eq!(text.time, "14:30");
     }
 }
