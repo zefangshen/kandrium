@@ -144,13 +144,13 @@ Boot:
 
 ## S6 — Docs
 
-- [ ] `README.md`: one app, commands, dev bundle, Wiki merge.
-- [ ] `AGENTS.md`: gpui architecture, commands, dev bundle, sections, icons,
+- [x] `README.md`: one app, commands, dev bundle, Wiki merge.
+- [x] `AGENTS.md`: gpui architecture, commands, dev bundle, sections, icons,
       conventions; remove egui-only conventions.
-- [ ] `crates/app-gpui/README.md`: the new binary name and dev bundle.
-- [ ] Gate: `cargo test --workspace`.
-- [ ] Commit.
-- [ ] Report.
+- [x] `crates/app-gpui/README.md`: the new binary name and dev bundle.
+- [x] Gate: `cargo test --workspace`.
+- [x] Commit.
+- [x] Report.
 
 ## S7 — Sweep
 

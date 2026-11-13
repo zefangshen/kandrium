@@ -1,12 +1,12 @@
 # Kandrium
 
-Kandrium is a local-first Kanban desktop app with a companion [Model Context Protocol](https://modelcontextprotocol.io/) server. Boards, columns, and cards live in a single SQLite database that the egui desktop app and any MCP client (an AI assistant, scripts) can read and write at the same time.
+Kandrium is a local-first Kanban desktop app with a companion [Model Context Protocol](https://modelcontextprotocol.io/) server. Boards, columns, and cards live in a single SQLite database that the gpui desktop app and any MCP client (an AI assistant, scripts) can read and write at the same time.
 
-- **Native desktop UI** built with [eframe/egui](https://github.com/emilk/egui) — no Electron, no web runtime
+- **Native desktop UI** built with [gpui](https://gpui.rs) — no Electron, no web runtime
 - **MCP server over stdio** exposing 13 tools for board/column-archive/card operations
 - **Multi-process sync** — changes made through MCP appear in the running app automatically
 - **Virtual "All" board** that aggregates every card into To Do / In Progress / Done with its own ordering
-- **Notes, Documents, and Projects** alongside the board — Markdown notes with vim-modal editing, PDF/Markdown documents, and project workspaces with their own board and files
+- **Wiki and Projects** alongside the board — Markdown notes and PDF/Markdown documents in one Wiki section, plus project workspaces with their own board and files
 - **Clocks** — a world-clock page with saved cities, residents, visitors, and temporary travel/relocation
 - **Local SQLite storage** (WAL mode), no account and no network
 
@@ -17,21 +17,21 @@ Kandrium is a local-first Kanban desktop app with a companion [Model Context Pro
 - Drag-and-drop cards and columns with animated reflow and settle flights
 - Card editor modal, inline column creation, archive/restore, and per-column "archive all"
 - Archived view as a filterable data table
-- Notes: Markdown files with debounced autosave and vim-modal editing (also used in project docs and the card description)
-- Documents: PDFs with annotation sidecars and Markdown files, organized in folders with upload and inline creation
+- Wiki: Markdown notes and PDF/Markdown documents side by side, with debounced autosave, vim-modal editing, and PDF annotation sidecars
 - Projects: a folder/project tree, one board per project, short unique identifiers, a tabbed Overview/Tasks detail pane, and per-project documents
 - Clocks: searchable city list, 12/24-hour toggle, three cities per page, residents and visitors, and per-person travel windows that expire on their own
-- Dark / light appearance (persisted)
+- Dark appearance with a single blue accent
 - One-click MCP access: create, move, update, archive, and query cards from an AI assistant
 
 ## Project layout
 
 ```
 crates/
-  core/   Shared data layer: SQLite schema, services, seed data,
-          legacy-DB import, and the `kandrium-import` binary
-  app/    eframe/egui desktop application (`kandrium-app`)
-  mcp/    stdio MCP server (`kandrium-mcp`) built on rmcp
+  core/       Shared data layer: SQLite schema, services, seed data,
+              legacy-DB import, and the `kandrium-import` binary
+  app-gpui/   gpui desktop application (`kandrium-app`)
+  mcp/        stdio MCP server (`kandrium-mcp`) built on rmcp
+  pdf-render/ PDF rasterization worker shared by the app
 ```
 
 The app and the MCP server are thin front-ends over `kandrium-core`. All
@@ -68,9 +68,9 @@ cargo build --release -p kandrium-app
 ## Test and lint
 
 ```sh
-cargo test --workspace     # 264 tests, including headless egui geometry tests
-cargo clippy --workspace
-cargo fmt
+cargo test --workspace
+cargo clippy --workspace --all-targets
+cargo fmt --all
 ```
 
 ## MCP server configuration
@@ -110,6 +110,7 @@ the MCP transport.
 | Notes root | `KANDRIUM_NOTES` env var, else `<data_dir>/kandrium/notes/` |
 | Documents root | `KANDRIUM_DOCS` env var, else `<data_dir>/kandrium/documents/` |
 | Projects root | `KANDRIUM_PROJECTS` env var, else `<data_dir>/kandrium/projects/` |
+| App settings | `gpui-settings.conf` next to the database |
 | Legacy Electron DB (importer source) | `KANDRIUM_OLD_DB` env var, else `<data_dir>/planly/planly.db` |
 
 Clocks are stored in SQLite (schema v8–v10: `clocks`, `clock_people`,
@@ -118,6 +119,13 @@ documents, and project files do not live in the database.
 
 On macOS `<data_dir>` is `~/Library/Application Support`, so the default
 database is `~/Library/Application Support/kandrium/kandrium.db`.
+
+On first boot with no `gpui-settings.conf`, the app imports `vim_mode`,
+`section`, the tree-open flag, `projects_tree_open` and `clocks_use_24h` from
+the old egui store at `<data_dir>/Kandrium/app.ron` and never writes that file
+again. The database is the same file both builds used, so boards, cards,
+clocks and documents carry over. The last open board, project selection and
+window theme are not migrated and reset once.
 
 On first boot, if no Kandrium database exists but a pre-rebrand
 `<data_dir>/planly-rs/planly.db` is found, it is copied into place
@@ -183,14 +191,17 @@ The repository is configured for [cargo-packager](https://github.com/crabnebula-
 (see [packager.json](packager.json)):
 
 ```sh
-cargo packager --release
+just bundle
+# (equivalent)
+cargo packager --config packager.json
 ```
 
-This builds the release binary and produces `Kandrium.app` plus a DMG
-(bundle identifier `app.kandrium.desktop`).
+This builds the release binary and produces `Kandrium.app` plus
+`Kandrium_0.1.0_<arch>.dmg` in the repository root (bundle identifier
+`app.kandrium.desktop`).
 
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE). Bundled Inter font files and Lucide icons
 ship under their own licenses, included alongside the assets in
-`crates/app/assets/`.
+`crates/app-gpui/assets/`.
