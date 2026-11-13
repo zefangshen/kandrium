@@ -56,14 +56,18 @@ use crate::views::{
 };
 use crate::vim;
 
-/// The five top-level sections. [`Section::ALL`] fixes the segmented
-/// control's order, which deliberately differs from the egui app.
+/// The top-level sections. [`Section::ALL`] fixes the segmented control's
+/// order, which deliberately differs from the egui app.
+///
+/// Wiki temporarily sits outside `ALL` while the merged body is built; the
+/// cutover that drops Notes and Documents adds it to the nav.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
     Tasks,
     Clocks,
     Notes,
     Documents,
+    Wiki,
     Projects,
 }
 
@@ -82,6 +86,7 @@ impl Section {
             Section::Clocks => "Clocks",
             Section::Notes => "Notes",
             Section::Documents => "Documents",
+            Section::Wiki => "Wiki",
             Section::Projects => "Projects",
         }
     }
@@ -93,6 +98,7 @@ impl Section {
             Section::Clocks => "clocks",
             Section::Notes => "notes",
             Section::Documents => "documents",
+            Section::Wiki => "wiki",
             Section::Projects => "projects",
         }
     }
@@ -100,7 +106,10 @@ impl Section {
     /// Inverse of [`Section::id`], used by the settings store. `None` for a key
     /// this build does not know (a file written by a newer build).
     pub fn from_key(key: &str) -> Option<Section> {
-        Section::ALL.into_iter().find(|section| section.id() == key)
+        Section::ALL
+            .into_iter()
+            .find(|section| section.id() == key)
+            .or_else(|| (key == Section::Wiki.id()).then_some(Section::Wiki))
     }
 
     pub fn icon(self) -> Icon {
@@ -109,6 +118,7 @@ impl Section {
             Section::Clocks => Icon::Globe,
             Section::Notes => Icon::StickyNote,
             Section::Documents => Icon::FileText,
+            Section::Wiki => Icon::Folder,
             Section::Projects => Icon::FolderKanban,
         }
     }
@@ -317,10 +327,13 @@ impl AppShell {
         let settings = settings::Settings::load(&settings_path);
 
         let mut wiki = WikiState::new();
-        wiki.notes.tree_open = settings.tree_open(TreePanel::Notes);
-        wiki.notes.tree_w = settings.tree_width(TreePanel::Notes);
-        wiki.documents.tree_open = settings.tree_open(TreePanel::Documents);
-        wiki.documents.tree_w = settings.tree_width(TreePanel::Documents);
+        wiki.notes.tree_open = settings.tree_open(TreePanel::Wiki);
+        wiki.notes.tree_w = settings.tree_width(TreePanel::Wiki);
+        wiki.documents.tree_open = wiki.notes.tree_open;
+        wiki.documents.tree_w = wiki.notes.tree_w;
+        wiki.split = settings.wiki_split();
+        wiki.notes_collapsed = settings.wiki_half_collapsed(settings::WikiHalf::Notes);
+        wiki.docs_collapsed = settings.wiki_half_collapsed(settings::WikiHalf::Documents);
         let mut projects = ProjectsState::new();
         projects.tree_open = settings.tree_open(TreePanel::Projects);
         projects.tree_w = settings.tree_width(TreePanel::Projects);
@@ -393,6 +406,10 @@ impl AppShell {
         match section {
             Section::Notes => shell.load_notes(),
             Section::Documents => shell.load_documents(),
+            Section::Wiki => {
+                shell.load_notes();
+                shell.load_documents();
+            }
             Section::Projects => shell.load_projects(),
             _ => {}
         }
@@ -409,13 +426,14 @@ impl AppShell {
         self.settings.set_vim_mode(self.vim_mode);
         self.settings.set_section(self.section);
         self.settings
-            .set_tree_open(TreePanel::Notes, self.wiki.notes.tree_open);
+            .set_tree_open(TreePanel::Wiki, self.wiki.notes.tree_open);
         self.settings
-            .set_tree_width(TreePanel::Notes, self.wiki.notes.tree_w);
+            .set_tree_width(TreePanel::Wiki, self.wiki.notes.tree_w);
+        self.settings.set_wiki_split(self.wiki.split);
         self.settings
-            .set_tree_open(TreePanel::Documents, self.wiki.documents.tree_open);
+            .set_wiki_half_collapsed(settings::WikiHalf::Notes, self.wiki.notes_collapsed);
         self.settings
-            .set_tree_width(TreePanel::Documents, self.wiki.documents.tree_w);
+            .set_wiki_half_collapsed(settings::WikiHalf::Documents, self.wiki.docs_collapsed);
         self.settings
             .set_tree_open(TreePanel::Projects, self.projects.tree_open);
         self.settings
@@ -456,20 +474,23 @@ impl AppShell {
         cx.notify();
     }
 
-    /// Live width while the tree splitter is dragged.
+    /// Live width while a Wiki tree splitter is dragged. Both halves share the
+    /// column width, so either splitter writes the same value.
     pub(crate) fn set_notes_tree_width(&mut self, width: f32, cx: &mut Context<Self>) {
         let width = settings::clamp_tree_width(width);
         if (self.wiki.notes.tree_w - width).abs() > 0.5 {
             self.wiki.notes.tree_w = width;
+            self.wiki.documents.tree_w = width;
             cx.notify();
         }
     }
 
-    /// Live width while the tree splitter is dragged.
+    /// Live width while a Wiki tree splitter is dragged.
     pub(crate) fn set_documents_tree_width(&mut self, width: f32, cx: &mut Context<Self>) {
         let width = settings::clamp_tree_width(width);
         if (self.wiki.documents.tree_w - width).abs() > 0.5 {
             self.wiki.documents.tree_w = width;
+            self.wiki.notes.tree_w = width;
             cx.notify();
         }
     }
@@ -520,6 +541,11 @@ impl AppShell {
             self.flush_documents(cx);
             self.save_documents_session();
         }
+        if self.section == Section::Wiki {
+            self.flush_active_note(cx);
+            self.flush_documents(cx);
+            self.save_documents_session();
+        }
         if self.section == Section::Projects {
             self.flush_project_fields(window, cx);
             self.save_project_description(cx);
@@ -533,6 +559,10 @@ impl AppShell {
             Section::Clocks => self.load_clocks(),
             Section::Notes => self.load_notes(),
             Section::Documents => self.load_documents(),
+            Section::Wiki => {
+                self.load_notes();
+                self.load_documents();
+            }
             Section::Projects => self.load_projects(),
         }
         if section != Section::Clocks {
@@ -3393,7 +3423,7 @@ impl AppShell {
                     self.reload_displayed_board();
                 }
             }
-            Section::Notes | Section::Documents => return,
+            Section::Notes | Section::Documents | Section::Wiki => return,
         }
         cx.notify();
     }
@@ -5933,6 +5963,18 @@ impl AppShell {
                 notes::notes_view(&self.wiki.notes, &t, window, cx).into_any_element()
             }
             Section::Documents => {
+                self.pump_documents(cx);
+                self.restore_documents_session(window, cx);
+                let element = documents::documents_view(&mut self.wiki.documents, &t, window, cx);
+                if self.wiki.documents.needs_repaint {
+                    cx.notify();
+                }
+                element.into_any_element()
+            }
+            // Temporary stopgap until the merged body lands: a settings file
+            // that still names Notes or Documents boots into Wiki, which shows
+            // the documents pane so the migrated user keeps their open tabs.
+            Section::Wiki => {
                 self.pump_documents(cx);
                 self.restore_documents_session(window, cx);
                 let element = documents::documents_view(&mut self.wiki.documents, &t, window, cx);

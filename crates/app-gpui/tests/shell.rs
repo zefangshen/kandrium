@@ -1094,7 +1094,7 @@ fn settings_file_records_section_tree_and_vim(cx: &mut TestAppContext) {
 
     let saved = Settings::load(&settings_path);
     assert_eq!(saved.section(), Section::Notes);
-    assert!(!saved.tree_open(TreePanel::Notes));
+    assert!(!saved.tree_open(TreePanel::Wiki));
 
     // Vim preference from the card modal's mode badge.
     cx.update(|window, cx| window.click("nav-tasks", cx));
