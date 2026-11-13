@@ -20,9 +20,8 @@ use gpui_kit::base::text::markdown;
 use gpui_kit::component::input::{Editor, EditorState, InputState, TextareaState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, DragMoveEvent, Entity, Pixels,
-    Point, RenderImage, Rgba, ScrollHandle, TestSupportExt, Window, div, point, px, relative, rgba,
-    size,
+    AnyElement, App, Bounds, ClickEvent, Context, Entity, Pixels, Point, RenderImage, Rgba,
+    ScrollHandle, TestSupportExt, Window, div, point, px, relative, rgba, size,
 };
 
 use kandrium_core::documents::{AnnotationKind, DocAnnotation, DocEntry};
@@ -31,7 +30,6 @@ use pdf_render::{Event, PageText, PdfWorker};
 use crate::app::AppShell;
 use crate::assets::{Icon, icon};
 use crate::theme::{Text, TextStyled, Tokens};
-use crate::views::placeholder;
 use crate::vim::VimSession;
 
 /// Tree panel width when expanded, matching the other tree sections.
@@ -488,124 +486,6 @@ pub fn abs_path(root: &Path, rel: &str) -> PathBuf {
 // View
 // ---------------------------------------------------------------------------
 
-/// Render the whole section.
-pub fn documents_view(
-    state: &mut DocumentsState,
-    t: &Tokens,
-    window: &mut Window,
-    cx: &mut Context<AppShell>,
-) -> AnyElement {
-    state.needs_repaint = false;
-    let mut row = div()
-        .id("documents-view")
-        .test_support()
-        .size_full()
-        .flex()
-        .child(tree_panel(state, t, cx));
-
-    if state.tree_open {
-        row = row
-            .child(tree_splitter(t))
-            .child(div().w(px(1.)).h_full().bg(t.divider));
-    }
-    row.on_drag_move::<DocumentsTreeDrag>(cx.listener(
-        |this, event: &DragMoveEvent<DocumentsTreeDrag>, _window, cx| {
-            let width = f32::from(event.event.position.x) - f32::from(event.bounds.origin.x);
-            this.set_documents_tree_width(width, cx);
-        },
-    ))
-    .on_drop::<DocumentsTreeDrag>(cx.listener(|this, _drag: &DocumentsTreeDrag, _window, cx| {
-        this.finish_tree_resize(cx);
-    }))
-    .child(content(state, t, window, cx))
-    .into_any_element()
-}
-
-/// A 5 px grab lane drawing the same 1 px rule as the plain divider.
-fn tree_splitter(t: &Tokens) -> AnyElement {
-    div()
-        .id("documents-tree-splitter")
-        .test_support()
-        // Visually 1 px, flush on both sides: the 5 px element is centred on
-        // the rule with -2 px side margins, so its slack overlaps the two
-        // neighbours instead of leaving an empty strip, and the resize target
-        // stays comfortably wide.
-        .w(px(5.))
-        .mx(px(-2.))
-        .h_full()
-        .flex()
-        .justify_center()
-        .flex_none()
-        .cursor(CursorStyle::ResizeLeftRight)
-        .hover(|style| style.bg(t.hover))
-        .on_drag(DocumentsTreeDrag, |_drag, _offset, _window, cx| {
-            cx.new(|_| TreeDragGhost)
-        })
-        .child(div().w(px(1.)).h_full().bg(t.divider))
-        .into_any_element()
-}
-
-/// Payload for a tree-splitter drag. Only its type selects the listener.
-pub struct DocumentsTreeDrag;
-
-struct TreeDragGhost;
-
-impl Render for TreeDragGhost {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().w(px(1.)).h(px(1.))
-    }
-}
-
-/// Header (collapse, new file, new folder, upload), the inline create row and
-/// the tree rows.
-fn tree_panel(state: &mut DocumentsState, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
-    if !state.tree_open {
-        return tree_rail(t, cx);
-    }
-
-    div()
-        .id("documents-tree")
-        .test_support()
-        .w(px(state.tree_w))
-        .h_full()
-        .flex()
-        .flex_col()
-        .border_r_1()
-        .border_color(t.divider)
-        .child(tree_header(t, cx, None))
-        .child(tree_body(state, t, cx))
-        .into_any_element()
-}
-
-/// The 30 px rail the whole tree column collapses to.
-pub(crate) fn tree_rail(t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
-    div()
-        .id("documents-tree-rail")
-        .test_support()
-        .w(px(RAIL_W))
-        .h_full()
-        .flex()
-        .flex_col()
-        .items_center()
-        .pt(px(10.))
-        .border_r_1()
-        .border_color(t.divider)
-        .child(
-            div()
-                .id("documents-expand")
-                .test_support()
-                .p(px(4.))
-                .rounded(px(t.radius))
-                .cursor_pointer()
-                .hover(|style| style.bg(t.hover))
-                .on_click(
-                    cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_documents_tree(cx)),
-                )
-                .child(icon(Icon::ChevronRight, 14., t.text_muted)),
-        )
-        .into_any_element()
-}
-
 /// The half's 38 px title row: name, whole-tree collapse, upload, new file,
 /// new folder and an optional trailing control (the Wiki half toggle).
 pub(crate) fn tree_header(
@@ -634,7 +514,7 @@ pub(crate) fn tree_header(
             "documents-collapse",
             Icon::ChevronLeft,
             t,
-            cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_documents_tree(cx)),
+            cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_wiki_tree(cx)),
         ))
         .child(tree_action(
             "documents-upload",
@@ -959,86 +839,6 @@ pub(crate) fn doc_icon(path: &Path) -> Icon {
     } else {
         Icon::FileText
     }
-}
-
-/// Tab strip plus the active document body.
-fn content(
-    state: &mut DocumentsState,
-    t: &Tokens,
-    window: &mut Window,
-    cx: &mut Context<AppShell>,
-) -> AnyElement {
-    let mut body = div()
-        .id("documents-content")
-        .test_support()
-        .flex_1()
-        .min_w_0()
-        .h_full()
-        .flex()
-        .flex_col();
-
-    if state.tabs.is_empty() {
-        return body
-            .child(placeholder::message(
-                "documents-empty",
-                Icon::FileText,
-                "No document open",
-                "Pick a document in the tree, or upload a PDF or Markdown file.",
-                t,
-            ))
-            .into_any_element();
-    }
-
-    body = body.child(tab_strip(state, t, cx));
-
-    let Some(index) = state.active else {
-        return body.into_any_element();
-    };
-    body.child(detail_body(state, index, t, window, cx))
-        .into_any_element()
-}
-
-/// The document tab row. The merged Wiki section draws its own shared row, so
-/// this remains the Documents-only composition until the cutover.
-fn tab_strip(state: &mut DocumentsState, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
-    let mut strip = crate::views::tab_strip(t);
-    for (index, tab) in state.tabs.iter().enumerate() {
-        let active = state.active == Some(index);
-        let path = tab.path.clone();
-        let close_path = tab.path.clone();
-        strip = strip.child(
-            crate::views::pane_tab(format!("doc-tab-{}", tab.path.display()), active, t)
-                .test_support()
-                .cursor_pointer()
-                .hover(|style| style.bg(t.hover))
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.activate_doc_tab(path.clone(), window, cx)
-                }))
-                .child(icon(doc_icon(&tab.path), 12., t.text_faint))
-                .child(
-                    div()
-                        .text(Text::Small)
-                        .text_color(if active { t.text } else { t.text_faint })
-                        .child(tab.name.clone()),
-                )
-                .when(tab.has_unsaved(), |this| {
-                    this.child(div().size(px(3.)).rounded(px(2.)).bg(t.accent))
-                })
-                .child(
-                    div()
-                        .id(format!("doc-tab-close-{}", tab.path.display()))
-                        .p(px(1.))
-                        .rounded(px(3.))
-                        .hover(|style| style.bg(t.pressed))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                            cx.stop_propagation();
-                            this.close_doc_tab_by_path(close_path.clone(), cx)
-                        }))
-                        .child(icon(Icon::X, 10., t.text_faint)),
-                ),
-        );
-    }
-    strip.child(div().flex_1()).into_any_element()
 }
 
 /// One document's head row, Markdown editor/preview or PDF viewer, and status

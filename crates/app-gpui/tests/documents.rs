@@ -54,7 +54,7 @@ fn boot(cx: &mut TestAppContext, db: PathBuf) -> (Entity<AppShell>, &mut VisualT
 }
 
 fn open_documents(cx: &mut VisualTestContext) {
-    cx.update(|window, cx| window.click("nav-documents", cx));
+    cx.update(|window, cx| window.click("nav-wiki", cx));
     cx.update(|window, cx| window.render_frame(cx));
 }
 
@@ -70,7 +70,7 @@ fn row_id(path: &Path) -> String {
 }
 
 fn tab_id(path: &Path) -> String {
-    format!("doc-tab-{}", path.display())
+    format!("wiki-tab-doc-{}", path.display())
 }
 
 /// One-page PDF with a single text run, enough for the worker to render.
@@ -127,8 +127,8 @@ fn selects_the_documents_section_and_lists_the_tree(cx: &mut TestAppContext) {
     expand(cx, &root);
 
     cx.update(|window, _cx| {
-        assert!(window.find("documents-view").visible());
-        assert!(window.find("documents-tree").visible());
+        assert!(window.find("wiki-view").visible());
+        assert!(window.find("wiki-documents-tree").visible());
         let folder_row = window.find(row_id(&folder));
         let pdf_row = window.find(row_id(&pdf));
         let md_row = window.find(row_id(&md));
@@ -515,11 +515,11 @@ fn tree_collapses_to_a_rail_and_expands_back(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.click("documents-collapse", cx));
     cx.update(|window, cx| window.render_frame(cx));
     cx.update(|window, _cx| {
-        assert!(window.find("documents-tree-rail").visible());
-        assert!(window.try_find("documents-tree").is_none());
+        assert!(window.find("wiki-tree-rail").visible());
+        assert!(window.try_find("wiki-tree").is_none());
     });
 
-    cx.update(|window, cx| window.click("documents-expand", cx));
+    cx.update(|window, cx| window.click("wiki-expand", cx));
     cx.update(|window, cx| window.render_frame(cx));
-    cx.update(|window, _cx| assert!(window.find("documents-tree").visible()));
+    cx.update(|window, _cx| assert!(window.find("wiki-tree").visible()));
 }

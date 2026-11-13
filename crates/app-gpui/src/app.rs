@@ -56,27 +56,20 @@ use crate::views::{
 };
 use crate::vim;
 
-/// The top-level sections. [`Section::ALL`] fixes the segmented control's
-/// order, which deliberately differs from the egui app.
-///
-/// Wiki temporarily sits outside `ALL` while the merged body is built; the
-/// cutover that drops Notes and Documents adds it to the nav.
+/// The four top-level sections. [`Section::ALL`] fixes the segmented
+/// control's order, which deliberately differs from the egui app.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
     Tasks,
     Clocks,
-    Notes,
-    Documents,
     Wiki,
     Projects,
 }
 
 impl Section {
-    pub const ALL: [Section; 6] = [
+    pub const ALL: [Section; 4] = [
         Section::Tasks,
         Section::Projects,
-        Section::Notes,
-        Section::Documents,
         Section::Wiki,
         Section::Clocks,
     ];
@@ -85,8 +78,6 @@ impl Section {
         match self {
             Section::Tasks => "Tasks",
             Section::Clocks => "Clocks",
-            Section::Notes => "Notes",
-            Section::Documents => "Documents",
             Section::Wiki => "Wiki",
             Section::Projects => "Projects",
         }
@@ -97,8 +88,6 @@ impl Section {
         match self {
             Section::Tasks => "tasks",
             Section::Clocks => "clocks",
-            Section::Notes => "notes",
-            Section::Documents => "documents",
             Section::Wiki => "wiki",
             Section::Projects => "projects",
         }
@@ -107,18 +96,13 @@ impl Section {
     /// Inverse of [`Section::id`], used by the settings store. `None` for a key
     /// this build does not know (a file written by a newer build).
     pub fn from_key(key: &str) -> Option<Section> {
-        Section::ALL
-            .into_iter()
-            .find(|section| section.id() == key)
-            .or_else(|| (key == Section::Wiki.id()).then_some(Section::Wiki))
+        Section::ALL.into_iter().find(|section| section.id() == key)
     }
 
     pub fn icon(self) -> Icon {
         match self {
             Section::Tasks => Icon::SquareKanban,
             Section::Clocks => Icon::Globe,
-            Section::Notes => Icon::StickyNote,
-            Section::Documents => Icon::FileText,
             Section::Wiki => Icon::Folder,
             Section::Projects => Icon::FolderKanban,
         }
@@ -405,8 +389,6 @@ impl AppShell {
             shell.load_archived();
         }
         match section {
-            Section::Notes => shell.load_notes(),
-            Section::Documents => shell.load_documents(),
             Section::Wiki => {
                 shell.load_notes();
                 shell.load_documents();
@@ -482,16 +464,6 @@ impl AppShell {
         if (self.wiki.notes.tree_w - width).abs() > 0.5 {
             self.wiki.notes.tree_w = width;
             self.wiki.documents.tree_w = width;
-            cx.notify();
-        }
-    }
-
-    /// Live width while a Wiki tree splitter is dragged.
-    pub(crate) fn set_documents_tree_width(&mut self, width: f32, cx: &mut Context<Self>) {
-        let width = settings::clamp_tree_width(width);
-        if (self.wiki.documents.tree_w - width).abs() > 0.5 {
-            self.wiki.documents.tree_w = width;
-            self.wiki.notes.tree_w = width;
             cx.notify();
         }
     }
@@ -598,13 +570,6 @@ impl AppShell {
         // handle alive, so the caret would silently reappear when the section
         // comes back. Drop focus with the section it belonged to.
         window.blur(cx);
-        if self.section == Section::Notes {
-            self.flush_active_note(cx);
-        }
-        if self.section == Section::Documents {
-            self.flush_documents(cx);
-            self.save_documents_session();
-        }
         if self.section == Section::Wiki {
             self.flush_active_note(cx);
             self.flush_documents(cx);
@@ -621,8 +586,6 @@ impl AppShell {
         match section {
             Section::Tasks => self.load_tasks(),
             Section::Clocks => self.load_clocks(),
-            Section::Notes => self.load_notes(),
-            Section::Documents => self.load_documents(),
             Section::Wiki => {
                 self.load_notes();
                 self.load_documents();
@@ -3487,7 +3450,7 @@ impl AppShell {
                     self.reload_displayed_board();
                 }
             }
-            Section::Notes | Section::Documents | Section::Wiki => return,
+            Section::Wiki => return,
         }
         cx.notify();
     }
@@ -4242,12 +4205,6 @@ impl AppShell {
         }
     }
 
-    pub(crate) fn toggle_notes_tree(&mut self, cx: &mut Context<Self>) {
-        self.wiki.notes.tree_open = !self.wiki.notes.tree_open;
-        self.persist_settings();
-        cx.notify();
-    }
-
     pub(crate) fn toggle_notes_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if !self.wiki.notes.expanded.remove(&path) {
             self.wiki.notes.expanded.insert(path.clone());
@@ -4781,13 +4738,6 @@ impl AppShell {
             &rels,
         );
         let _ = kandrium_core::fsutil::write_atomic(&self.documents_session_path(), text);
-    }
-
-    pub(crate) fn toggle_documents_tree(&mut self, cx: &mut Context<Self>) {
-        self.wiki.documents.tree_open = !self.wiki.documents.tree_open;
-        self.save_documents_session();
-        self.persist_settings();
-        cx.notify();
     }
 
     pub(crate) fn toggle_doc_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -6039,20 +5989,6 @@ impl AppShell {
             Section::Tasks => self.tasks_body(window, cx),
             Section::Clocks => clocks::clocks_view(&mut self.clocks, self.use_24h, &t, window, cx)
                 .into_any_element(),
-            Section::Notes => {
-                notes::notes_view(&self.wiki.notes, &t, window, cx).into_any_element()
-            }
-            Section::Documents => {
-                self.pump_documents(cx);
-                self.restore_documents_session(window, cx);
-                let element = documents::documents_view(&mut self.wiki.documents, &t, window, cx);
-                if self.wiki.documents.needs_repaint {
-                    cx.notify();
-                }
-                element.into_any_element()
-            }
-            // Temporary stopgap: the merged body lands in this stage, and the
-            // cutover that retires Notes/Documents follows.
             Section::Wiki => {
                 self.pump_documents(cx);
                 self.restore_documents_session(window, cx);

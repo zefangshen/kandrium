@@ -86,7 +86,7 @@ fn notes_reject_escapes_and_collisions() {
     assert!(kandrium_core::notes::delete_path(&root, &root).is_err());
 }
 
-/// The Notes section renders its tree header and the empty content state.
+/// The Wiki section renders the notes tree and the empty content state.
 #[gpui::test]
 fn notes_view_renders_the_tree_and_empty_content(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
@@ -96,15 +96,15 @@ fn notes_view_renders_the_tree_and_empty_content(cx: &mut TestAppContext) {
     let (_view, cx) =
         cx.add_window_view(|_window, _cx| AppShell::with_store(Store::open_path(path)));
     cx.update(|window, cx| window.render_frame(cx));
-    cx.update(|window, cx| window.click("nav-notes", cx));
+    cx.update(|window, cx| window.click("nav-wiki", cx));
     cx.update(|window, cx| window.render_frame(cx));
 
     cx.update(|window, _cx| {
-        assert!(window.find("notes-view").visible());
-        assert!(window.find("notes-tree").visible());
+        assert!(window.find("wiki-view").visible());
+        assert!(window.find("wiki-notes-tree").visible());
         assert!(window.find("notes-new-note").visible());
         assert!(window.find("notes-new-folder").visible());
         assert!(window.find("notes-collapse").visible());
-        assert!(window.find("notes-empty").visible());
+        assert!(window.find("wiki-empty").visible());
     });
 }

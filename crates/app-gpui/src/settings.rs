@@ -311,14 +311,10 @@ mod tests {
 
     #[test]
     fn retired_section_ids_resolve_to_wiki() {
-        assert_eq!(
-            Section::from_key("wiki"),
-            Some(Section::Wiki),
-            "wiki resolves even before it joins the nav order"
-        );
-        // Notes and Documents are still live sections, so their ids resolve to
-        // themselves; once the cutover removes them, `section()` maps both to
-        // Wiki through the fallback arm.
+        for key in ["notes", "documents", "wiki"] {
+            let settings = Settings::parse(&format!("section={key}\n"));
+            assert_eq!(settings.section(), Section::Wiki, "section={key}");
+        }
         let settings = Settings::parse("section=elsewhere\n");
         assert_eq!(settings.section(), Section::Tasks);
     }

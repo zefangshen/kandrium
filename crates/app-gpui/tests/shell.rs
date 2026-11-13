@@ -44,8 +44,7 @@ fn every_section_renders_its_body(cx: &mut TestAppContext) {
 
     let expected = [
         (Section::Clocks, "clocks-view"),
-        (Section::Notes, "notes-view"),
-        (Section::Documents, "documents-view"),
+        (Section::Wiki, "wiki-view"),
         (Section::Projects, "projects-view"),
         (Section::Tasks, "board-view"),
     ];
@@ -1087,13 +1086,13 @@ fn settings_file_records_section_tree_and_vim(cx: &mut TestAppContext) {
     cx.update(|window, cx| window.render_frame(cx));
 
     // Section and tree flag.
-    cx.update(|window, cx| window.click("nav-notes", cx));
+    cx.update(|window, cx| window.click("nav-wiki", cx));
     cx.update(|window, cx| window.render_frame(cx));
     cx.update(|window, cx| window.click("notes-collapse", cx));
     cx.update(|window, cx| window.render_frame(cx));
 
     let saved = Settings::load(&settings_path);
-    assert_eq!(saved.section(), Section::Notes);
+    assert_eq!(saved.section(), Section::Wiki);
     assert!(!saved.tree_open(TreePanel::Wiki));
 
     // Vim preference from the card modal's mode badge.
@@ -2828,8 +2827,8 @@ fn board_search_does_not_regain_focus_after_navigating_away(cx: &mut TestAppCont
         );
     });
 
-    // Tasks -> Notes -> Tasks.
-    cx.update(|window, cx| window.click("nav-notes", cx));
+    // Tasks -> Wiki -> Tasks.
+    cx.update(|window, cx| window.click("nav-wiki", cx));
     cx.update(|window, cx| window.render_frame(cx));
     cx.update(|window, cx| window.click("nav-tasks", cx));
     cx.update(|window, cx| window.render_frame(cx));
