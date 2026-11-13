@@ -7,7 +7,7 @@
 //! fall back to defaults instead of failing the boot.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::app::Section;
 
@@ -97,6 +97,54 @@ impl Settings {
             return Self::default();
         };
         Self::parse(&text)
+    }
+
+    /// Read for boot. A missing file is seeded once from the retired egui
+    /// store, if one exists; an existing file always wins, so the import never
+    /// runs twice.
+    pub fn load_for_boot(path: &Path) -> Self {
+        if path.exists() {
+            return Self::load(path);
+        }
+        let mut settings = Self::default();
+        if let Some(legacy) = legacy_egui_path(path) {
+            settings.import_egui(&legacy);
+        }
+        settings
+    }
+
+    /// Seed the mappable preferences from the egui `app.ron`. Unknown keys,
+    /// malformed values and a missing file are ignored; the legacy file is
+    /// only ever read.
+    pub fn import_egui(&mut self, path: &Path) {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        if let Some(on) = ron_bool(&text, "vim_mode") {
+            self.set_vim_mode(on);
+        }
+        if let Some(section) = ron_scalar(&text, "section") {
+            let key = section.to_ascii_lowercase();
+            let section = match key.as_str() {
+                "notes" | "documents" => Section::Wiki,
+                other => Section::from_key(other).unwrap_or(Section::Tasks),
+            };
+            self.set_section(section);
+        }
+        let notes = ron_bool(&text, "notes_tree_open");
+        let documents = ron_bool(&text, "docs_tree_open");
+        if notes.is_some() || documents.is_some() {
+            self.set_tree_open(
+                TreePanel::Wiki,
+                notes.unwrap_or(false) || documents.unwrap_or(false),
+            );
+        }
+        if let Some(on) = ron_bool(&text, "projects_tree_open") {
+            self.set_tree_open(TreePanel::Projects, on);
+        }
+        if let Some(on) = ron_bool(&text, "clocks_use_24h") {
+            self.set_clocks_use_24h(on);
+        }
     }
 
     /// Parse the file format. Blank lines and `#` comments are skipped, and
@@ -264,6 +312,16 @@ impl Settings {
         self.set_bool("tasks_archive", on);
     }
 
+    /// Whether clocks render a 24-hour dial. Defaults to on, which is what
+    /// the in-memory state used before the key existed.
+    pub fn clocks_use_24h(&self) -> bool {
+        self.bool_at("clocks_use_24h", true)
+    }
+
+    pub fn set_clocks_use_24h(&mut self, on: bool) {
+        self.set_bool("clocks_use_24h", on);
+    }
+
     fn bool_at(&self, key: &str, default: bool) -> bool {
         match self.values.get(key).map(String::as_str) {
             Some("1" | "true" | "yes" | "on") => true,
@@ -276,6 +334,94 @@ impl Settings {
         self.values
             .insert(key.into(), if value { "1" } else { "0" }.into());
     }
+}
+
+/// `<data_dir>/Kandrium/app.ron`, the eframe store the egui build wrote.
+/// The settings file sits next to the database at `<data_dir>/kandrium/`.
+pub fn legacy_egui_path(settings_path: &Path) -> Option<PathBuf> {
+    let data_dir = settings_path.parent()?.parent()?;
+    Some(data_dir.join("Kandrium").join("app.ron"))
+}
+
+/// Read a boolean field from the RON text. `None` when the key is absent or
+/// the value is not a boolean.
+fn ron_bool(text: &str, key: &str) -> Option<bool> {
+    match ron_value(text, key)?.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// Read a scalar field, unwrapping `Some(..)` and quotes.
+fn ron_scalar(text: &str, key: &str) -> Option<String> {
+    let value = ron_value(text, key)?;
+    let value = value
+        .strip_prefix("Some(")
+        .and_then(|inner| inner.strip_suffix(')'))
+        .unwrap_or(&value)
+        .trim()
+        .trim_matches('"')
+        .to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+/// Extract the value token after `key:` without a RON dependency. The token
+/// ends at a top-level comma or closing bracket; quoted strings may contain
+/// both.
+fn ron_value(text: &str, key: &str) -> Option<String> {
+    let mut from = 0;
+    while let Some(offset) = text[from..].find(key) {
+        let at = from + offset;
+        let before = text[..at].chars().next_back();
+        let is_field_start = before.is_none_or(|ch| !ch.is_alphanumeric() && ch != '_');
+        let after = text[at + key.len()..].trim_start();
+        if is_field_start && let Some(rest) = after.strip_prefix(':') {
+            return Some(read_ron_token(rest.trim_start()));
+        }
+        from = at + key.len();
+    }
+    None
+}
+
+fn read_ron_token(text: &str) -> String {
+    let mut out = String::new();
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    for ch in text.chars() {
+        if quoted {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => {
+                quoted = true;
+                out.push(ch);
+            }
+            '(' | '[' => {
+                depth += 1;
+                out.push(ch);
+            }
+            ')' | ']' => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+                out.push(ch);
+            }
+            ',' if depth == 0 => break,
+            _ => out.push(ch),
+        }
+    }
+    out.trim().to_string()
 }
 
 /// Clamp a tree width into the range both views can render.
@@ -420,6 +566,67 @@ mod tests {
         settings.set_titlebar_clock(None);
         assert_eq!(settings.titlebar_clock(), None);
         assert!(!settings.to_text().contains("titlebar_clock"));
+    }
+
+    #[test]
+    fn clock_units_default_on_and_round_trip() {
+        assert!(Settings::default().clocks_use_24h());
+        let mut settings = Settings::default();
+        settings.set_clocks_use_24h(false);
+        assert_eq!(settings.to_text(), "clocks_use_24h=0\n");
+        assert!(!Settings::parse(&settings.to_text()).clocks_use_24h());
+        assert!(Settings::parse("clocks_use_24h=garbage\n").clocks_use_24h());
+    }
+
+    #[test]
+    fn egui_settings_seed_the_gpui_store_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let kandrium = dir.path().join("kandrium");
+        std::fs::create_dir_all(&kandrium).unwrap();
+        let path = kandrium.join(FILE_NAME);
+        let legacy = dir.path().join("Kandrium");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(
+            legacy.join("app.ron"),
+            "(vim_mode: false, section: Documents, notes_tree_open: false, \
+             docs_tree_open: true, projects_tree_open: false, \
+             clocks_use_24h: false, dark_mode: true)",
+        )
+        .unwrap();
+
+        let settings = Settings::load_for_boot(&path);
+        assert!(!settings.vim_mode());
+        assert_eq!(settings.section(), Section::Wiki);
+        assert!(
+            settings.tree_open(TreePanel::Wiki),
+            "either half being open keeps the merged tree open"
+        );
+        assert!(!settings.tree_open(TreePanel::Projects));
+        assert!(!settings.clocks_use_24h());
+        assert!(!path.exists(), "boot must not write the settings file");
+
+        // An existing gpui file wins, so the import is one-time.
+        let mut existing = Settings::default();
+        existing.set_vim_mode(true);
+        existing.save(&path).unwrap();
+        let again = Settings::load_for_boot(&path);
+        assert!(again.vim_mode());
+        assert!(again.clocks_use_24h());
+    }
+
+    #[test]
+    fn malformed_egui_settings_fall_back_to_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let kandrium = dir.path().join("kandrium");
+        std::fs::create_dir_all(&kandrium).unwrap();
+        let legacy = dir.path().join("Kandrium");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("app.ron"), "not ron at all").unwrap();
+
+        let settings = Settings::load_for_boot(&kandrium.join(FILE_NAME));
+        assert!(settings.vim_mode());
+        assert_eq!(settings.section(), Section::Tasks);
+        assert!(settings.clocks_use_24h());
     }
 
     #[test]

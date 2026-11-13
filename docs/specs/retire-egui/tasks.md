@@ -96,19 +96,19 @@ Boot:
 
 ## S3 — Settings bridge and 24-hour preference
 
-- [ ] `settings.rs`: add `clocks_use_24h` (default `true`) to the conf model,
+- [x] `settings.rs`: add `clocks_use_24h` (default `true`) to the conf model,
       parser, writer and sorted-key output.
-- [ ] Clocks view/probe reads `clocks_use_24h` instead of in-memory state; the
+- [x] Clocks view/probe reads `clocks_use_24h` instead of in-memory state; the
       toggle persists.
-- [ ] `import_egui_settings()`: run only when `gpui-settings.conf` is absent;
+- [x] `import_egui_settings()`: run only when `gpui-settings.conf` is absent;
       read `<data_dir>/Kandrium/app.ron`; map `vim_mode`, `section`,
       `notes_tree_open || docs_tree_open`, `projects_tree_open`,
       `clocks_use_24h`; ignore unknown/malformed input; never write `app.ron`.
-- [ ] Unit tests: import, skip when conf exists, malformed file, 24h round trip.
-- [ ] Boot test against a temp data dir with an `app.ron` fixture.
-- [ ] Gate: gpui fmt/clippy/test.
-- [ ] Commit.
-- [ ] Report: imported keys + reset preferences record.
+- [x] Unit tests: import, skip when conf exists, malformed file, 24h round trip.
+- [x] Boot test against a temp data dir with an `app.ron` fixture.
+- [x] Gate: gpui fmt/clippy/test.
+- [x] Commit.
+- [x] Report: imported keys + reset preferences record.
 
 ## S4 — Workspace takeover and deletion
 

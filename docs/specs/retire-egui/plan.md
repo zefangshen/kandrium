@@ -314,8 +314,12 @@ cargo test --manifest-path crates/app-gpui/Cargo.toml
    `projects_docs_open`, `dark_mode`) — implement now or accept the reset?
    Default: accept the reset for the first release, record it in the release
    note, and keep the light palette as a backlog item.
+   **Taken:** accepted. `vim_mode`, `section`, the merged tree open flag,
+   `projects_tree_open` and `clocks_use_24h` are imported once;
+   the four preferences above reset once and the release note says so.
 7. **Light theme** — port the `dark_mode` toggle before deleting egui? Default:
    no; gpui ships dark only, and the tokens for light already exist.
+   **Taken:** no toggle; dark only.
 8. **Test port scope** — port every non-duplicated egui test, or only
    core-level invariants? Default: every non-duplicated invariant; delete the
    widget-specific ones that exercise egui layout.

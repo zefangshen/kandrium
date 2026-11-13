@@ -310,7 +310,7 @@ impl AppShell {
             .parent()
             .map(|parent| parent.join(settings::FILE_NAME))
             .unwrap_or_else(|| PathBuf::from(settings::FILE_NAME));
-        let settings = settings::Settings::load(&settings_path);
+        let settings = settings::Settings::load_for_boot(&settings_path);
 
         let mut wiki = WikiState::new();
         wiki.notes.tree_open = settings.tree_open(TreePanel::Wiki);
@@ -330,7 +330,7 @@ impl AppShell {
         let mut shell = Self {
             section,
             tokens: Tokens::dark(),
-            use_24h: true,
+            use_24h: settings.clocks_use_24h(),
             store,
             boards: Vec::new(),
             active_board_id: None,
@@ -425,6 +425,7 @@ impl AppShell {
         self.settings
             .set_titlebar_clock(self.titlebar_clock.as_deref());
         self.settings.set_tasks_archive(self.showing_archive);
+        self.settings.set_clocks_use_24h(self.use_24h);
         let path = self.settings_path();
         if let Err(error) = self.settings.save(&path) {
             kandrium_core::logging::warn!("could not write settings {}: {error}", path.display());
@@ -3456,6 +3457,7 @@ impl AppShell {
     /// Times are formatted at render time, so the toggle needs no reload.
     pub(crate) fn toggle_clock_units(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.use_24h = !self.use_24h;
+        self.persist_settings();
         self.rewrite_probe_field(window, cx);
         cx.notify();
     }
