@@ -25,6 +25,11 @@ Decisions taken (approved defaults):
   zone carries a `Selected` chip.
 - S3: a 12/24-hour toggle rewrites an active probe's field from its instant
   (`probe_field_text`), leaving the instant itself untouched.
+- S4: the narrow layout (below 980 logical px, i.e. at the 940 px minimum)
+  drops the calendar glyph and the zone label and makes `Now` icon-only rather
+  than opening a separate popover; every control keeps working and the row
+  still fits. gpui reports the viewport in device pixels, so the threshold
+  divides by `window.scale_factor()`.
 
 ## 1. Goal
 

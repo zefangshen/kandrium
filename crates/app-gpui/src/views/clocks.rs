@@ -735,6 +735,11 @@ pub fn clocks_view(
     sync_probe_placeholder(state, &probe_input, use_24h, window, cx);
     let filtered = state.filtered_indices();
     let reduced = cx.reduce_motion();
+    // Below the plan's 980 px threshold the probe drops its glyphs and labels
+    // so the row never overflows; the controls keep working. gpui reports the
+    // viewport in device pixels, so divide by the display scale first.
+    let logical_w = f32::from(window.viewport_size().width) / window.scale_factor();
+    let compact = logical_w < 980.0;
 
     let mut page = div()
         .id("clocks-view")
@@ -743,7 +748,15 @@ pub fn clocks_view(
         .size_full()
         .flex()
         .flex_col()
-        .child(toolbar(state, &search_input, &probe_input, use_24h, t, cx));
+        .child(toolbar(
+            state,
+            &search_input,
+            &probe_input,
+            use_24h,
+            compact,
+            t,
+            cx,
+        ));
 
     if let Some(error) = &state.error {
         page = page.child(
@@ -862,6 +875,7 @@ fn toolbar(
     search_input: &Entity<InputState>,
     probe_input: &Entity<InputState>,
     use_24h: bool,
+    compact: bool,
     t: &Tokens,
     cx: &mut Context<AppShell>,
 ) -> AnyElement {
@@ -889,7 +903,7 @@ fn toolbar(
             div()
                 .id("clocks-search")
                 .test_support()
-                .w(px(200.))
+                .w(px(if compact { 150. } else { 200. }))
                 .ml(px(14.))
                 .child(crate::views::field_input(search_input, t).prefix(icon(
                     Icon::Search,
@@ -897,7 +911,7 @@ fn toolbar(
                     t.text_faint,
                 ))),
         )
-        .child(probe_control(state, probe_input, t, cx))
+        .child(probe_control(state, probe_input, compact, t, cx))
         .child(div().flex_1())
         .child(units_toggle(use_24h, t, cx))
         .child(
@@ -940,6 +954,7 @@ fn toolbar(
 fn probe_control(
     state: &ClockState,
     input: &Entity<InputState>,
+    compact: bool,
     t: &Tokens,
     cx: &mut Context<AppShell>,
 ) -> AnyElement {
@@ -961,6 +976,7 @@ fn probe_control(
         .unwrap_or_else(|| "Read every city at one time".to_string());
     let zone_label = state.probe_zone_label();
     let tokens = *t;
+    let zone_icon = if probing { t.accent_text } else { t.text_muted };
 
     div()
         .id("clocks-probe")
@@ -973,11 +989,13 @@ fn probe_control(
         .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
             this.handle_clock_probe_key(event, window, cx)
         }))
-        .child(icon(
-            Icon::Calendar,
-            11.,
-            if probing { t.accent_text } else { t.text_faint },
-        ))
+        .when(!compact, |el| {
+            el.child(icon(
+                Icon::Calendar,
+                11.,
+                if probing { t.accent_text } else { t.text_faint },
+            ))
+        })
         .child(
             div()
                 .id("clocks-probe-time")
@@ -990,7 +1008,7 @@ fn probe_control(
                 .id("clocks-probe-zone")
                 .test_support()
                 .h(px(28.))
-                .px(px(8.))
+                .px(px(if compact { 6. } else { 8. }))
                 .flex()
                 .items_center()
                 .gap(px(5.))
@@ -1008,7 +1026,8 @@ fn probe_control(
                 .text(Text::Small)
                 .text_color(if probing { t.accent_text } else { t.text_muted })
                 .hover(move |style| style.bg(tokens.surface_2).border_color(tokens.border_hover))
-                .child(zone_label)
+                .when(compact, |el| el.child(icon(Icon::Globe, 11., zone_icon)))
+                .when(!compact, |el| el.child(zone_label))
                 .child(icon(
                     Icon::ChevronDown,
                     10.,
@@ -1023,6 +1042,7 @@ fn probe_control(
                 div()
                     .id("clocks-probe-now")
                     .test_support()
+                    .aria_label("Now")
                     .h(px(28.))
                     .px(px(8.))
                     .flex()
@@ -1035,7 +1055,7 @@ fn probe_control(
                     .text_color(t.accent_text)
                     .hover(move |style| style.bg(tokens.surface_2))
                     .child(icon(Icon::RotateCcw, 10., t.accent_text))
-                    .child("Now")
+                    .when(!compact, |el| el.child("Now"))
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         this.clear_clock_probe(window, cx)
                     })),
@@ -1736,6 +1756,64 @@ mod tests {
         assert!(!state.probe_zone_label().is_empty());
         state.probe_zone = Some("Asia/Tokyo".into());
         assert_eq!(state.probe_zone_label(), "Tokyo");
+    }
+
+    #[test]
+    fn a_probe_instant_moves_people_between_cities() {
+        let person = Person {
+            id: "p1".into(),
+            name: "Ada".into(),
+            home_clock_id: "home".into(),
+            position: 0,
+            created_at: String::new(),
+        };
+        let clock = |id: &str, people: Vec<Person>| ClockEntry {
+            id: id.to_string(),
+            tz_identifier: "UTC".into(),
+            city: id.to_string(),
+            zone: resolve_zone("UTC"),
+            people,
+        };
+        let travels = vec![Travel {
+            id: "t1".into(),
+            person_id: "p1".into(),
+            origin_clock_id: Some("home".into()),
+            destination_clock_id: Some("away".into()),
+            starts_at: 9 * 3600,
+            ends_at: Some(17 * 3600),
+            cancelled_at: None,
+            created_at: String::new(),
+        }];
+
+        let at_ten = city_people(
+            &[clock("home", vec![person.clone()]), clock("away", vec![])],
+            &travels,
+            &clock("away", vec![]),
+            10 * 3600,
+        );
+        assert_eq!(at_ten.visitors.len(), 1);
+        let home_at_ten = city_people(
+            &[clock("home", vec![person.clone()]), clock("away", vec![])],
+            &travels,
+            &clock("home", vec![person.clone()]),
+            10 * 3600,
+        );
+        assert_eq!(home_at_ten.residents[0].away_to.as_deref(), Some("away"));
+
+        let at_eighteen = city_people(
+            &[clock("home", vec![person.clone()]), clock("away", vec![])],
+            &travels,
+            &clock("away", vec![]),
+            18 * 3600,
+        );
+        assert!(at_eighteen.visitors.is_empty());
+        let home_at_eighteen = city_people(
+            &[clock("home", vec![person.clone()]), clock("away", vec![])],
+            &travels,
+            &clock("home", vec![person]),
+            18 * 3600,
+        );
+        assert!(home_at_eighteen.residents[0].away_to.is_none());
     }
 
     #[test]
