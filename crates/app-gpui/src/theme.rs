@@ -268,16 +268,13 @@ impl<E: Styled> TextStyled for E {}
 
 /// Install Inter and JetBrains Mono into the text system.
 ///
-/// The font files are reused from the egui app's asset directory; the gpui
-/// crate does not keep a second copy.
+/// The fonts are bundled in this crate's `assets/` directory.
 pub fn install_fonts(cx: &mut App) {
     let fonts: Vec<Cow<'static, [u8]>> = vec![
-        Cow::Borrowed(include_bytes!("../../app/assets/fonts/Inter-Regular.ttf")),
-        Cow::Borrowed(include_bytes!("../../app/assets/fonts/Inter-Medium.ttf")),
-        Cow::Borrowed(include_bytes!("../../app/assets/fonts/Inter-SemiBold.ttf")),
-        Cow::Borrowed(include_bytes!(
-            "../../app/assets/fonts/JetBrainsMono-Regular.ttf"
-        )),
+        Cow::Borrowed(include_bytes!("../assets/fonts/Inter-Regular.ttf")),
+        Cow::Borrowed(include_bytes!("../assets/fonts/Inter-Medium.ttf")),
+        Cow::Borrowed(include_bytes!("../assets/fonts/Inter-SemiBold.ttf")),
+        Cow::Borrowed(include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf")),
     ];
     cx.text_system()
         .add_fonts(fonts)

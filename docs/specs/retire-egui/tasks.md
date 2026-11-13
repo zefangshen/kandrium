@@ -15,22 +15,22 @@ commit; stop and report at every stage boundary.
 
 ## S1 — Assets and packaging copy
 
-- [ ] `cp -R crates/app/assets/fonts crates/app-gpui/assets/fonts`
-- [ ] `cp -R crates/app/assets/icons crates/app-gpui/assets/icons`
-- [ ] `cp -R crates/app/packaging crates/app-gpui/assets/packaging`
-- [ ] `crates/app-gpui/src/theme.rs`: repoint the two Inter `include_bytes!`
+- [x] `cp -R crates/app/assets/fonts crates/app-gpui/assets/fonts`
+- [x] `cp -R crates/app/assets/icons crates/app-gpui/assets/icons`
+- [x] `cp -R crates/app/packaging crates/app-gpui/assets/packaging`
+- [x] `crates/app-gpui/src/theme.rs`: repoint the two Inter `include_bytes!`
       to `../assets/fonts/…`.
-- [ ] `crates/app-gpui/src/assets.rs`: repoint every icon `include_bytes!` to
+- [x] `crates/app-gpui/src/assets.rs`: repoint every icon `include_bytes!` to
       `../assets/icons/…`.
-- [ ] `crates/app-gpui/packager.json`: icon paths to `assets/packaging/…`.
-- [ ] Gate: `cargo fmt --manifest-path crates/app-gpui/Cargo.toml`
-- [ ] Gate: `cargo clippy --manifest-path crates/app-gpui/Cargo.toml --all-targets`
-- [ ] Gate: `cargo test --manifest-path crates/app-gpui/Cargo.toml`
-- [ ] Gate: `cargo packager --config crates/app-gpui/packager.json`; confirm
+- [x] `crates/app-gpui/packager.json`: icon paths to `assets/packaging/…`.
+- [x] Gate: `cargo fmt --manifest-path crates/app-gpui/Cargo.toml`
+- [x] Gate: `cargo clippy --manifest-path crates/app-gpui/Cargo.toml --all-targets`
+- [x] Gate: `cargo test --manifest-path crates/app-gpui/Cargo.toml`
+- [x] Gate: `cargo packager --config crates/app-gpui/packager.json`; confirm
       `Kandrium.app/Contents/Resources` has the icon set.
-- [ ] Commit only the copied assets, the three edited files, and the new
+- [x] Commit only the copied assets, the three edited files, and the new
       packaging directory.
-- [ ] Report: gate results + packaged icon evidence.
+- [x] Report: gate results + packaged icon evidence.
 
 ## S2 — Test port
 

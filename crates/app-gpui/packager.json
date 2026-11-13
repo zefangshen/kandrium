@@ -10,12 +10,12 @@
   "binaries_dir": "target/release",
   "binaries": [{ "path": "kandrium-gpui", "main": true }],
   "icons": [
-    "../app/packaging/16x16.png",
-    "../app/packaging/32x32.png",
-    "../app/packaging/128x128.png",
-    "../app/packaging/256x256.png",
-    "../app/packaging/512x512.png",
-    "../app/packaging/icon@2x.png"
+    "assets/packaging/16x16.png",
+    "assets/packaging/32x32.png",
+    "assets/packaging/128x128.png",
+    "assets/packaging/256x256.png",
+    "assets/packaging/512x512.png",
+    "assets/packaging/icon@2x.png"
   ],
   "formats": ["app", "dmg"],
   "macos": {
