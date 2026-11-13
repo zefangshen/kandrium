@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use gpui::TestAppContext;
 use gpui_kit::test::TestWindowExt;
 
-use kandrium_app_gpui::app::AppShell;
-use kandrium_app_gpui::store::Store;
+use kandrium_app::app::AppShell;
+use kandrium_app::store::Store;
 
 /// A bootstrapped database (schema + seed) in the temp directory.
 fn seeded_db(dir: &Path) -> PathBuf {

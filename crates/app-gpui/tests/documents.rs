@@ -13,9 +13,9 @@ use std::time::Duration;
 use gpui::{Entity, TestAppContext, VisualTestContext};
 use gpui_kit::test::TestWindowExt;
 
-use kandrium_app_gpui::app::AppShell;
-use kandrium_app_gpui::store::Store;
-use kandrium_app_gpui::views::documents as docs_view;
+use kandrium_app::app::AppShell;
+use kandrium_app::store::Store;
+use kandrium_app::views::documents as docs_view;
 use kandrium_core::documents::{AnnotationDoc, AnnotationKind, new_annotation};
 
 /// A bootstrapped database (schema + seed) in the temp directory.

@@ -112,20 +112,20 @@ Boot:
 
 ## S4 — Workspace takeover and deletion
 
-- [ ] Root `Cargo.toml`: members `core`, `mcp`, `app-gpui`, `pdf-render`;
+- [x] Root `Cargo.toml`: members `core`, `mcp`, `app-gpui`, `pdf-render`;
       remove `exclude`.
-- [ ] `crates/app-gpui/Cargo.toml`: remove inner `[workspace]` /
+- [x] `crates/app-gpui/Cargo.toml`: remove inner `[workspace]` /
       `[workspace.package]`; package `kandrium-app`; bin `kandrium-app`.
-- [ ] `crates/app-gpui/src/main.rs`: log component `kandrium-app`.
-- [ ] Replace `kandrium_app_gpui::` with `kandrium_app::` in `tests/*`.
-- [ ] `git rm -r crates/app`.
-- [ ] `justfile`: `run` builds `kandrium-app`; add `test`, `lint`, `fmt`.
-- [ ] Gate: `cargo fmt --all --check`
-- [ ] Gate: `cargo clippy --workspace --all-targets`
-- [ ] Gate: `cargo test --workspace`
-- [ ] Gate: `cargo build --bin kandrium-app`
-- [ ] Commit.
-- [ ] Report: final test count, clippy clean.
+- [x] `crates/app-gpui/src/main.rs`: log component `kandrium-app`.
+- [x] Replace `kandrium_app_gpui::` with `kandrium_app::` in `tests/*`.
+- [x] `git rm -r crates/app`.
+- [x] `justfile`: `run` builds `kandrium-app`; add `test`, `lint`, `fmt`.
+- [x] Gate: `cargo fmt --all --check`
+- [x] Gate: `cargo clippy --workspace --all-targets`
+- [x] Gate: `cargo test --workspace`
+- [x] Gate: `cargo build --bin kandrium-app`
+- [x] Commit.
+- [x] Report: final test count, clippy clean.
 
 ## S5 — Packaging and one dev bundle
 

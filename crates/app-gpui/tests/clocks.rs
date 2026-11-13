@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use kandrium_app_gpui::store::Store;
+use kandrium_app::store::Store;
 use kandrium_core::clocks::{day_end_seconds, day_start_seconds, resolve_zone};
 
 /// A bootstrapped database (schema + seed) in the temp directory.

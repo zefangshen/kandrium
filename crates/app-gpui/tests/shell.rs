@@ -14,10 +14,10 @@ use gpui_kit::{
     TestSupportExt, Window, div, px,
 };
 
-use kandrium_app_gpui::app::{AppShell, Section};
-use kandrium_app_gpui::settings::{Settings, TreePanel};
-use kandrium_app_gpui::store::Store;
-use kandrium_app_gpui::theme::Tokens;
+use kandrium_app::app::{AppShell, Section};
+use kandrium_app::settings::{Settings, TreePanel};
+use kandrium_app::store::Store;
+use kandrium_app::theme::Tokens;
 
 /// A bootstrapped database (schema + seed) in the temp directory.
 fn seeded_db(dir: &Path) -> PathBuf {
@@ -1073,7 +1073,7 @@ fn settings_file_records_section_tree_and_vim(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let path = seeded_db(dir.path());
     cx.update(gpui_kit::init);
-    let settings_path = dir.path().join(kandrium_app_gpui::settings::FILE_NAME);
+    let settings_path = dir.path().join(kandrium_app::settings::FILE_NAME);
 
     let store = Store::open_path(path.clone());
     let board_id = store.boards().expect("boards")[0].id.clone();
@@ -1894,14 +1894,14 @@ impl Render for FieldProbe {
                     .id("field-single")
                     .test_support()
                     .w_full()
-                    .child(kandrium_app_gpui::views::field_input_tall(&self.single, &t)),
+                    .child(kandrium_app::views::field_input_tall(&self.single, &t)),
             )
             .child(
                 div()
                     .id("field-multi")
                     .test_support()
                     .w_full()
-                    .child(kandrium_app_gpui::views::field_textarea(&self.multi, &t).h(px(120.))),
+                    .child(kandrium_app::views::field_textarea(&self.multi, &t).h(px(120.))),
             )
     }
 }
@@ -2964,7 +2964,7 @@ fn probe_projects_header(cx: &mut TestAppContext, width: f32) {
     let dir = tempfile::tempdir().unwrap();
     let path = seeded_db(dir.path());
     std::fs::write(
-        dir.path().join(kandrium_app_gpui::settings::FILE_NAME),
+        dir.path().join(kandrium_app::settings::FILE_NAME),
         format!("section=projects\nprojects_tree_width={width}\n"),
     )
     .unwrap();
@@ -3035,7 +3035,7 @@ fn collapsed_projects_rail_keeps_a_single_divider(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let path = seeded_db(dir.path());
     std::fs::write(
-        dir.path().join(kandrium_app_gpui::settings::FILE_NAME),
+        dir.path().join(kandrium_app::settings::FILE_NAME),
         "section=projects\nprojects_tree_width=240\n",
     )
     .unwrap();
@@ -3059,7 +3059,7 @@ fn collapsed_projects_rail_keeps_a_single_divider(cx: &mut TestAppContext) {
         );
         assert_eq!(
             rail.size.width,
-            px(kandrium_app_gpui::views::projects::RAIL_W),
+            px(kandrium_app::views::projects::RAIL_W),
             "the rail keeps its fixed width"
         );
     });
@@ -3069,7 +3069,7 @@ fn collapsed_projects_rail_keeps_a_single_divider(cx: &mut TestAppContext) {
 /// splitter allows.
 #[gpui::test]
 fn projects_header_puts_collapse_on_the_right_edge_at_minimum_width(cx: &mut TestAppContext) {
-    probe_projects_header(cx, kandrium_app_gpui::settings::MIN_TREE_W);
+    probe_projects_header(cx, kandrium_app::settings::MIN_TREE_W);
 }
 
 /// …and at a wide dragged width.
@@ -3085,7 +3085,7 @@ fn projects_header_actions_need_a_selected_project(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let path = seeded_db(dir.path());
     std::fs::write(
-        dir.path().join(kandrium_app_gpui::settings::FILE_NAME),
+        dir.path().join(kandrium_app::settings::FILE_NAME),
         "section=projects\nprojects_tree_width=240\n",
     )
     .unwrap();

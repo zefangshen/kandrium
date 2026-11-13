@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use gpui::TestAppContext;
 use gpui_kit::test::TestWindowExt;
 
-use kandrium_app_gpui::app::AppShell;
-use kandrium_app_gpui::store::Store;
+use kandrium_app::app::AppShell;
+use kandrium_app::store::Store;
 
 fn notes_root(dir: &Path) -> PathBuf {
     let root = dir.join("notes");

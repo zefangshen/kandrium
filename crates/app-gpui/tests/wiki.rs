@@ -11,9 +11,9 @@ use std::sync::OnceLock;
 use gpui::{Entity, TestAppContext, VisualTestContext};
 use gpui_kit::test::TestWindowExt;
 
-use kandrium_app_gpui::app::AppShell;
-use kandrium_app_gpui::store::Store;
-use kandrium_app_gpui::views::wiki::{HEADER_H, MIN_HALF_H};
+use kandrium_app::app::AppShell;
+use kandrium_app::store::Store;
+use kandrium_app::views::wiki::{HEADER_H, MIN_HALF_H};
 
 /// A bootstrapped database (schema + seed) in the temp directory.
 fn seeded_db(dir: &Path) -> PathBuf {

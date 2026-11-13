@@ -1,28 +1,13 @@
-[workspace]
-# Standalone workspace. The repository root excludes this crate so the
-# shipping egui build, `cargo test --workspace` and `cargo clippy --workspace`
-# keep exactly the cost they had before the gpui migration started.
-#
-# Build and run it explicitly:
-#   cargo run --manifest-path crates/app-gpui/Cargo.toml --bin kandrium-gpui
-members = ["."]
-resolver = "2"
-
-[workspace.package]
-version = "0.1.0"
-edition = "2024"
-license = "Apache-2.0"
-
 [package]
-name = "kandrium-app-gpui"
+name = "kandrium-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Kandrium desktop UI on gpui (migration in progress)"
+description = "Kandrium desktop app"
 publish = false
 
 [[bin]]
-name = "kandrium-gpui"
+name = "kandrium-app"
 path = "src/main.rs"
 
 [dependencies]

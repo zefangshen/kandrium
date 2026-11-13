@@ -1,11 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/mcp", "crates/app", "crates/pdf-render"]
-# The gpui app is its own workspace (`crates/app-gpui/Cargo.toml`) so the
-# shipping egui build, tests and clippy keep the exact cost they had before the
-# migration. It must be built explicitly:
-#   cargo run --manifest-path crates/app-gpui/Cargo.toml
-exclude = ["crates/app-gpui"]
+members = ["crates/core", "crates/mcp", "crates/app-gpui", "crates/pdf-render"]
 
 [workspace.package]
 version = "0.1.0"

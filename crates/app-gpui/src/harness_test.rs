@@ -1,7 +1,7 @@
 //! The one real test the spike owes: boot a window under `TestAppContext`,
 //! draw a frame, and observe layout, a key event and a click.
 //!
-//! Run with `cargo test -p kandrium-app-gpui`. No window is shown and no GPU is
+//! Run with `cargo test -p kandrium-app`. No window is shown and no GPU is
 //! touched — the test platform substitutes for both.
 
 use std::cell::Cell;
