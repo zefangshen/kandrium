@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui_kit::base::text::markdown;
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::input::{Editor, EditorState, InputState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
@@ -129,12 +130,15 @@ impl NotesState {
     }
 }
 
-/// The half's 38 px title row: name, new-note, new-folder, whole-tree collapse
-/// and an optional trailing control (the Wiki half toggle).
+/// The half's 38 px title row: optional leading control (the Wiki half
+/// toggle), name, new-note, new-folder and whole-tree collapse. The separator
+/// below is only drawn while the half is collapsed, where it keeps the two
+/// headers readable as separate rows.
 pub(crate) fn tree_header(
     t: &Tokens,
     cx: &mut Context<AppShell>,
-    trailing: Option<AnyElement>,
+    leading: Option<AnyElement>,
+    separator: bool,
 ) -> AnyElement {
     div()
         .h(px(38.))
@@ -143,8 +147,8 @@ pub(crate) fn tree_header(
         .items_center()
         .gap(px(6.))
         .px(px(12.))
-        .border_b_1()
-        .border_color(t.divider)
+        .when(separator, |this| this.border_b_1().border_color(t.divider))
+        .children(leading)
         .child(
             div()
                 .flex_1()
@@ -175,7 +179,6 @@ pub(crate) fn tree_header(
             t,
             cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_wiki_tree(cx)),
         ))
-        .children(trailing)
         .into_any_element()
 }
 
@@ -426,7 +429,6 @@ pub(crate) fn detail_body(
                 cx,
             ))
             .child(div().flex_1())
-            .child(crate::views::vim_indicator("notes-vim", &tab.vim, t))
             .child(crate::views::mode_switch(
                 "notes-preview",
                 preview,
@@ -460,6 +462,10 @@ pub(crate) fn detail_body(
         );
     } else {
         let lines = tab.editor.read(cx).value().lines().count();
+        let (mono_family, mono_size) = {
+            let theme = cx.theme();
+            (theme.mono_font_family.clone(), theme.mono_font_size)
+        };
         body = body
             .child(
                 div()
@@ -486,6 +492,18 @@ pub(crate) fn detail_body(
                                         .readonly(!tab.vim.is_insert()),
                                 ),
                             )
+                            .when(tab.vim.block_cursor(), |this| {
+                                this.child(
+                                    crate::vim::block_cursor_overlay(
+                                        tab.editor.clone(),
+                                        mono_family,
+                                        mono_size,
+                                        t.accent.into(),
+                                    )
+                                    .absolute()
+                                    .inset_0(),
+                                )
+                            })
                             .child(crate::views::gutter_rule(lines, t, window)),
                     ),
             )

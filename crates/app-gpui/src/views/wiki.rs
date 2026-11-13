@@ -336,7 +336,7 @@ fn notes_half(
         .flex()
         .flex_col()
         .overflow_hidden()
-        .child(notes::tree_header(t, cx, Some(toggle)));
+        .child(notes::tree_header(t, cx, Some(toggle), collapsed));
     if !collapsed {
         half = half.child(notes::tree_body(&state.notes, t, cx));
     }
@@ -359,7 +359,7 @@ fn documents_half(
         .flex()
         .flex_col()
         .overflow_hidden()
-        .child(documents::tree_header(t, cx, Some(toggle)));
+        .child(documents::tree_header(t, cx, Some(toggle), collapsed));
     if !collapsed {
         half = half.child(documents::tree_body(&state.documents, t, cx));
     }
@@ -421,9 +421,9 @@ fn half_toggle(
         )
         .child(icon(
             if collapsed {
-                Icon::ChevronDown
+                Icon::ChevronRight
             } else {
-                Icon::ChevronUp
+                Icon::ChevronDown
             },
             13.,
             t.text_muted,

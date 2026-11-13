@@ -13,10 +13,12 @@
 //! never registered. Insert mode is plain textarea editing, so IME, selection
 //! and clipboard keep working.
 //!
-//! Normal/Visual modes keep the caret on the input: the block caret of the
-//! egui editor is not reproduced, but the vim cursor is always one character,
-//! and Visual mode's inclusive selection is written as a textarea selection
-//! (`anchor ..= cursor`) with the caret direction pointing at the moving end.
+//! Normal/Visual modes keep the caret on the input but draw it as a filled
+//! block ([`block_cursor_overlay`]) over the engine's line caret; Insert mode
+//! leaves the line caret alone, so the mode is visible without a badge. The
+//! vim cursor is always one character, and Visual mode's inclusive selection
+//! is written as a textarea selection (`anchor ..= cursor`) with the caret
+//! direction pointing at the moving end.
 //!
 //! Supported: `h j k l w W b B e E 0 ^ $ gg G { }`, counts,
 //! `f F t T ; ,`, `i I a A o O`, `v V`, `.` repeat,
@@ -33,7 +35,10 @@
 use std::ops::Range;
 
 use gpui_kit::component::input::{EditorState, TextareaState};
-use gpui_kit::{App, Entity, KeyDownEvent, Keystroke, Window};
+use gpui_kit::{
+    App, Bounds, Entity, Focusable, Hsla, IntoElement, KeyDownEvent, Keystroke, Pixels,
+    SharedString, Styled, Window, canvas, fill, font,
+};
 
 /// The buffer operations vim needs.
 ///
@@ -214,6 +219,17 @@ struct VimState {
 }
 
 impl VimState {
+    /// Whether a count, operator or multi-key command is waiting for its
+    /// next input.
+    fn has_pending(&self) -> bool {
+        self.count.is_some()
+            || self.pending_op.is_some()
+            || self.pending_g
+            || self.pending_r
+            || self.pending_find.is_some()
+            || self.pending_text_obj.is_some()
+    }
+
     fn take_count(&mut self) -> usize {
         self.count.take().unwrap_or(1).max(1) as usize
     }
@@ -1752,6 +1768,13 @@ impl VimSession {
         !self.enabled || self.state.mode == VimMode::Insert
     }
 
+    /// Whether the caret should read as a vim block. Normal and Visual modes
+    /// use the block; Insert keeps the input's line caret. A disabled session
+    /// keeps the line caret so it behaves like a plain editor.
+    pub fn block_cursor(&self) -> bool {
+        self.enabled && self.state.mode != VimMode::Insert
+    }
+
     /// Whether the textarea must be read-only. A disabled session is never
     /// read-only, so typing behaves like a plain editor.
     pub fn readonly(&self) -> bool {
@@ -1817,8 +1840,9 @@ impl VimSession {
 
     /// Apply one key press to the buffer and write the result back.
     ///
-    /// `handled: false` on `Esc` in Normal mode means "leave vim": the caller
-    /// closes the editor.
+    /// `handled: false` on `Esc` in Normal mode means the key did nothing:
+    /// Normal already is the resting mode, and the caller leaves the open
+    /// document alone.
     pub fn handle_key(
         &mut self,
         event: &KeyDownEvent,
@@ -1866,8 +1890,14 @@ impl VimSession {
                 return KeyOutcome::handled();
             }
             if self.state.mode == VimMode::Normal {
-                // Nothing to leave: the caller closes the editor.
-                return KeyOutcome::default();
+                // Nothing to leave. Esc cancels a pending command; with
+                // nothing pending it is a no-op, and it never closes the
+                // document.
+                if !self.state.has_pending() {
+                    return KeyOutcome::default();
+                }
+                self.state.reset_pending();
+                return KeyOutcome::handled();
             }
             let mut b = Buf::new(&text, caret);
             escape(&mut self.state, &mut b);
@@ -1978,6 +2008,85 @@ impl VimSession {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Block caret
+// ---------------------------------------------------------------------------
+
+/// The caret geometry the block overlay needs from an editor state.
+///
+/// The code editor and the textarea are aliases of the same engine, but they
+/// are distinct types, so this trait keeps the overlay one implementation.
+pub trait CaretSource: 'static {
+    /// The active caret in window coordinates, with the vertical scroll
+    /// offset applied the way the engine applies it when painting its own
+    /// line caret.
+    fn caret_bounds(&self, cx: &App) -> Option<Bounds<Pixels>>;
+    /// Whether the editor owns keyboard focus right now.
+    fn caret_focused(&self, window: &Window, cx: &App) -> bool;
+}
+
+macro_rules! impl_caret_source {
+    ($state:ty) => {
+        impl CaretSource for Entity<$state> {
+            fn caret_bounds(&self, cx: &App) -> Option<Bounds<Pixels>> {
+                let geometry = self.read(cx).prepaint_caret_geometry()?;
+                let mut bounds = geometry.cursor_bounds();
+                // The engine stashes the caret before scroll is applied and
+                // adds it back when painting; mirror that here.
+                bounds.origin.y += geometry.scroll_offset().y;
+                Some(bounds)
+            }
+
+            fn caret_focused(&self, window: &Window, cx: &App) -> bool {
+                self.read(cx).focus_handle(cx).is_focused(window)
+            }
+        }
+    };
+}
+
+impl_caret_source!(TextareaState);
+impl_caret_source!(EditorState);
+
+/// Paint the vim block caret over an editor.
+///
+/// The input keeps painting its own 1 px line caret, but the block starts at
+/// the same origin and is filled with the accent colour, so Normal/Visual
+/// modes read as a block. Insert mode does not call this, which leaves the
+/// engine's line caret untouched. `family` and `size` must match the editor's
+/// text so the block spans one character cell.
+///
+/// The caller places the returned canvas over the editor (for example
+/// `.absolute().inset_0()` inside the editor's relative wrapper); it paints
+/// in window coordinates and never takes pointer input.
+pub fn block_cursor_overlay(
+    source: impl CaretSource,
+    family: impl Into<SharedString>,
+    font_size: Pixels,
+    color: Hsla,
+) -> impl IntoElement + Styled {
+    let family = family.into();
+    canvas(
+        move |_bounds, _window, _cx| (),
+        move |_bounds, (), window, cx| {
+            if !source.caret_focused(window, cx) {
+                return;
+            }
+            let Some(caret) = source.caret_bounds(cx) else {
+                return;
+            };
+            let font_id = window.text_system().resolve_font(&font(family.clone()));
+            let width = window
+                .text_system()
+                .ch_width(font_id, font_size)
+                .unwrap_or(font_size * 0.6);
+            window.paint_quad(fill(
+                Bounds::new(caret.origin, gpui_kit::size(width, caret.size.height)),
+                color,
+            ));
+        },
+    )
 }
 
 fn is_escape(keystroke: &Keystroke) -> bool {

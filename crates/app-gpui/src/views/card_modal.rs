@@ -15,6 +15,7 @@
 use gpui_kit::TestSupportExt;
 use gpui_kit::base::FocusTrapElement;
 use gpui_kit::base::text::markdown;
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::input::{InputState, TextareaState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
@@ -294,9 +295,14 @@ pub fn modal(ctx: ModalContext<'_>, cx: &mut Context<AppShell>) -> AnyElement {
     // the row and redirects clicks outside the text to the field. The vim
     // strip keeps its slot in preview mode so toggling never resizes the modal.
     let focus_description = session.description.clone();
+    let (body_family, body_size) = {
+        let theme = cx.theme();
+        (theme.font_family.clone(), theme.font_size * 0.875)
+    };
     let description_body = div()
         .id("card-description-field")
         .test_support()
+        .relative()
         .w_full()
         .h(px(188.))
         .flex()
@@ -338,6 +344,18 @@ pub fn modal(ctx: ModalContext<'_>, cx: &mut Context<AppShell>) -> AnyElement {
                     .readonly(!session.vim.is_insert())
                     .h(px(188.)),
             )
+            .when(session.vim.block_cursor(), |this| {
+                this.child(
+                    crate::vim::block_cursor_overlay(
+                        session.description.clone(),
+                        body_family,
+                        body_size,
+                        t.accent.into(),
+                    )
+                    .absolute()
+                    .inset_0(),
+                )
+            })
         });
     panel = panel.child(
         div()

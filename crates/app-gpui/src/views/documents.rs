@@ -17,6 +17,7 @@ use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use gpui_kit::base::text::markdown;
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::input::{Editor, EditorState, InputState, TextareaState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
@@ -486,12 +487,15 @@ pub fn abs_path(root: &Path, rel: &str) -> PathBuf {
 // View
 // ---------------------------------------------------------------------------
 
-/// The half's 38 px title row: name, whole-tree collapse, upload, new file,
-/// new folder and an optional trailing control (the Wiki half toggle).
+/// The half's 38 px title row: optional leading control (the Wiki half
+/// toggle), name, upload, new file and new folder. The whole-tree collapse
+/// lives in the notes half's header, so this row carries no rail control. The
+/// separator below is only drawn while the half is collapsed.
 pub(crate) fn tree_header(
     t: &Tokens,
     cx: &mut Context<AppShell>,
-    trailing: Option<AnyElement>,
+    leading: Option<AnyElement>,
+    separator: bool,
 ) -> AnyElement {
     div()
         .flex()
@@ -500,8 +504,8 @@ pub(crate) fn tree_header(
         .h(px(38.))
         .flex_none()
         .px(px(12.))
-        .border_b_1()
-        .border_color(t.divider)
+        .when(separator, |this| this.border_b_1().border_color(t.divider))
+        .children(leading)
         .child(
             div()
                 .flex_1()
@@ -510,12 +514,6 @@ pub(crate) fn tree_header(
                 .text_color(t.text_muted)
                 .child("DOCUMENTS"),
         )
-        .child(tree_action(
-            "documents-collapse",
-            Icon::ChevronLeft,
-            t,
-            cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_wiki_tree(cx)),
-        ))
         .child(tree_action(
             "documents-upload",
             Icon::Upload,
@@ -540,7 +538,6 @@ pub(crate) fn tree_header(
                 this.begin_doc_draft(DocDraftKind::Folder, window, cx)
             }),
         ))
-        .children(trailing)
         .into_any_element()
 }
 
@@ -891,9 +888,6 @@ pub(crate) fn detail_body(
         ))
         .child(div().flex_1());
     if markdown {
-        if let Some(vim) = state.tabs[index].vim.as_ref() {
-            head = head.child(crate::views::vim_indicator("documents-vim", vim, t));
-        }
         head = head.child(crate::views::mode_switch(
             "documents-preview",
             preview,
@@ -962,6 +956,11 @@ fn markdown_body(
     let editor = tab.editor.clone().expect("markdown tab has an editor");
     let lines = editor.read(cx).value().lines().count();
     let readonly = tab.vim.as_ref().is_none_or(|vim| !vim.is_insert());
+    let block_cursor = tab.vim.as_ref().is_some_and(|vim| vim.block_cursor());
+    let (mono_family, mono_size) = {
+        let theme = cx.theme();
+        (theme.mono_font_family.clone(), theme.mono_font_size)
+    };
     div()
         .id("doc-markdown")
         .test_support()
@@ -1002,6 +1001,18 @@ fn markdown_body(
                                             .readonly(readonly),
                                     ),
                                 )
+                                .when(block_cursor, |this| {
+                                    this.child(
+                                        crate::vim::block_cursor_overlay(
+                                            editor.clone(),
+                                            mono_family,
+                                            mono_size,
+                                            t.accent.into(),
+                                        )
+                                        .absolute()
+                                        .inset_0(),
+                                    )
+                                })
                                 .child(crate::views::gutter_rule(lines, t, window)),
                         ),
                 )

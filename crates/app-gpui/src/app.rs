@@ -3054,15 +3054,12 @@ impl AppShell {
             cx.stop_propagation();
             cx.notify();
         }
+        // Esc never closes the document: in Normal mode it is a no-op, and
+        // the vim layer has already handled every other mode's Esc.
         match outcome.ex {
             Some(vim::ExCommand::Write) => self.save_project_doc(index, cx),
             Some(vim::ExCommand::Close) => self.close_project_doc(index, cx),
-            None => {
-                if event.keystroke.key == "escape" && !outcome.handled {
-                    cx.stop_propagation();
-                    self.close_project_doc(index, cx);
-                }
-            }
+            None => {}
         }
     }
 
@@ -4796,15 +4793,12 @@ impl AppShell {
             cx.stop_propagation();
             cx.notify();
         }
+        // Esc never closes the note: in Normal mode it is a no-op, and the
+        // vim layer has already handled every other mode's Esc.
         match outcome.ex {
             Some(vim::ExCommand::Write) => self.save_active_note(cx),
             Some(vim::ExCommand::Close) => self.close_active_note(cx),
-            None => {
-                if event.keystroke.key == "escape" && !outcome.handled {
-                    cx.stop_propagation();
-                    self.close_active_note(cx);
-                }
-            }
+            None => {}
         }
     }
 
@@ -5382,15 +5376,12 @@ impl AppShell {
             cx.stop_propagation();
             cx.notify();
         }
+        // Esc never closes the document: in Normal mode it is a no-op, and
+        // the vim layer has already handled every other mode's Esc.
         match outcome.ex {
             Some(vim::ExCommand::Write) => self.save_active_document(cx),
             Some(vim::ExCommand::Close) => self.close_active_document(cx),
-            None => {
-                if event.keystroke.key == "escape" && !outcome.handled {
-                    cx.stop_propagation();
-                    self.close_active_document(cx);
-                }
-            }
+            None => {}
         }
     }
 

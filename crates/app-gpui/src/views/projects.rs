@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui_kit::base::text::markdown;
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::input::{Editor, EditorState, InputState, TextareaState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
@@ -2530,6 +2531,10 @@ fn doc_body(
         );
     } else {
         let lines = tab.editor.read(cx).value().lines().count();
+        let (mono_family, mono_size) = {
+            let theme = cx.theme();
+            (theme.mono_font_family.clone(), theme.mono_font_size)
+        };
         body = body
             .child(
                 div()
@@ -2555,6 +2560,18 @@ fn doc_body(
                                         .readonly(!tab.vim.is_insert()),
                                 ),
                             )
+                            .when(tab.vim.block_cursor(), |this| {
+                                this.child(
+                                    crate::vim::block_cursor_overlay(
+                                        tab.editor.clone(),
+                                        mono_family,
+                                        mono_size,
+                                        t.accent.into(),
+                                    )
+                                    .absolute()
+                                    .inset_0(),
+                                )
+                            })
                             .child(crate::views::gutter_rule(lines, t, window)),
                     ),
             )
