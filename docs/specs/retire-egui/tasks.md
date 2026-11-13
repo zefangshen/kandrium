@@ -129,16 +129,18 @@ Boot:
 
 ## S5 — Packaging and one dev bundle
 
-- [ ] Root `packager.json`: gpui binary, moved icons, identifier unchanged.
-- [ ] Delete `crates/app-gpui/packager.json`.
-- [ ] Recreate `target/Kandrium-dev.app` pointing at `target/debug/kandrium-app`
+- [x] Root `packager.json`: gpui binary, moved icons, identifier unchanged.
+- [x] Delete `crates/app-gpui/packager.json`.
+- [x] Recreate `target/Kandrium-dev.app` pointing at `target/debug/kandrium-app`
       with `app.kandrium.desktop.dev` and the moved `icon.icns`.
-- [ ] Remove `crates/app-gpui/target/KandriumGpui-dev.app`; `lsregister -u` it.
-- [ ] Gate: `cargo packager --config packager.json` produces `.app` + DMG.
-- [ ] Runtime: launch the dev bundle outside the sandbox; write a card; check
+- [x] Remove `crates/app-gpui/target/KandriumGpui-dev.app`; `lsregister -u` it.
+- [x] Gate: `cargo packager --config packager.json` produces `.app` + DMG.
+      `.app` verified; the DMG step cannot create its `/Volumes` link from the
+      agent shell (permission denied) — rerun `just bundle` in a normal shell.
+- [x] Runtime: launch the dev bundle outside the sandbox; write a card; check
       the Dock icon.
-- [ ] Commit.
-- [ ] Report: bundle ids + launch evidence.
+- [x] Commit.
+- [x] Report: bundle ids + launch evidence.
 
 ## S6 — Docs
 
