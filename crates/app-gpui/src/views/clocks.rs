@@ -26,17 +26,18 @@
 
 use std::time::Duration;
 
-use gpui_kit::component::input::InputState;
+use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     Animation, AnimationExt, AnyElement, ClickEvent, Context, DragMoveEvent, Entity, IntoElement,
-    Render, TestSupportExt, Window, div, px,
+    KeyDownEvent, Render, TestSupportExt, Window, div, px,
 };
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use kandrium_core::clocks::{available_zones, zone_matches};
 use kandrium_core::{
-    ClockText, Person, Travel, city_name, format_clock, placement_for, resolve_zone,
+    ClockText, Person, ProbeAmbiguity, ProbeReading, Travel, city_name, format_clock,
+    placement_for, resolve_zone, system_zone,
 };
 
 use crate::anim::{LIFT, ease_standard};
@@ -157,11 +158,35 @@ pub struct DragState {
     pub from: usize,
 }
 
+/// A committed probe: the instant every card reads at.
+pub struct ProbeState {
+    pub instant: Timestamp,
+    /// The text the user committed, kept verbatim while it still resolves.
+    pub text: String,
+}
+
 /// Everything the Clocks section renders.
 pub struct ClockState {
     pub entries: Vec<ClockEntry>,
     pub travels: Vec<Travel>,
     pub now: Timestamp,
+    /// The active probe; `None` means live time. Never persisted.
+    pub probe: Option<ProbeState>,
+    /// Zone the probe reads in. `None` follows [`ClockState::local_zone`].
+    pub probe_zone: Option<String>,
+    /// The zone captured when the section was created; the probe's default.
+    pub local_zone: TimeZone,
+    /// Text field shared by every probe, created on first render.
+    pub probe_input: Option<Entity<InputState>>,
+    /// Placeholder currently installed on `probe_input`, so the 12/24-hour
+    /// preference only rewrites it when the shape really changed.
+    pub probe_placeholder: String,
+    /// Whether the probe-zone menu is open.
+    pub probe_menu: bool,
+    /// Last commit failure, shown on the control and in its `aria_label`.
+    pub probe_error: Option<String>,
+    /// DST note for the active probe ("02:30 does not exist here").
+    pub probe_hint: Option<String>,
     pub search: String,
     pub search_input: Option<Entity<InputState>>,
     pub zones: Vec<String>,
@@ -180,6 +205,14 @@ impl ClockState {
             entries: Vec::new(),
             travels: Vec::new(),
             now: Timestamp::now(),
+            probe: None,
+            probe_zone: None,
+            local_zone: system_zone(),
+            probe_input: None,
+            probe_placeholder: String::new(),
+            probe_menu: false,
+            probe_error: None,
+            probe_hint: None,
             search: String::new(),
             search_input: None,
             zones: Vec::new(),
@@ -219,6 +252,33 @@ impl ClockState {
 
     pub fn set_now(&mut self, now: Timestamp) {
         self.now = now;
+    }
+
+    /// The instant every card and person row reads: the probe when one is
+    /// active, the live clock otherwise.
+    pub fn instant(&self) -> Timestamp {
+        self.probe.as_ref().map_or(self.now, |probe| probe.instant)
+    }
+
+    /// The zone the probe reads its wall clock in.
+    pub fn probe_zone_value(&self) -> TimeZone {
+        self.probe_zone
+            .as_deref()
+            .and_then(resolve_zone)
+            .unwrap_or_else(|| self.local_zone.clone())
+    }
+
+    /// Label on the zone trigger. The local default names the system city
+    /// when the platform reports one.
+    pub fn probe_zone_label(&self) -> String {
+        match &self.probe_zone {
+            Some(identifier) => city_name(identifier),
+            None => self
+                .local_zone
+                .iana_name()
+                .map(city_name)
+                .unwrap_or_else(|| "Local".to_string()),
+        }
     }
 
     pub fn clear_drag(&mut self) {
@@ -265,7 +325,12 @@ impl ClockState {
         let Some(entry) = self.entry(clock_id) else {
             return CityPeople::default();
         };
-        city_people(&self.entries, &self.travels, entry, self.now.as_second())
+        city_people(
+            &self.entries,
+            &self.travels,
+            entry,
+            self.instant().as_second(),
+        )
     }
 
     /// Display order of clock ids.
@@ -539,6 +604,20 @@ pub fn starts_label(zone: Option<&TimeZone>, starts_at: i64) -> String {
     }
 }
 
+/// One-line DST note for a committed probe, or `None` when unambiguous.
+pub fn probe_hint(reading: ProbeReading, zone: &TimeZone, use_24h: bool) -> Option<String> {
+    let text = format_clock(reading.instant, zone, use_24h);
+    let shown = match text.period {
+        Some(period) => format!("{} {period}", text.time),
+        None => text.time,
+    };
+    match reading.ambiguity {
+        ProbeAmbiguity::Unique => None,
+        ProbeAmbiguity::Gap => Some(format!("{shown} \u{00b7} skipped hour")),
+        ProbeAmbiguity::Fold => Some(format!("{shown} \u{00b7} occurs twice, showing the first")),
+    }
+}
+
 /// First character of the first two words, uppercased.
 pub fn initials(name: &str) -> String {
     name.split_whitespace()
@@ -634,6 +713,8 @@ pub fn clocks_view(
     cx: &mut Context<AppShell>,
 ) -> AnyElement {
     let search_input = ensure_search_input(state, window, cx);
+    let probe_input = ensure_probe_input(state, window, cx);
+    sync_probe_placeholder(state, &probe_input, use_24h, window, cx);
     let filtered = state.filtered_indices();
     let reduced = cx.reduce_motion();
 
@@ -644,7 +725,7 @@ pub fn clocks_view(
         .size_full()
         .flex()
         .flex_col()
-        .child(toolbar(state, &search_input, use_24h, t, cx));
+        .child(toolbar(state, &search_input, &probe_input, use_24h, t, cx));
 
     if let Some(error) = &state.error {
         page = page.child(
@@ -683,6 +764,9 @@ pub fn clocks_view(
     if let Some(panel) = clocks_panels::confirm(state, t, cx) {
         page = page.child(panel);
     }
+    if let Some(panel) = clocks_panels::probe_zone_menu(state, t, cx) {
+        page = page.child(panel);
+    }
     page.into_any_element()
 }
 
@@ -710,9 +794,55 @@ fn ensure_search_input(
     input
 }
 
+fn ensure_probe_input(
+    state: &mut ClockState,
+    window: &mut Window,
+    cx: &mut Context<AppShell>,
+) -> Entity<InputState> {
+    if let Some(input) = &state.probe_input {
+        return input.clone();
+    }
+    let input = cx.new(|cx| InputState::new(window, cx).placeholder(""));
+    // Commit on Enter and on blur, never per keystroke: a half-typed `1`
+    // must not jump the page to 01:00.
+    cx.subscribe_in(
+        &input,
+        window,
+        |this: &mut AppShell, _input, event: &InputEvent, window, cx| match event {
+            InputEvent::PressEnter { .. } | InputEvent::Blur => this.commit_clock_probe(window, cx),
+            InputEvent::Change => this.clear_clock_probe_error(cx),
+            _ => {}
+        },
+    )
+    .detach();
+    state.probe_input = Some(input.clone());
+    input
+}
+
+/// The placeholder follows the 12/24-hour preference; rewrite it only when
+/// the shape really changed so the field is not touched every frame.
+fn sync_probe_placeholder(
+    state: &mut ClockState,
+    input: &Entity<InputState>,
+    use_24h: bool,
+    window: &mut Window,
+    cx: &mut Context<AppShell>,
+) {
+    let desired = if use_24h { "14:30" } else { "2:30 pm" };
+    if state.probe_placeholder == desired {
+        return;
+    }
+    state.probe_placeholder = desired.to_string();
+    let desired = desired.to_string();
+    input.update(cx, |input, cx| {
+        input.set_placeholder(desired, window, cx);
+    });
+}
+
 fn toolbar(
     state: &ClockState,
     search_input: &Entity<InputState>,
+    probe_input: &Entity<InputState>,
     use_24h: bool,
     t: &Tokens,
     cx: &mut Context<AppShell>,
@@ -741,7 +871,7 @@ fn toolbar(
             div()
                 .id("clocks-search")
                 .test_support()
-                .w(px(240.))
+                .w(px(200.))
                 .ml(px(14.))
                 .child(crate::views::field_input(search_input, t).prefix(icon(
                     Icon::Search,
@@ -749,6 +879,7 @@ fn toolbar(
                     t.text_faint,
                 ))),
         )
+        .child(probe_control(state, probe_input, t, cx))
         .child(div().flex_1())
         .child(units_toggle(use_24h, t, cx))
         .child(
@@ -779,6 +910,119 @@ fn toolbar(
                     this.open_clock_picker(window, cx)
                 })),
         )
+        .into_any_element()
+}
+
+/// The time + zone control: a calendar glyph, the time field, the zone
+/// trigger, and — while a probe is active — the `Now` chip.
+///
+/// The field keeps `field_input`'s own fill and border, so the accent lives on
+/// the zone chip instead of a wrapping pill; framing the field twice is the
+/// known duplicate-box regression.
+fn probe_control(
+    state: &ClockState,
+    input: &Entity<InputState>,
+    t: &Tokens,
+    cx: &mut Context<AppShell>,
+) -> AnyElement {
+    let probing = state.probe.is_some();
+    let invalid = state.probe_error.is_some();
+    let label = state
+        .probe_error
+        .clone()
+        .or_else(|| state.probe_hint.clone())
+        .or_else(|| {
+            state.probe.as_ref().map(|probe| {
+                format!(
+                    "Probing {} \u{00b7} {}",
+                    probe.text,
+                    state.probe_zone_label()
+                )
+            })
+        })
+        .unwrap_or_else(|| "Read every city at one time".to_string());
+    let zone_label = state.probe_zone_label();
+    let tokens = *t;
+
+    div()
+        .id("clocks-probe")
+        .test_support()
+        .aria_label(label)
+        .h(px(28.))
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+            this.handle_clock_probe_key(event, window, cx)
+        }))
+        .child(icon(
+            Icon::Calendar,
+            11.,
+            if probing { t.accent_text } else { t.text_faint },
+        ))
+        .child(
+            div()
+                .id("clocks-probe-time")
+                .test_support()
+                .w(px(92.))
+                .child(crate::views::field_input(input, t)),
+        )
+        .child(
+            div()
+                .id("clocks-probe-zone")
+                .test_support()
+                .h(px(28.))
+                .px(px(8.))
+                .flex()
+                .items_center()
+                .gap(px(5.))
+                .rounded(px(t.radius))
+                .border_1()
+                .border_color(if invalid {
+                    t.danger
+                } else if probing {
+                    t.accent
+                } else {
+                    t.border
+                })
+                .bg(if probing { t.accent_soft } else { t.card })
+                .cursor_pointer()
+                .text(Text::Small)
+                .text_color(if probing { t.accent_text } else { t.text_muted })
+                .hover(move |style| style.bg(tokens.surface_2).border_color(tokens.border_hover))
+                .child(zone_label)
+                .child(icon(
+                    Icon::ChevronDown,
+                    10.,
+                    if probing { t.accent_text } else { t.text_muted },
+                ))
+                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                    this.toggle_clock_probe_menu(cx)
+                })),
+        )
+        .when(probing, |el| {
+            el.child(
+                div()
+                    .id("clocks-probe-now")
+                    .test_support()
+                    .h(px(28.))
+                    .px(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .rounded(px(t.radius))
+                    .bg(t.accent_soft)
+                    .cursor_pointer()
+                    .text(Text::SmallStrong)
+                    .text_color(t.accent_text)
+                    .hover(move |style| style.bg(tokens.surface_2))
+                    .child(icon(Icon::RotateCcw, 10., t.accent_text))
+                    .child("Now")
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.clear_clock_probe(window, cx)
+                    })),
+            )
+        })
         .into_any_element()
 }
 
@@ -1004,7 +1248,7 @@ fn card(
     let text = entry
         .zone
         .as_ref()
-        .map(|zone| format_clock(state.now, zone, use_24h))
+        .map(|zone| format_clock(state.instant(), zone, use_24h))
         .unwrap_or_else(|| ClockText {
             time: "--:--".into(),
             period: None,
@@ -1449,6 +1693,50 @@ mod tests {
         assert_eq!(next, 1);
         let previous = next_selectable(&entries, &rows, 1, false);
         assert_eq!(previous, 2);
+    }
+
+    #[test]
+    fn instant_falls_back_to_now_and_follows_the_probe() {
+        let mut state = ClockState::new();
+        let now = Timestamp::from_second(1_700_000_000).expect("valid");
+        state.set_now(now);
+        assert_eq!(state.instant(), now);
+        let probe = Timestamp::from_second(1_600_000_000).expect("valid");
+        state.probe = Some(ProbeState {
+            instant: probe,
+            text: "03:00".into(),
+        });
+        assert_eq!(state.instant(), probe);
+    }
+
+    #[test]
+    fn probe_zone_label_names_the_default_zone() {
+        let mut state = ClockState::new();
+        assert!(!state.probe_zone_label().is_empty());
+        state.probe_zone = Some("Asia/Tokyo".into());
+        assert_eq!(state.probe_zone_label(), "Tokyo");
+    }
+
+    #[test]
+    fn probe_hint_reports_only_gap_and_fold() {
+        use kandrium_core::{probe_date, read_probe_time};
+        let zone = resolve_zone("America/New_York").expect("known zone");
+        let now = Timestamp::from_second(1_772_000_000).expect("valid");
+        let unique = read_probe_time("12:00", probe_date(now, &zone), &zone).expect("parse");
+        assert_eq!(probe_hint(unique, &zone, true), None);
+
+        let gap = read_probe_time("2:30", jiff::civil::date(2026, 3, 8), &zone).expect("parse");
+        assert!(
+            probe_hint(gap, &zone, true)
+                .expect("hint")
+                .contains("skipped hour")
+        );
+        let fold = read_probe_time("1:30", jiff::civil::date(2026, 11, 1), &zone).expect("parse");
+        assert!(
+            probe_hint(fold, &zone, false)
+                .expect("hint")
+                .contains("occurs twice")
+        );
     }
 
     #[test]

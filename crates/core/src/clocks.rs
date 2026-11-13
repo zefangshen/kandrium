@@ -899,6 +899,15 @@ pub fn probe_date(now: Timestamp, zone: &TimeZone) -> Date {
     now.to_zoned(zone.clone()).date()
 }
 
+/// A parsed probe time plus the DST classification of its wall clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProbeReading {
+    /// The instant the wall clock resolved to.
+    pub instant: Timestamp,
+    /// Whether that wall clock was skipped or repeated in the zone.
+    pub ambiguity: ProbeAmbiguity,
+}
+
 /// Parse `text` as a wall-clock time on `date` in `zone`.
 ///
 /// Accepts `H:mm`, `HH:mm`, `H.mm`, `HH.mm` and the 12-hour shapes `H:mm am`,
@@ -914,6 +923,15 @@ pub fn parse_probe_time(
     date: Date,
     zone: &TimeZone,
 ) -> std::result::Result<Timestamp, ProbeError> {
+    read_probe_time(text, date, zone).map(|reading| reading.instant)
+}
+
+/// Parse `text` and report how its wall clock resolved in `zone`.
+pub fn read_probe_time(
+    text: &str,
+    date: Date,
+    zone: &TimeZone,
+) -> std::result::Result<ProbeReading, ProbeError> {
     let text = text.trim().to_lowercase();
     if text.is_empty() {
         return Err(ProbeError::Empty);
@@ -974,10 +992,13 @@ pub fn parse_probe_time(
 
     let time = jiff::civil::Time::new(hour as i8, minute as i8, 0, 0)
         .map_err(|_| ProbeError::OutOfRange)?;
-    date.to_datetime(time)
+    let ambiguity = probe_ambiguity(date, time, zone);
+    let instant = date
+        .to_datetime(time)
         .to_zoned(zone.clone())
         .map(|zoned| zoned.timestamp())
-        .map_err(|_| ProbeError::OutOfRange)
+        .map_err(|_| ProbeError::OutOfRange)?;
+    Ok(ProbeReading { instant, ambiguity })
 }
 
 /// Classify a civil time in `zone` before it is disambiguated.

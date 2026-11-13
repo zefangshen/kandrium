@@ -83,20 +83,22 @@ The right group stays untouched.
 
 Anatomy (all `h(px(28))`, `rounded(t.radius)`, `border_1`):
 
-- container `clocks-probe`, `flex items_center gap(6)`; live state:
-  `border t.border`, `bg t.card`; probing: `border t.accent`, `bg t.accent_soft`.
+- container `clocks-probe`, `flex items_center gap(6)`; the accent lives on
+  the zone chip (S2 decision): `field_input` already paints its own fill and
+  border, and wrapping it in a framed pill would show the duplicate-box
+  regression the workspace notes warn about.
 - `Icon::Calendar` at 11 px, `t.text_faint` (no new icon asset).
-- time field `clocks-probe-time`: `width ~92 px`, `Text::Small`; placeholder
+- time field `clocks-probe-time`: `width 92 px`, `Text::Small`; placeholder
   follows the preference (`14:30` vs `2:30 pm`).
 - zone trigger `clocks-probe-zone`: city label + `Icon::ChevronDown` at 10 px,
-  hover wash; label is `city_name(iana)` plus nothing else — the offset is
-  already on the cards, and a long label truncates with a tooltip.
+  hover wash; label is `city_name(iana)` / the local zone's city. Live:
+  `border t.border`, `bg t.card`; probing: `border t.accent`, `bg
+  t.accent_soft`; failed commit: `border t.danger`.
 - separator `1 px t.divider` and `clocks-probe-now` (`Icon::RotateCcw` 10 px +
   `Now`), rendered **only** while probing.
-- `clocks-probe-error` / `clocks-probe-hint`: a 1-line caption below the row
-  is not possible inside 46 px, so both render as a red/neutral border on the
-  pill plus an `aria_label`/tooltip; the hint text also appears as the tail of
-  the pill when it fits (`02:30 → 03:30`). See §11 Q1 for the alternative.
+- `clocks-probe-error` / `clocks-probe-hint`: the toolbar is a fixed 46 px, so
+  both surface on the control's `aria_label` and the zone chip's border rather
+  than as a second row. See §11 Q11.
 
 Width budget at the app's 940 px minimum: padding 40 + title ~55 + count ~60 +
 search 200 + probe ~230 + units ~70 + add-city ~90 + 7 gaps 70 = 815, leaving
@@ -199,6 +201,11 @@ pub fn probe_date(now: Timestamp, zone: &TimeZone) -> Date;
 /// fold ⇒ earlier occurrence), matching `civil::DateTime::to_zoned`.
 pub fn parse_probe_time(text: &str, date: Date, zone: &TimeZone)
     -> Result<Timestamp, ProbeError>;
+
+/// Same parse plus the DST classification, so the view can render a hint.
+pub struct ProbeReading { pub instant: Timestamp, pub ambiguity: ProbeAmbiguity }
+pub fn read_probe_time(text: &str, date: Date, zone: &TimeZone)
+    -> Result<ProbeReading, ProbeError>;
 
 /// Classify the civil time before disambiguation, for the inline hint.
 pub fn probe_ambiguity(date: Date, time: civil::Time, zone: &TimeZone)

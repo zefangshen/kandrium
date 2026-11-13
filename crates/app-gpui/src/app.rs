@@ -23,7 +23,8 @@ use jiff::civil::Date;
 use kandrium_core::documents::{AnnotationDoc, AnnotationKind, import_file, new_annotation};
 use kandrium_core::{
     ALL_BOARD_ID, ArchivedCard, Board, BoardWithColumns, Card, CardStatus, CreateCardBody, Person,
-    ProjectChoice, Travel, day_end_seconds, day_start_seconds, project_dir,
+    ProjectChoice, Travel, day_end_seconds, day_start_seconds, probe_date, project_dir,
+    read_probe_time,
 };
 use pdf_render::{Event as PdfEvent, PdfWorker};
 use smallvec::smallvec;
@@ -37,7 +38,7 @@ use crate::views::archive;
 use crate::views::card_modal::{self, EditSession, ModalContext};
 use crate::views::clocks::{
     self, ClockDrag, ClockState, ConfirmKind, ConfirmState, DragState, FormKind, FormState,
-    InspectorState, PickerState,
+    InspectorState, PickerState, ProbeState,
 };
 use crate::views::documents::{self, DocDraft, DocDraftKind, DocKind, DocTab};
 use crate::views::documents_pdf;
@@ -3461,6 +3462,89 @@ impl AppShell {
         cx.notify();
     }
 
+    /// Commit the probe field. Enter and blur only: a half-typed `1` must not
+    /// jump the page, so typing never resolves a time on its own.
+    pub(crate) fn commit_clock_probe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(input) = self.clocks.probe_input.clone() else {
+            return;
+        };
+        let text = input.read(cx).value().to_string();
+        if text.trim().is_empty() {
+            self.clear_clock_probe(window, cx);
+            return;
+        }
+        let zone = self.clocks.probe_zone_value();
+        let date = probe_date(self.clocks.now, &zone);
+        match read_probe_time(&text, date, &zone) {
+            Ok(reading) => {
+                self.clocks.probe_hint = clocks::probe_hint(reading, &zone, self.use_24h);
+                self.clocks.probe = Some(ProbeState {
+                    instant: reading.instant,
+                    text,
+                });
+                self.clocks.probe_error = None;
+                self.clocks.probe_menu = false;
+            }
+            Err(error) => {
+                // Keep the previous probe and the typed text so the field can
+                // be corrected instead of reset.
+                self.clocks.probe_error = Some(error.to_string());
+            }
+        }
+        cx.notify();
+    }
+
+    /// Return to live time and empty the field.
+    pub(crate) fn clear_clock_probe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(input) = self.clocks.probe_input.clone() {
+            input.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+            });
+        }
+        self.clocks.probe = None;
+        self.clocks.probe_error = None;
+        self.clocks.probe_hint = None;
+        self.clocks.probe_menu = false;
+        cx.notify();
+    }
+
+    /// Drop the error as soon as the user edits the field again.
+    pub(crate) fn clear_clock_probe_error(&mut self, cx: &mut Context<Self>) {
+        if self.clocks.probe_error.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn handle_clock_probe_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.key == "escape" {
+            cx.stop_propagation();
+            self.clear_clock_probe(window, cx);
+        }
+    }
+
+    pub(crate) fn toggle_clock_probe_menu(&mut self, cx: &mut Context<Self>) {
+        self.clocks.probe_menu = !self.clocks.probe_menu;
+        cx.notify();
+    }
+
+    /// Pick the zone the probe reads in and re-read the typed wall clock in
+    /// it, per the plan's Q2 default.
+    pub(crate) fn set_clock_probe_zone(
+        &mut self,
+        zone: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.clocks.probe_zone = zone.map(str::to_string);
+        self.clocks.probe_menu = false;
+        self.commit_clock_probe(window, cx);
+    }
+
     pub(crate) fn open_clock_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.clocks.ensure_zones();
         let input = cx
@@ -4252,7 +4336,7 @@ impl AppShell {
                     name,
                     editor: editor.clone(),
                     vim: session,
-                    preview: true,
+                    preview: false,
                     saved: text,
                     dirty: false,
                     generation: 0,

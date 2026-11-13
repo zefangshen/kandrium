@@ -280,6 +280,170 @@ pub fn picker(
 }
 
 // ---------------------------------------------------------------------------
+// Probe zone menu
+// ---------------------------------------------------------------------------
+
+/// Zone menu for the toolbar probe: the local zone first, then every saved
+/// city. Picking a row re-reads the typed wall clock in that zone.
+pub fn probe_zone_menu(
+    state: &ClockState,
+    t: &Tokens,
+    cx: &mut Context<AppShell>,
+) -> Option<AnyElement> {
+    if !state.probe_menu {
+        return None;
+    }
+
+    let mut list = div()
+        .id("clock-probe-zone-list")
+        .w_full()
+        .max_h(px(360.))
+        .overflow_y_scroll()
+        .py(px(6.))
+        .flex()
+        .flex_col();
+
+    let local_detail = state
+        .local_zone
+        .iana_name()
+        .unwrap_or("system time zone")
+        .to_string();
+    let local_offset = format_offset(
+        state
+            .instant()
+            .to_zoned(state.local_zone.clone())
+            .offset()
+            .seconds(),
+    );
+    list = list.child(probe_zone_row(
+        "clock-probe-zone-local".to_string(),
+        "Local time zone",
+        &format!(
+            "{} \u{00b7} {local_detail} \u{00b7} {local_offset}",
+            state.probe_zone_label()
+        ),
+        state.probe_zone.is_none(),
+        None,
+        t,
+        cx,
+    ));
+
+    for (index, entry) in state.entries.iter().enumerate() {
+        let Some(zone) = entry.zone.clone() else {
+            continue;
+        };
+        let offset = format_offset(state.instant().to_zoned(zone).offset().seconds());
+        let selected = state.probe_zone.as_deref() == Some(entry.tz_identifier.as_str());
+        list = list.child(probe_zone_row(
+            format!("clock-probe-zone-{index}"),
+            &entry.city,
+            &format!("{} \u{00b7} {offset}", entry.tz_identifier),
+            selected,
+            Some(entry.tz_identifier.clone()),
+            t,
+            cx,
+        ));
+    }
+
+    let panel = panel_shell("clock-probe-zone-menu", 360., t)
+        .child(panel_header("Probe time zone", t))
+        .child(list)
+        .child(
+            div()
+                .w_full()
+                .px(px(16.))
+                .py(px(10.))
+                .flex()
+                .items_center()
+                .justify_end()
+                .border_t_1()
+                .border_color(t.border)
+                .child(
+                    div()
+                        .id("clock-probe-zone-cancel")
+                        .test_support()
+                        .px(px(10.))
+                        .h(px(28.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(t.radius))
+                        .cursor_pointer()
+                        .text(Text::Button)
+                        .text_color(t.text_muted)
+                        .child("Cancel")
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.toggle_clock_probe_menu(cx)
+                        })),
+                ),
+        );
+
+    Some(overlay(
+        "clock-probe-zone-overlay",
+        panel.into_any_element(),
+    ))
+}
+
+fn probe_zone_row(
+    id: String,
+    city: &str,
+    detail: &str,
+    selected: bool,
+    zone: Option<String>,
+    t: &Tokens,
+    cx: &mut Context<AppShell>,
+) -> AnyElement {
+    div()
+        .id(id)
+        .test_support()
+        .mx(px(8.))
+        .px(px(10.))
+        .py(px(7.))
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .rounded(px(4.))
+        .cursor_pointer()
+        .when(selected, |el| el.bg(t.selected))
+        .hover(|style| style.bg(t.hover))
+        .child(
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .text(Text::Body)
+                        .text_color(t.text)
+                        .child(city.to_string()),
+                )
+                .child(
+                    div()
+                        .text(Text::Small)
+                        .text_color(t.text_faint)
+                        .child(detail.to_string()),
+                ),
+        )
+        .when(selected, |el| {
+            el.child(
+                div()
+                    .px(px(6.))
+                    .h(px(18.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(4.))
+                    .bg(t.field)
+                    .text(Text::SmallStrong)
+                    .text_color(t.accent_text)
+                    .child("Selected"),
+            )
+        })
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+            this.set_clock_probe_zone(zone.as_deref(), window, cx)
+        }))
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
 // People inspector
 // ---------------------------------------------------------------------------
 
