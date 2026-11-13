@@ -154,10 +154,10 @@ Boot:
 
 ## S7 — Sweep
 
-- [ ] `cargo tree -d` and `Cargo.lock` review; confirm no
+- [x] `cargo tree -d` and `Cargo.lock` review; confirm no
       `eframe`/`egui`/`egui_commonmark`/`egui_extras`/`syntect`/`objc`.
-- [ ] `git grep -n "egui\|eframe\|egui_commonmark"`: only historical specs.
-- [ ] Final fmt/clippy/test.
-- [ ] Packaged smoke pass.
-- [ ] Commit.
-- [ ] Final report.
+- [x] `git grep -n "egui\|eframe\|egui_commonmark"`: only historical specs.
+- [x] Final fmt/clippy/test.
+- [x] Packaged smoke pass.
+- [x] Commit.
+- [x] Final report.

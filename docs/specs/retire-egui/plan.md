@@ -426,3 +426,27 @@ not block S1.
 
 `pre-egui-removal` is created in the S0 commit so the whole-app state can be
 restored with one command before S4.
+
+## 9. Execution notes
+
+Deviations found while carrying out the stages, recorded so the code and this
+file agree:
+
+- **Tab in the card description is dropped.** The gpui modal's focus trap
+  reserves `Tab` for focus navigation, so the key never reaches the field and
+  the egui "insert two spaces" behaviour cannot be reproduced without a
+  framework-level workaround. Recorded in §3.3 and tasks.md; no code change.
+- **The dev bundle's executable is a copy, not a symlink.** LaunchServices
+  hangs in dyld before `main` when the debug binary is reached through a
+  symlink or a launcher script on this macOS. `just dev` rebuilds and copies
+  the binary into `target/Kandrium-dev.app` before opening it.
+- **DMG creation is blocked from the agent shell.** The `.app` builds and
+  launches (DB and log open, correct icon and id); `create-dmg` cannot create
+  its `/Volumes/Kandrium` link from the sandbox. Run `just bundle` in a normal
+  shell for the DMG.
+- **`objc` stays in the lock.** It is now reached through gpui's `cocoa`
+  dependency, not the retired egui app; `eframe`, `egui`, `egui_commonmark`,
+  `egui_extras` and `syntect` are absent from `Cargo.lock`.
+- **Code-highlight palette.** As recorded in §8.3, gpui uses its own dark
+  highlight theme and only the Markdown grammar; this is a fidelity difference,
+  not a missing capability.

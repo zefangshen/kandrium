@@ -7,9 +7,10 @@ those rules.
 
 ## Where we are now
 
-- **Stack**: eframe/egui 0.36 desktop app, rmcp stdio MCP server, rusqlite
-  (bundled SQLite) shared data layer, all in one workspace
-  (`crates/core`, `crates/app`, `crates/mcp`).
+- **Stack**: gpui 0.9 desktop app (binary `kandrium-app`), rmcp stdio MCP
+  server, rusqlite (bundled SQLite) shared data layer and a PDF worker, all in
+  one workspace (`crates/core`, `crates/app-gpui`, `crates/mcp`,
+  `crates/pdf-render`).
 - **Tasks**: real boards with columns, drag-and-drop cards/columns, inline
   title editing, card modal (markdown description + due date + labels), a
   virtual **All** board with per-status ordering, and an **Archived** table
@@ -17,11 +18,11 @@ those rules.
 - **Projects**: DB-backed folder/project tree; each project owns a board, a
   document folder, an inline-editable overview (identifier, status,
   description, source) and mirrored "area" cards on normal boards.
-- **Notes** and **Documents**: file-system trees with multi-tab editors/readers;
-  Markdown (shared editor, preview, debounced autosave), PDFs (worker
-  rendering, highlights, sticky notes in JSON sidecars).
-- **Markdown editing**: vim-modal by default in Notes, project docs, Documents
-  `.md` tabs and the card description field.
+- **Wiki**: notes and documents in one split section, each with multi-tab
+  editors/readers; Markdown (shared editor, preview, debounced autosave), PDFs
+  (worker rendering, highlights, sticky notes in JSON sidecars).
+- **Markdown editing**: vim-modal by default in Wiki notes, project docs,
+  document `.md` tabs and the card description field.
 - **Data safety**: WAL + busy timeout, integrity check at boot, pre-migration
   and daily `VACUUM INTO` snapshots, atomic file writes, rotating logs and
   panic crash files.
