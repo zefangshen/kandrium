@@ -3457,9 +3457,34 @@ impl AppShell {
     }
 
     /// Times are formatted at render time, so the toggle needs no reload.
-    pub(crate) fn toggle_clock_units(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_clock_units(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.use_24h = !self.use_24h;
+        self.rewrite_probe_field(window, cx);
         cx.notify();
+    }
+
+    /// An active probe keeps its instant; only the field and hint follow the
+    /// new 12/24-hour shape.
+    fn rewrite_probe_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(probe) = self.clocks.probe.as_ref() else {
+            return;
+        };
+        let instant = probe.instant;
+        let reading = kandrium_core::ProbeReading {
+            instant,
+            ambiguity: probe.ambiguity,
+        };
+        let zone = self.clocks.probe_zone_value();
+        let value = clocks::probe_field_text(instant, &zone, self.use_24h);
+        if let Some(input) = self.clocks.probe_input.clone() {
+            input.update(cx, |state, cx| {
+                state.set_value(value.clone(), window, cx);
+            });
+        }
+        if let Some(probe) = self.clocks.probe.as_mut() {
+            probe.text = value;
+        }
+        self.clocks.probe_hint = clocks::probe_hint(reading, &zone, self.use_24h);
     }
 
     /// Commit the probe field. Enter and blur only: a half-typed `1` must not
@@ -3480,6 +3505,7 @@ impl AppShell {
                 self.clocks.probe_hint = clocks::probe_hint(reading, &zone, self.use_24h);
                 self.clocks.probe = Some(ProbeState {
                     instant: reading.instant,
+                    ambiguity: reading.ambiguity,
                     text,
                 });
                 self.clocks.probe_error = None;
@@ -3546,6 +3572,21 @@ impl AppShell {
     }
 
     pub(crate) fn open_clock_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_zone_picker(clocks::PickerTarget::AddCity, window, cx);
+    }
+
+    /// The same searchable zone overlay, choosing the probe's zone instead of
+    /// adding a city.
+    pub(crate) fn open_probe_zone_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_zone_picker(clocks::PickerTarget::ProbeZone, window, cx);
+    }
+
+    fn open_zone_picker(
+        &mut self,
+        target: clocks::PickerTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.clocks.ensure_zones();
         let input = cx
             .new(|cx| InputState::new(window, cx).placeholder("Search city, region or time zone"));
@@ -3554,8 +3595,21 @@ impl AppShell {
             input,
             selected: 0,
             error: None,
+            target,
         });
+        self.clocks.probe_menu = false;
         cx.notify();
+    }
+
+    /// Set the probe zone from the searchable overlay and close it.
+    pub(crate) fn pick_probe_zone(
+        &mut self,
+        zone: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.clocks.picker = None;
+        self.set_clock_probe_zone(Some(zone), window, cx);
     }
 
     pub(crate) fn close_clock_picker(&mut self, cx: &mut Context<Self>) {
@@ -3587,12 +3641,13 @@ impl AppShell {
     pub(crate) fn handle_picker_key(
         &mut self,
         event: &KeyDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(picker) = &self.clocks.picker else {
             return;
         };
+        let target = picker.target;
         let query = picker.input.read(cx).value().to_string();
         let rows = clocks::picker_rows(&self.clocks.zones, &query);
         match event.keystroke.key.as_str() {
@@ -3608,12 +3663,26 @@ impl AppShell {
                     .as_ref()
                     .map(|picker| picker.selected)
                     .unwrap_or(0);
-                let next = clocks::next_selectable(
-                    &self.clocks.entries,
-                    &rows,
-                    from,
-                    event.keystroke.key == "down",
-                );
+                // The add-city picker skips zones that are already saved; the
+                // probe picker must reach them too.
+                let next = match target {
+                    clocks::PickerTarget::AddCity => clocks::next_selectable(
+                        &self.clocks.entries,
+                        &rows,
+                        from,
+                        event.keystroke.key == "down",
+                    ),
+                    clocks::PickerTarget::ProbeZone if !rows.is_empty() => {
+                        let len = rows.len();
+                        let from = from.min(len - 1);
+                        if event.keystroke.key == "down" {
+                            (from + 1) % len
+                        } else {
+                            (from + len - 1) % len
+                        }
+                    }
+                    clocks::PickerTarget::ProbeZone => 0,
+                };
                 if let Some(picker) = &mut self.clocks.picker {
                     picker.selected = next;
                 }
@@ -3627,10 +3696,15 @@ impl AppShell {
                     .as_ref()
                     .map(|picker| picker.selected)
                     .unwrap_or(0);
-                if let Some(zone) = rows.get(selected).cloned()
-                    && !clocks::zone_is_added(&self.clocks.entries, &zone)
-                {
-                    self.pick_zone(&zone, cx);
+                if let Some(zone) = rows.get(selected).cloned() {
+                    match target {
+                        clocks::PickerTarget::AddCity => {
+                            if !clocks::zone_is_added(&self.clocks.entries, &zone) {
+                                self.pick_zone(&zone, cx);
+                            }
+                        }
+                        clocks::PickerTarget::ProbeZone => self.pick_probe_zone(&zone, window, cx),
+                    }
                 }
             }
             _ => {}

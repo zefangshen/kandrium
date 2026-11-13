@@ -18,6 +18,13 @@ Decisions taken (approved defaults):
 - Q9 probed zone: no accent ring on its card; the pill names the zone.
 - Q10 default zone: the system zone captured when the probe opens.
 - Q11 error surface: pill border plus tooltip/`aria_label`, no extra row.
+- S2: the accent sits on the zone chip, not a wrapping pill, because
+  `field_input` already paints its own border and fill.
+- S3: the all-zones overlay reuses the existing picker (`clock-picker`); its
+  header reads "Probe time zone", saved zones stay selectable, and the current
+  zone carries a `Selected` chip.
+- S3: a 12/24-hour toggle rewrites an active probe's field from its instant
+  (`probe_field_text`), leaving the instant itself untouched.
 
 ## 1. Goal
 

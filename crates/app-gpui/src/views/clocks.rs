@@ -92,6 +92,15 @@ pub struct CityPeople {
     pub visitors: Vec<PersonStatus>,
 }
 
+/// What the IANA picker is choosing for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PickerTarget {
+    /// Append the zone to the Clocks page.
+    AddCity,
+    /// Set the zone the probe reads its wall clock in.
+    ProbeZone,
+}
+
 /// Add-city picker.
 pub struct PickerState {
     pub input: Entity<InputState>,
@@ -99,6 +108,8 @@ pub struct PickerState {
     pub selected: usize,
     /// Last failure reported by core while adding a zone.
     pub error: Option<String>,
+    /// Whether the chosen zone is added as a city or becomes the probe zone.
+    pub target: PickerTarget,
 }
 
 /// Per-city people inspector.
@@ -161,6 +172,8 @@ pub struct DragState {
 /// A committed probe: the instant every card reads at.
 pub struct ProbeState {
     pub instant: Timestamp,
+    /// How the typed wall clock resolved (DST gap/fold note).
+    pub ambiguity: ProbeAmbiguity,
     /// The text the user committed, kept verbatim while it still resolves.
     pub text: String,
 }
@@ -606,15 +619,20 @@ pub fn starts_label(zone: Option<&TimeZone>, starts_at: i64) -> String {
 
 /// One-line DST note for a committed probe, or `None` when unambiguous.
 pub fn probe_hint(reading: ProbeReading, zone: &TimeZone, use_24h: bool) -> Option<String> {
-    let text = format_clock(reading.instant, zone, use_24h);
-    let shown = match text.period {
-        Some(period) => format!("{} {period}", text.time),
-        None => text.time,
-    };
+    let shown = probe_field_text(reading.instant, zone, use_24h);
     match reading.ambiguity {
         ProbeAmbiguity::Unique => None,
         ProbeAmbiguity::Gap => Some(format!("{shown} \u{00b7} skipped hour")),
         ProbeAmbiguity::Fold => Some(format!("{shown} \u{00b7} occurs twice, showing the first")),
+    }
+}
+
+/// The time field's text for an instant: the same shape the cards print.
+pub fn probe_field_text(instant: Timestamp, zone: &TimeZone, use_24h: bool) -> String {
+    let text = format_clock(instant, zone, use_24h);
+    match text.period {
+        Some(period) => format!("{} {period}", text.time),
+        None => text.time,
     }
 }
 
@@ -1037,7 +1055,9 @@ fn units_toggle(use_24h: bool, t: &Tokens, cx: &mut Context<AppShell>) -> AnyEle
         .rounded(px(t.radius))
         .bg(t.hover)
         .cursor_pointer()
-        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_clock_units(cx)))
+        .on_click(
+            cx.listener(|this, _: &ClickEvent, window, cx| this.toggle_clock_units(window, cx)),
+        )
         .child(unit_chip("12h", !use_24h, t))
         .child(unit_chip("24h", use_24h, t))
         .into_any_element()
@@ -1704,6 +1724,7 @@ mod tests {
         let probe = Timestamp::from_second(1_600_000_000).expect("valid");
         state.probe = Some(ProbeState {
             instant: probe,
+            ambiguity: ProbeAmbiguity::Unique,
             text: "03:00".into(),
         });
         assert_eq!(state.instant(), probe);
@@ -1715,6 +1736,14 @@ mod tests {
         assert!(!state.probe_zone_label().is_empty());
         state.probe_zone = Some("Asia/Tokyo".into());
         assert_eq!(state.probe_zone_label(), "Tokyo");
+    }
+
+    #[test]
+    fn probe_field_text_follows_the_clock_preference() {
+        let zone = resolve_zone("Asia/Tokyo").expect("known zone");
+        let at: Timestamp = "2026-11-05T05:30:00Z".parse().expect("timestamp");
+        assert_eq!(probe_field_text(at, &zone, true), "14:30");
+        assert_eq!(probe_field_text(at, &zone, false), "2:30 pm");
     }
 
     #[test]

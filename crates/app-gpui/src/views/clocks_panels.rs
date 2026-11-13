@@ -17,8 +17,8 @@ use crate::app::AppShell;
 use crate::assets::{Icon, icon};
 use crate::theme::{Text, TextStyled, Tokens};
 use crate::views::clocks::{
-    ClockState, ConfirmKind, FormKind, PersonStatus, city_label, picker_rows, starts_label,
-    until_label, zone_is_added,
+    ClockState, ConfirmKind, FormKind, PersonStatus, PickerTarget, city_label, picker_rows,
+    starts_label, until_label, zone_is_added,
 };
 
 /// Full-section scrim with a centred panel.
@@ -97,6 +97,9 @@ pub fn picker(
     cx: &mut Context<AppShell>,
 ) -> Option<AnyElement> {
     let picker = state.picker.as_ref()?;
+    let target = picker.target;
+    // The probe picker must reach saved zones too, so it never disables a row.
+    let probe_target = target == PickerTarget::ProbeZone;
     let query = picker.input.read(cx).value().to_string();
     let rows = picker_rows(&state.zones, &query);
     let selected = picker.selected.min(rows.len().saturating_sub(1));
@@ -139,12 +142,13 @@ pub fn picker(
         );
     } else {
         for (index, zone) in rows.iter().enumerate() {
-            let added = zone_is_added(&state.entries, zone);
+            let added = !probe_target && zone_is_added(&state.entries, zone);
             let is_selected = index == selected;
             let city = kandrium_core::city_name(zone);
             let offset = resolve_zone(zone)
-                .map(|zone| format_offset(state.now.to_zoned(zone).offset().seconds()))
+                .map(|zone| format_offset(state.instant().to_zoned(zone).offset().seconds()))
                 .unwrap_or_else(|| "GMT?".to_string());
+            let current = probe_target && state.probe_zone.as_deref() == Some(zone.as_str());
             let row = div()
                 .id(format!("clock-zone-{zone}"))
                 .test_support()
@@ -189,6 +193,20 @@ pub fn picker(
                             .child("Added"),
                     )
                 })
+                .when(current, |el| {
+                    el.child(
+                        div()
+                            .px(px(6.))
+                            .h(px(18.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(4.))
+                            .bg(t.field)
+                            .text(Text::SmallStrong)
+                            .text_color(t.accent_text)
+                            .child("Selected"),
+                    )
+                })
                 .when(!added, |el| {
                     el.child(
                         div()
@@ -201,9 +219,18 @@ pub fn picker(
                 row
             } else {
                 let zone = zone.clone();
-                row.on_click(
-                    cx.listener(move |this, _: &ClickEvent, _window, cx| this.pick_zone(&zone, cx)),
-                )
+                match target {
+                    PickerTarget::AddCity => {
+                        row.on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                            this.pick_zone(&zone, cx)
+                        }))
+                    }
+                    PickerTarget::ProbeZone => {
+                        row.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.pick_probe_zone(&zone, window, cx)
+                        }))
+                    }
+                }
             };
             list = list.child(row);
         }
@@ -213,7 +240,14 @@ pub fn picker(
         .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
             this.handle_picker_key(event, window, cx)
         }))
-        .child(panel_header("Add a city", t))
+        .child(panel_header(
+            if probe_target {
+                "Probe time zone"
+            } else {
+                "Add a city"
+            },
+            t,
+        ))
         .child(
             div()
                 .w_full()
@@ -348,6 +382,30 @@ pub fn probe_zone_menu(
     let panel = panel_shell("clock-probe-zone-menu", 360., t)
         .child(panel_header("Probe time zone", t))
         .child(list)
+        .child(
+            div()
+                .id("clock-probe-zone-search")
+                .test_support()
+                .mx(px(8.))
+                .px(px(10.))
+                .py(px(7.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .hover(|style| style.bg(t.hover))
+                .child(icon(Icon::Search, 11., t.text_muted))
+                .child(
+                    div()
+                        .text(Text::Body)
+                        .text_color(t.text_muted)
+                        .child("Search all zones\u{2026}"),
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.open_probe_zone_picker(window, cx)
+                })),
+        )
         .child(
             div()
                 .w_full()
