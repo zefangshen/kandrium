@@ -512,7 +512,7 @@ pub(crate) fn tree_header(
                 .truncate()
                 .text(Text::Label)
                 .text_color(t.text_muted)
-                .child("DOCUMENTS"),
+                .child("SOURCES"),
         )
         .child(tree_action(
             "documents-upload",
@@ -619,7 +619,7 @@ pub(crate) fn tree_body(
                 .py(px(10.))
                 .text(Text::Small)
                 .text_color(t.text_faint)
-                .child("No documents yet. Upload a PDF or Markdown file."),
+                .child("No sources yet. Upload a PDF or Markdown file."),
         );
     }
     for entry in &entries {

@@ -155,7 +155,7 @@ pub(crate) fn tree_header(
                 .truncate()
                 .text(Text::Label)
                 .text_color(t.text_muted)
-                .child("NOTES"),
+                .child("WIKI"),
         )
         .child(tree_action(
             "notes-new-note",
@@ -194,7 +194,7 @@ pub(crate) fn tree_body(state: &NotesState, t: &Tokens, cx: &mut Context<AppShel
 
     if let Some(draft) = &state.draft {
         let label = match draft.kind {
-            DraftKind::Note => "New note",
+            DraftKind::Note => "New page",
             DraftKind::Folder => "New folder",
             DraftKind::Rename => "Rename",
         };
@@ -253,7 +253,7 @@ pub(crate) fn tree_body(state: &NotesState, t: &Tokens, cx: &mut Context<AppShel
                 .py(px(10.))
                 .text(Text::Small)
                 .text_color(t.text_faint)
-                .child("No notes yet."),
+                .child("No wiki pages yet."),
         );
     }
     for entry in &state.entries {

@@ -482,7 +482,7 @@ fn detail_column(
                 "wiki-empty",
                 Icon::Folder,
                 "Nothing open",
-                "Pick a note or document in either tree, or use the new and upload buttons above.",
+                "Pick a wiki page or source in either tree, or use the new and upload buttons above.",
                 t,
             ))
             .into_any_element();
