@@ -39,7 +39,7 @@ use crate::views::clocks::{
     self, ClockDrag, ClockState, ConfirmKind, ConfirmState, DragState, FormKind, FormState,
     InspectorState, PickerState,
 };
-use crate::views::documents::{self, DocDraft, DocDraftKind, DocKind, DocTab, DocumentsState};
+use crate::views::documents::{self, DocDraft, DocDraftKind, DocKind, DocTab};
 use crate::views::documents_pdf;
 use crate::views::projects::{
     self, DetailEditor, DocDraft as ProjectDocDraft, DocDraftKind as ProjectDocDraftKind,
@@ -50,8 +50,9 @@ use crate::views::tasks::{
     COLUMN_W, CardMetrics, DropTarget, GAP_FALLBACK, SLOT_H, card_body, title_row,
 };
 use crate::views::{
-    notes::{self, DraftKind, NameDraft, NoteTab, NotesState},
+    notes::{self, DraftKind, NameDraft, NoteTab},
     placeholder, tasks,
+    wiki::WikiState,
 };
 use crate::vim;
 
@@ -239,8 +240,8 @@ pub struct AppShell {
     clock_tick: u64,
     /// Generation of the tick loop currently allowed to run.
     clock_tick_running: Option<u64>,
-    notes: NotesState,
-    documents: DocumentsState,
+    /// The merged Wiki section: both trees, the shared tab order and the split.
+    wiki: WikiState,
     projects: ProjectsState,
     /// Board currently loaded into `board` for a project's Tasks tab. Kept
     /// separate from `active_board_id` so the Tasks section is unaffected.
@@ -315,12 +316,11 @@ impl AppShell {
             .unwrap_or_else(|| PathBuf::from(settings::FILE_NAME));
         let settings = settings::Settings::load(&settings_path);
 
-        let mut notes = NotesState::new();
-        notes.tree_open = settings.tree_open(TreePanel::Notes);
-        notes.tree_w = settings.tree_width(TreePanel::Notes);
-        let mut documents = DocumentsState::new();
-        documents.tree_open = settings.tree_open(TreePanel::Documents);
-        documents.tree_w = settings.tree_width(TreePanel::Documents);
+        let mut wiki = WikiState::new();
+        wiki.notes.tree_open = settings.tree_open(TreePanel::Notes);
+        wiki.notes.tree_w = settings.tree_width(TreePanel::Notes);
+        wiki.documents.tree_open = settings.tree_open(TreePanel::Documents);
+        wiki.documents.tree_w = settings.tree_width(TreePanel::Documents);
         let mut projects = ProjectsState::new();
         projects.tree_open = settings.tree_open(TreePanel::Projects);
         projects.tree_w = settings.tree_width(TreePanel::Projects);
@@ -374,8 +374,7 @@ impl AppShell {
             titlebar_clock_menu: false,
             clock_tick: 0,
             clock_tick_running: None,
-            notes,
-            documents,
+            wiki,
             projects,
             project_board_shown: None,
             settings,
@@ -410,13 +409,13 @@ impl AppShell {
         self.settings.set_vim_mode(self.vim_mode);
         self.settings.set_section(self.section);
         self.settings
-            .set_tree_open(TreePanel::Notes, self.notes.tree_open);
+            .set_tree_open(TreePanel::Notes, self.wiki.notes.tree_open);
         self.settings
-            .set_tree_width(TreePanel::Notes, self.notes.tree_w);
+            .set_tree_width(TreePanel::Notes, self.wiki.notes.tree_w);
         self.settings
-            .set_tree_open(TreePanel::Documents, self.documents.tree_open);
+            .set_tree_open(TreePanel::Documents, self.wiki.documents.tree_open);
         self.settings
-            .set_tree_width(TreePanel::Documents, self.documents.tree_w);
+            .set_tree_width(TreePanel::Documents, self.wiki.documents.tree_w);
         self.settings
             .set_tree_open(TreePanel::Projects, self.projects.tree_open);
         self.settings
@@ -438,11 +437,11 @@ impl AppShell {
             let description = session.description.clone();
             session.vim.set_enabled(enabled, &description, cx);
         }
-        for tab in &mut self.notes.tabs {
+        for tab in &mut self.wiki.notes.tabs {
             let editor = tab.editor.clone();
             tab.vim.set_enabled(enabled, &editor, cx);
         }
-        for tab in &mut self.documents.tabs {
+        for tab in &mut self.wiki.documents.tabs {
             if let (Some(vim), Some(editor)) = (tab.vim.as_mut(), tab.editor.clone()) {
                 vim.set_enabled(enabled, &editor, cx);
             }
@@ -460,8 +459,8 @@ impl AppShell {
     /// Live width while the tree splitter is dragged.
     pub(crate) fn set_notes_tree_width(&mut self, width: f32, cx: &mut Context<Self>) {
         let width = settings::clamp_tree_width(width);
-        if (self.notes.tree_w - width).abs() > 0.5 {
-            self.notes.tree_w = width;
+        if (self.wiki.notes.tree_w - width).abs() > 0.5 {
+            self.wiki.notes.tree_w = width;
             cx.notify();
         }
     }
@@ -469,8 +468,8 @@ impl AppShell {
     /// Live width while the tree splitter is dragged.
     pub(crate) fn set_documents_tree_width(&mut self, width: f32, cx: &mut Context<Self>) {
         let width = settings::clamp_tree_width(width);
-        if (self.documents.tree_w - width).abs() > 0.5 {
-            self.documents.tree_w = width;
+        if (self.wiki.documents.tree_w - width).abs() > 0.5 {
+            self.wiki.documents.tree_w = width;
             cx.notify();
         }
     }
@@ -4129,52 +4128,52 @@ impl AppShell {
         let root = match self.store.notes_root() {
             Ok(root) => root,
             Err(error) => {
-                self.notes.root = None;
-                self.notes.entries.clear();
-                self.notes.error = Some(error.to_string());
+                self.wiki.notes.root = None;
+                self.wiki.notes.entries.clear();
+                self.wiki.notes.error = Some(error.to_string());
                 return;
             }
         };
         match self.store.notes_tree(&root) {
             Ok(entries) => {
-                self.notes.root = Some(root);
-                self.notes.entries = entries;
-                self.notes.error = None;
+                self.wiki.notes.root = Some(root);
+                self.wiki.notes.entries = entries;
+                self.wiki.notes.error = None;
             }
             Err(error) => {
-                self.notes.root = Some(root);
-                self.notes.entries.clear();
-                self.notes.error = Some(error.to_string());
+                self.wiki.notes.root = Some(root);
+                self.wiki.notes.entries.clear();
+                self.wiki.notes.error = Some(error.to_string());
             }
         }
     }
 
     pub(crate) fn toggle_notes_tree(&mut self, cx: &mut Context<Self>) {
-        self.notes.tree_open = !self.notes.tree_open;
+        self.wiki.notes.tree_open = !self.wiki.notes.tree_open;
         self.persist_settings();
         cx.notify();
     }
 
     pub(crate) fn toggle_notes_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if !self.notes.expanded.remove(&path) {
-            self.notes.expanded.insert(path.clone());
+        if !self.wiki.notes.expanded.remove(&path) {
+            self.wiki.notes.expanded.insert(path.clone());
         }
-        self.notes.selected = Some(path);
+        self.wiki.notes.selected = Some(path);
         cx.notify();
     }
 
     /// Open a note in a tab, reusing the tab when the path is already open.
     pub(crate) fn open_note(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        self.notes.selected = Some(path.clone());
-        if let Some(index) = self.notes.tab_index(&path) {
-            self.notes.active = Some(index);
-            let editor = self.notes.tabs[index].editor.clone();
+        self.wiki.notes.selected = Some(path.clone());
+        if let Some(index) = self.wiki.notes.tab_index(&path) {
+            self.wiki.notes.active = Some(index);
+            let editor = self.wiki.notes.tabs[index].editor.clone();
             editor.update(cx, |state, cx| state.focus(window, cx));
             cx.notify();
             return;
         }
-        let Some(root) = self.notes.root.clone() else {
-            self.notes.error = Some("The notes folder is unavailable".into());
+        let Some(root) = self.wiki.notes.root.clone() else {
+            self.wiki.notes.error = Some("The notes folder is unavailable".into());
             cx.notify();
             return;
         };
@@ -4196,7 +4195,7 @@ impl AppShell {
                     .file_name()
                     .map(|name| name.to_string_lossy().to_string())
                     .unwrap_or_default();
-                self.notes.tabs.push(NoteTab {
+                self.wiki.notes.tabs.push(NoteTab {
                     path,
                     name,
                     editor: editor.clone(),
@@ -4206,13 +4205,13 @@ impl AppShell {
                     dirty: false,
                     generation: 0,
                 });
-                self.notes.active = Some(self.notes.tabs.len() - 1);
-                self.notes.error = None;
-                if self.notes.tabs.last().is_some_and(|tab| !tab.preview) {
+                self.wiki.notes.active = Some(self.wiki.notes.tabs.len() - 1);
+                self.wiki.notes.error = None;
+                if self.wiki.notes.tabs.last().is_some_and(|tab| !tab.preview) {
                     editor.update(cx, |state, cx| state.focus(window, cx));
                 }
             }
-            Err(error) => self.notes.error = Some(error.to_string()),
+            Err(error) => self.wiki.notes.error = Some(error.to_string()),
         }
         cx.notify();
     }
@@ -4223,12 +4222,12 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = self.notes.tab_index(&path) else {
+        let Some(index) = self.wiki.notes.tab_index(&path) else {
             return;
         };
-        self.notes.active = Some(index);
-        let editor = self.notes.tabs[index].editor.clone();
-        if !self.notes.tabs[index].preview {
+        self.wiki.notes.active = Some(index);
+        let editor = self.wiki.notes.tabs[index].editor.clone();
+        if !self.wiki.notes.tabs[index].preview {
             editor.update(cx, |state, cx| state.focus(window, cx));
         }
         cx.notify();
@@ -4236,14 +4235,16 @@ impl AppShell {
 
     pub(crate) fn close_note_tab_by_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.save_note(&path, cx);
-        let Some(index) = self.notes.tab_index(&path) else {
+        let Some(index) = self.wiki.notes.tab_index(&path) else {
             return;
         };
-        self.notes.tabs.remove(index);
-        self.notes.active = match (self.notes.tabs.is_empty(), self.notes.active) {
+        self.wiki.notes.tabs.remove(index);
+        self.wiki.notes.active = match (self.wiki.notes.tabs.is_empty(), self.wiki.notes.active) {
             (true, _) => None,
             (false, Some(active)) if active > index => Some(active - 1),
-            (false, Some(active)) if active == index => Some(index.min(self.notes.tabs.len() - 1)),
+            (false, Some(active)) if active == index => {
+                Some(index.min(self.wiki.notes.tabs.len() - 1))
+            }
             (false, other) => other,
         };
         cx.notify();
@@ -4252,11 +4253,17 @@ impl AppShell {
     /// A textarea notification. Only a value that differs from the last write
     /// marks the tab dirty and schedules the debounce.
     fn note_edited(&mut self, editor: &Entity<EditorState>, cx: &mut Context<Self>) {
-        let Some(index) = self.notes.tabs.iter().position(|tab| tab.editor == *editor) else {
+        let Some(index) = self
+            .wiki
+            .notes
+            .tabs
+            .iter()
+            .position(|tab| tab.editor == *editor)
+        else {
             return;
         };
         let value = editor.read(cx).value().to_string();
-        let tab = &mut self.notes.tabs[index];
+        let tab = &mut self.wiki.notes.tabs[index];
         if value == tab.saved {
             if tab.dirty {
                 tab.dirty = false;
@@ -4280,10 +4287,10 @@ impl AppShell {
     /// A debounce that already lost its race (a newer edit bumped the
     /// generation) bows out.
     fn autosave_note(&mut self, path: &Path, generation: u64, cx: &mut Context<Self>) {
-        let Some(index) = self.notes.tab_index(path) else {
+        let Some(index) = self.wiki.notes.tab_index(path) else {
             return;
         };
-        if self.notes.tabs[index].generation != generation {
+        if self.wiki.notes.tabs[index].generation != generation {
             return;
         }
         self.save_note(path, cx);
@@ -4291,37 +4298,41 @@ impl AppShell {
 
     /// Write a dirty tab through core's atomic write.
     fn save_note(&mut self, path: &Path, cx: &mut Context<Self>) {
-        let Some(index) = self.notes.tab_index(path) else {
+        let Some(index) = self.wiki.notes.tab_index(path) else {
             return;
         };
-        if !self.notes.tabs[index].dirty {
+        if !self.wiki.notes.tabs[index].dirty {
             return;
         }
-        let Some(root) = self.notes.root.clone() else {
+        let Some(root) = self.wiki.notes.root.clone() else {
             return;
         };
-        let value = self.notes.tabs[index].editor.read(cx).value().to_string();
+        let value = self.wiki.notes.tabs[index]
+            .editor
+            .read(cx)
+            .value()
+            .to_string();
         match self.store.write_note(path, &root, &value) {
             Ok(()) => {
-                let tab = &mut self.notes.tabs[index];
+                let tab = &mut self.wiki.notes.tabs[index];
                 tab.saved = value;
                 tab.dirty = false;
-                self.notes.error = None;
+                self.wiki.notes.error = None;
             }
-            Err(error) => self.notes.error = Some(error.to_string()),
+            Err(error) => self.wiki.notes.error = Some(error.to_string()),
         }
         cx.notify();
     }
 
     fn save_active_note(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = self.notes.active_tab().map(|tab| tab.path.clone()) else {
+        let Some(path) = self.wiki.notes.active_tab().map(|tab| tab.path.clone()) else {
             return;
         };
         self.save_note(&path, cx);
     }
 
     fn close_active_note(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = self.notes.active_tab().map(|tab| tab.path.clone()) else {
+        let Some(path) = self.wiki.notes.active_tab().map(|tab| tab.path.clone()) else {
             return;
         };
         self.close_note_tab_by_path(path, cx);
@@ -4333,10 +4344,10 @@ impl AppShell {
     }
 
     pub(crate) fn toggle_note_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(index) = self.notes.active else {
+        let Some(index) = self.wiki.notes.active else {
             return;
         };
-        let Some(tab) = self.notes.tabs.get_mut(index) else {
+        let Some(tab) = self.wiki.notes.tabs.get_mut(index) else {
             return;
         };
         tab.preview = !tab.preview;
@@ -4352,15 +4363,15 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.notes.draft.is_some() {
+        if self.wiki.notes.draft.is_some() {
             return;
         }
-        let Some(root) = self.notes.root.clone() else {
-            self.notes.error = Some("The notes folder is unavailable".into());
+        let Some(root) = self.wiki.notes.root.clone() else {
+            self.wiki.notes.error = Some("The notes folder is unavailable".into());
             cx.notify();
             return;
         };
-        let target = self.notes.selected_dir(&root);
+        let target = self.wiki.notes.selected_dir(&root);
         let placeholder = match kind {
             DraftKind::Note => "Note name",
             DraftKind::Folder => "Folder name",
@@ -4368,12 +4379,12 @@ impl AppShell {
         };
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         input.update(cx, |state, cx| state.focus(window, cx));
-        self.notes.draft = Some(NameDraft {
+        self.wiki.notes.draft = Some(NameDraft {
             kind,
             target,
             input,
         });
-        self.notes.error = None;
+        self.wiki.notes.error = None;
         cx.notify();
     }
 
@@ -4391,12 +4402,12 @@ impl AppShell {
         };
         let input = cx.new(|cx| InputState::new(window, cx).default_value(name));
         input.update(cx, |state, cx| state.focus(window, cx));
-        self.notes.draft = Some(NameDraft {
+        self.wiki.notes.draft = Some(NameDraft {
             kind: DraftKind::Rename,
             target: path,
             input,
         });
-        self.notes.error = None;
+        self.wiki.notes.error = None;
         cx.notify();
     }
 
@@ -4420,19 +4431,19 @@ impl AppShell {
     }
 
     fn commit_note_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(draft) = &self.notes.draft else {
+        let Some(draft) = &self.wiki.notes.draft else {
             return;
         };
         let kind = draft.kind;
         let target = draft.target.clone();
         let name = draft.input.read(cx).value().trim().to_string();
-        let Some(root) = self.notes.root.clone() else {
-            self.notes.error = Some("The notes folder is unavailable".into());
+        let Some(root) = self.wiki.notes.root.clone() else {
+            self.wiki.notes.error = Some("The notes folder is unavailable".into());
             cx.notify();
             return;
         };
         if name.is_empty() {
-            self.notes.error = Some("A name is required".into());
+            self.wiki.notes.error = Some("A name is required".into());
             cx.notify();
             return;
         }
@@ -4446,17 +4457,17 @@ impl AppShell {
                 if kind == DraftKind::Rename {
                     self.remap_note_paths(&target, &created);
                 } else {
-                    self.notes.expanded.insert(target);
+                    self.wiki.notes.expanded.insert(target);
                     if kind == DraftKind::Note {
                         self.open_note(created.clone(), window, cx);
                     }
                 }
-                self.notes.selected = Some(created);
-                self.notes.draft = None;
-                self.notes.error = None;
+                self.wiki.notes.selected = Some(created);
+                self.wiki.notes.draft = None;
+                self.wiki.notes.error = None;
                 self.load_notes();
             }
-            Err(error) => self.notes.error = Some(error.to_string()),
+            Err(error) => self.wiki.notes.error = Some(error.to_string()),
         }
         cx.notify();
     }
@@ -4464,7 +4475,7 @@ impl AppShell {
     /// Follow a rename (file or folder) through open tabs, the selection and
     /// the expanded set.
     fn remap_note_paths(&mut self, from: &Path, to: &Path) {
-        for tab in &mut self.notes.tabs {
+        for tab in &mut self.wiki.notes.tabs {
             if let Some(path) = remap_path(&tab.path, from, to) {
                 tab.path = path;
                 tab.name = tab
@@ -4474,64 +4485,69 @@ impl AppShell {
                     .unwrap_or_default();
             }
         }
-        if let Some(selected) = &self.notes.selected
+        if let Some(selected) = &self.wiki.notes.selected
             && let Some(path) = remap_path(selected, from, to)
         {
-            self.notes.selected = Some(path);
+            self.wiki.notes.selected = Some(path);
         }
         let expanded: Vec<PathBuf> = self
+            .wiki
             .notes
             .expanded
             .iter()
             .filter_map(|path| remap_path(path, from, to))
             .collect();
-        self.notes.expanded = expanded.into_iter().collect();
+        self.wiki.notes.expanded = expanded.into_iter().collect();
     }
 
     fn cancel_note_draft(&mut self, cx: &mut Context<Self>) {
-        if self.notes.draft.take().is_some() {
-            self.notes.error = None;
+        if self.wiki.notes.draft.take().is_some() {
+            self.wiki.notes.error = None;
             cx.notify();
         }
     }
 
     pub(crate) fn ask_delete_note(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.notes.confirm = Some(path);
+        self.wiki.notes.confirm = Some(path);
         cx.notify();
     }
 
     pub(crate) fn cancel_delete_note(&mut self, cx: &mut Context<Self>) {
-        if self.notes.confirm.take().is_some() {
+        if self.wiki.notes.confirm.take().is_some() {
             cx.notify();
         }
     }
 
     pub(crate) fn confirm_delete_note(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let Some(root) = self.notes.root.clone() else {
+        let Some(root) = self.wiki.notes.root.clone() else {
             return;
         };
         match self.store.delete_note(&path, &root) {
             Ok(()) => {
-                let active_path = self.notes.active_tab().map(|tab| tab.path.clone());
-                self.notes.tabs.retain(|tab| !tab.path.starts_with(&path));
-                self.notes.active = active_path
-                    .and_then(|path| self.notes.tabs.iter().position(|tab| tab.path == path));
-                if self.notes.active.is_none() && !self.notes.tabs.is_empty() {
-                    self.notes.active = Some(self.notes.tabs.len() - 1);
+                let active_path = self.wiki.notes.active_tab().map(|tab| tab.path.clone());
+                self.wiki
+                    .notes
+                    .tabs
+                    .retain(|tab| !tab.path.starts_with(&path));
+                self.wiki.notes.active = active_path
+                    .and_then(|path| self.wiki.notes.tabs.iter().position(|tab| tab.path == path));
+                if self.wiki.notes.active.is_none() && !self.wiki.notes.tabs.is_empty() {
+                    self.wiki.notes.active = Some(self.wiki.notes.tabs.len() - 1);
                 }
                 if self
+                    .wiki
                     .notes
                     .selected
                     .as_deref()
                     .is_some_and(|selected| selected.starts_with(&path))
                 {
-                    self.notes.selected = None;
+                    self.wiki.notes.selected = None;
                 }
-                self.notes.confirm = None;
-                self.notes.error = None;
+                self.wiki.notes.confirm = None;
+                self.wiki.notes.error = None;
                 self.load_notes();
             }
-            Err(error) => self.notes.error = Some(error.to_string()),
+            Err(error) => self.wiki.notes.error = Some(error.to_string()),
         }
         cx.notify();
     }
@@ -4543,10 +4559,10 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = self.notes.active else {
+        let Some(index) = self.wiki.notes.active else {
             return;
         };
-        let Some(tab) = self.notes.tabs.get(index) else {
+        let Some(tab) = self.wiki.notes.tabs.get(index) else {
             return;
         };
         if tab.preview {
@@ -4556,7 +4572,7 @@ impl AppShell {
         if !editor.read(cx).focus_handle(cx).is_focused(window) {
             return;
         }
-        let outcome = self.notes.tabs[index]
+        let outcome = self.wiki.notes.tabs[index]
             .vim
             .handle_key(event, &editor, window, cx);
         if outcome.handled {
@@ -4594,39 +4610,39 @@ impl AppShell {
         let root = match self.store.documents_root() {
             Ok(root) => root,
             Err(error) => {
-                self.documents.root = None;
-                self.documents.entries.clear();
-                self.documents.error = Some(error);
+                self.wiki.documents.root = None;
+                self.wiki.documents.entries.clear();
+                self.wiki.documents.error = Some(error);
                 return;
             }
         };
         match self.store.documents_tree(&root) {
             Ok(entries) => {
-                self.documents.root = Some(root.clone());
-                self.documents.entries = entries;
-                self.documents.error = None;
+                self.wiki.documents.root = Some(root.clone());
+                self.wiki.documents.entries = entries;
+                self.wiki.documents.error = None;
             }
             Err(error) => {
-                self.documents.root = Some(root.clone());
-                self.documents.entries.clear();
-                self.documents.error = Some(error);
+                self.wiki.documents.root = Some(root.clone());
+                self.wiki.documents.entries.clear();
+                self.wiki.documents.error = Some(error);
             }
         }
-        if !self.documents.session_loaded {
-            self.documents.session_loaded = true;
+        if !self.wiki.documents.session_loaded {
+            self.wiki.documents.session_loaded = true;
             if let Ok(text) = std::fs::read_to_string(self.documents_session_path()) {
-                self.documents.restore = Some(documents::parse_session(&text));
+                self.wiki.documents.restore = Some(documents::parse_session(&text));
             }
         }
     }
 
     /// Restore the tabs once a window exists. Missing files are dropped.
     fn restore_documents_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((tree_open, active, rels)) = self.documents.restore.take() else {
+        let Some((tree_open, active, rels)) = self.wiki.documents.restore.take() else {
             return;
         };
-        self.documents.tree_open = tree_open;
-        let Some(root) = self.documents.root.clone() else {
+        self.wiki.documents.tree_open = tree_open;
+        let Some(root) = self.wiki.documents.root.clone() else {
             return;
         };
         for rel in rels {
@@ -4636,10 +4652,10 @@ impl AppShell {
             }
         }
         if let Some(index) = active {
-            self.documents.active = if self.documents.tabs.is_empty() {
+            self.wiki.documents.active = if self.wiki.documents.tabs.is_empty() {
                 None
             } else {
-                Some(index.min(self.documents.tabs.len() - 1))
+                Some(index.min(self.wiki.documents.tabs.len() - 1))
             };
         }
         cx.notify();
@@ -4647,32 +4663,36 @@ impl AppShell {
 
     /// Persist the tab list as root-relative paths plus the tree flag.
     fn save_documents_session(&self) {
-        let Some(root) = self.documents.root.clone() else {
+        let Some(root) = self.wiki.documents.root.clone() else {
             return;
         };
         let rels: Vec<String> = self
+            .wiki
             .documents
             .tabs
             .iter()
             .filter_map(|tab| documents::rel_path(&root, &tab.path))
             .collect();
-        let text =
-            documents::format_session(self.documents.tree_open, self.documents.active, &rels);
+        let text = documents::format_session(
+            self.wiki.documents.tree_open,
+            self.wiki.documents.active,
+            &rels,
+        );
         let _ = kandrium_core::fsutil::write_atomic(&self.documents_session_path(), text);
     }
 
     pub(crate) fn toggle_documents_tree(&mut self, cx: &mut Context<Self>) {
-        self.documents.tree_open = !self.documents.tree_open;
+        self.wiki.documents.tree_open = !self.wiki.documents.tree_open;
         self.save_documents_session();
         self.persist_settings();
         cx.notify();
     }
 
     pub(crate) fn toggle_doc_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if !self.documents.expanded.remove(&path) {
-            self.documents.expanded.insert(path.clone());
+        if !self.wiki.documents.expanded.remove(&path) {
+            self.wiki.documents.expanded.insert(path.clone());
         }
-        self.documents.selected = Some(path);
+        self.wiki.documents.selected = Some(path);
         cx.notify();
     }
 
@@ -4683,17 +4703,17 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.documents.selected = Some(path.clone());
-        if let Some(index) = self.documents.tab_index(&path) {
-            self.documents.active = Some(index);
-            if let Some(editor) = self.documents.tabs[index].editor.clone() {
+        self.wiki.documents.selected = Some(path.clone());
+        if let Some(index) = self.wiki.documents.tab_index(&path) {
+            self.wiki.documents.active = Some(index);
+            if let Some(editor) = self.wiki.documents.tabs[index].editor.clone() {
                 editor.update(cx, |state, cx| state.focus(window, cx));
             }
             cx.notify();
             return;
         }
-        let Some(root) = self.documents.root.clone() else {
-            self.documents.error = Some("The documents folder is unavailable".into());
+        let Some(root) = self.wiki.documents.root.clone() else {
+            self.wiki.documents.error = Some("The documents folder is unavailable".into());
             cx.notify();
             return;
         };
@@ -4705,18 +4725,18 @@ impl AppShell {
             match self.store.load_annotations(&path, &root) {
                 Ok(doc) => {
                     let (worker, events) = PdfWorker::open(path.clone(), || {});
-                    self.documents.tabs.push(DocTab::pdf(
+                    self.wiki.documents.tabs.push(DocTab::pdf(
                         path,
                         name,
                         worker,
                         events,
                         doc.annotations,
                     ));
-                    self.documents.active = Some(self.documents.tabs.len() - 1);
-                    self.documents.error = None;
+                    self.wiki.documents.active = Some(self.wiki.documents.tabs.len() - 1);
+                    self.wiki.documents.error = None;
                 }
                 Err(error) => {
-                    self.documents.error = Some(error);
+                    self.wiki.documents.error = Some(error);
                     cx.notify();
                     return;
                 }
@@ -4734,21 +4754,24 @@ impl AppShell {
                         this.doc_tab_edited(&editor, cx)
                     })
                     .detach();
-                    self.documents
-                        .tabs
-                        .push(DocTab::markdown(path, name, text, editor.clone()));
-                    let index = self.documents.tabs.len() - 1;
-                    if let Some(vim) = self.documents.tabs[index].vim.as_mut() {
+                    self.wiki.documents.tabs.push(DocTab::markdown(
+                        path,
+                        name,
+                        text,
+                        editor.clone(),
+                    ));
+                    let index = self.wiki.documents.tabs.len() - 1;
+                    if let Some(vim) = self.wiki.documents.tabs[index].vim.as_mut() {
                         vim.set_enabled(self.vim_mode, &editor, cx);
                     }
-                    self.documents.active = Some(index);
-                    self.documents.error = None;
+                    self.wiki.documents.active = Some(index);
+                    self.wiki.documents.error = None;
                     editor.update(cx, |state, cx| state.focus(window, cx));
                 }
-                Err(error) => self.documents.error = Some(error),
+                Err(error) => self.wiki.documents.error = Some(error),
             }
         } else {
-            self.documents.error = Some("Unsupported document type".into());
+            self.wiki.documents.error = Some("Unsupported document type".into());
         }
         self.save_documents_session();
         cx.notify();
@@ -4760,11 +4783,11 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = self.documents.tab_index(&path) else {
+        let Some(index) = self.wiki.documents.tab_index(&path) else {
             return;
         };
-        self.documents.active = Some(index);
-        if let Some(editor) = self.documents.tabs[index].editor.clone() {
+        self.wiki.documents.active = Some(index);
+        if let Some(editor) = self.wiki.documents.tabs[index].editor.clone() {
             editor.update(cx, |state, cx| state.focus(window, cx));
         }
         self.save_documents_session();
@@ -4773,21 +4796,24 @@ impl AppShell {
 
     pub(crate) fn close_doc_tab_by_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.save_document_tab(&path, cx);
-        let Some(index) = self.documents.tab_index(&path) else {
+        let Some(index) = self.wiki.documents.tab_index(&path) else {
             return;
         };
         // A failed save keeps the tab (and its dirty buffer) open so the user
         // can retry instead of losing the edit.
-        if self.documents.tabs[index].has_unsaved() {
+        if self.wiki.documents.tabs[index].has_unsaved() {
             cx.notify();
             return;
         }
-        self.documents.tabs.remove(index);
-        self.documents.active = match (self.documents.tabs.is_empty(), self.documents.active) {
+        self.wiki.documents.tabs.remove(index);
+        self.wiki.documents.active = match (
+            self.wiki.documents.tabs.is_empty(),
+            self.wiki.documents.active,
+        ) {
             (true, _) => None,
             (false, Some(active)) if active > index => Some(active - 1),
             (false, Some(active)) if active == index => {
-                Some(index.min(self.documents.tabs.len() - 1))
+                Some(index.min(self.wiki.documents.tabs.len() - 1))
             }
             (false, other) => other,
         };
@@ -4796,10 +4822,10 @@ impl AppShell {
     }
 
     pub(crate) fn toggle_doc_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(index) = self.documents.active else {
+        let Some(index) = self.wiki.documents.active else {
             return;
         };
-        let Some(tab) = self.documents.tabs.get_mut(index) else {
+        let Some(tab) = self.wiki.documents.tabs.get_mut(index) else {
             return;
         };
         tab.preview = !tab.preview;
@@ -4816,12 +4842,12 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(root) = self.documents.root.clone() else {
-            self.documents.error = Some("The documents folder is unavailable".into());
+        let Some(root) = self.wiki.documents.root.clone() else {
+            self.wiki.documents.error = Some("The documents folder is unavailable".into());
             cx.notify();
             return;
         };
-        let target = self.documents.selected_dir(&root);
+        let target = self.wiki.documents.selected_dir(&root);
         self.begin_doc_draft_in(kind, target, window, cx);
     }
 
@@ -4832,7 +4858,7 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.documents.draft.is_some() {
+        if self.wiki.documents.draft.is_some() {
             return;
         }
         let placeholder = match kind {
@@ -4852,12 +4878,12 @@ impl AppShell {
             },
         )
         .detach();
-        self.documents.draft = Some(DocDraft {
+        self.wiki.documents.draft = Some(DocDraft {
             kind,
             target,
             input,
         });
-        self.documents.error = None;
+        self.wiki.documents.error = None;
         cx.notify();
     }
 
@@ -4891,12 +4917,12 @@ impl AppShell {
             },
         )
         .detach();
-        self.documents.draft = Some(DocDraft {
+        self.wiki.documents.draft = Some(DocDraft {
             kind: DocDraftKind::Rename,
             target: path,
             input,
         });
-        self.documents.error = None;
+        self.wiki.documents.error = None;
         cx.notify();
     }
 
@@ -4920,19 +4946,19 @@ impl AppShell {
     }
 
     fn commit_doc_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(draft) = &self.documents.draft else {
+        let Some(draft) = &self.wiki.documents.draft else {
             return;
         };
         let kind = draft.kind;
         let target = draft.target.clone();
         let name = draft.input.read(cx).value().trim().to_string();
-        let Some(root) = self.documents.root.clone() else {
-            self.documents.error = Some("The documents folder is unavailable".into());
+        let Some(root) = self.wiki.documents.root.clone() else {
+            self.wiki.documents.error = Some("The documents folder is unavailable".into());
             cx.notify();
             return;
         };
         if name.is_empty() {
-            self.documents.error = Some("A name is required".into());
+            self.wiki.documents.error = Some("A name is required".into());
             cx.notify();
             return;
         }
@@ -4946,25 +4972,25 @@ impl AppShell {
                 if kind == DocDraftKind::Rename {
                     self.remap_doc_paths(&target, &created);
                 } else {
-                    self.documents.expanded.insert(target);
+                    self.wiki.documents.expanded.insert(target);
                     if kind == DocDraftKind::File {
                         self.open_document(created.clone(), window, cx);
                     }
                 }
-                self.documents.selected = Some(created);
-                self.documents.draft = None;
-                self.documents.error = None;
+                self.wiki.documents.selected = Some(created);
+                self.wiki.documents.draft = None;
+                self.wiki.documents.error = None;
                 self.load_documents();
                 self.save_documents_session();
             }
-            Err(error) => self.documents.error = Some(error),
+            Err(error) => self.wiki.documents.error = Some(error),
         }
         cx.notify();
     }
 
     fn cancel_doc_draft(&mut self, cx: &mut Context<Self>) {
-        if self.documents.draft.take().is_some() {
-            self.documents.error = None;
+        if self.wiki.documents.draft.take().is_some() {
+            self.wiki.documents.error = None;
             cx.notify();
         }
     }
@@ -4972,7 +4998,7 @@ impl AppShell {
     /// Follow a rename (file or folder) through open tabs, the selection and
     /// the expanded set.
     fn remap_doc_paths(&mut self, from: &Path, to: &Path) {
-        for tab in &mut self.documents.tabs {
+        for tab in &mut self.wiki.documents.tabs {
             if let Some(path) = remap_path(&tab.path, from, to) {
                 tab.path = path;
                 tab.name = tab
@@ -4982,62 +5008,70 @@ impl AppShell {
                     .unwrap_or_default();
             }
         }
-        if let Some(selected) = &self.documents.selected
+        if let Some(selected) = &self.wiki.documents.selected
             && let Some(path) = remap_path(selected, from, to)
         {
-            self.documents.selected = Some(path);
+            self.wiki.documents.selected = Some(path);
         }
         let expanded: Vec<PathBuf> = self
+            .wiki
             .documents
             .expanded
             .iter()
             .filter_map(|path| remap_path(path, from, to))
             .collect();
-        self.documents.expanded = expanded.into_iter().collect();
+        self.wiki.documents.expanded = expanded.into_iter().collect();
     }
 
     pub(crate) fn ask_delete_document(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.documents.confirm = Some(path);
+        self.wiki.documents.confirm = Some(path);
         cx.notify();
     }
 
     pub(crate) fn cancel_delete_document(&mut self, cx: &mut Context<Self>) {
-        if self.documents.confirm.take().is_some() {
+        if self.wiki.documents.confirm.take().is_some() {
             cx.notify();
         }
     }
 
     pub(crate) fn confirm_delete_document(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let Some(root) = self.documents.root.clone() else {
+        let Some(root) = self.wiki.documents.root.clone() else {
             return;
         };
         match self.store.delete_document(&path, &root) {
             Ok(()) => {
-                let active_path = self.documents.active_tab().map(|tab| tab.path.clone());
+                let active_path = self.wiki.documents.active_tab().map(|tab| tab.path.clone());
                 // Drop the tabs without flushing: the backing file is gone, so
                 // a save would only leave an orphan sidecar behind.
-                self.documents
+                self.wiki
+                    .documents
                     .tabs
                     .retain(|tab| !tab.path.starts_with(&path));
-                self.documents.active = active_path
-                    .and_then(|path| self.documents.tabs.iter().position(|tab| tab.path == path));
-                if self.documents.active.is_none() && !self.documents.tabs.is_empty() {
-                    self.documents.active = Some(self.documents.tabs.len() - 1);
+                self.wiki.documents.active = active_path.and_then(|path| {
+                    self.wiki
+                        .documents
+                        .tabs
+                        .iter()
+                        .position(|tab| tab.path == path)
+                });
+                if self.wiki.documents.active.is_none() && !self.wiki.documents.tabs.is_empty() {
+                    self.wiki.documents.active = Some(self.wiki.documents.tabs.len() - 1);
                 }
                 if self
+                    .wiki
                     .documents
                     .selected
                     .as_deref()
                     .is_some_and(|selected| selected.starts_with(&path))
                 {
-                    self.documents.selected = None;
+                    self.wiki.documents.selected = None;
                 }
-                self.documents.confirm = None;
-                self.documents.error = None;
+                self.wiki.documents.confirm = None;
+                self.wiki.documents.error = None;
                 self.load_documents();
                 self.save_documents_session();
             }
-            Err(error) => self.documents.error = Some(error),
+            Err(error) => self.wiki.documents.error = Some(error),
         }
         cx.notify();
     }
@@ -5049,8 +5083,8 @@ impl AppShell {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(root) = self.documents.root.clone() else {
-            self.documents.error = Some("The documents folder is unavailable".into());
+        let Some(root) = self.wiki.documents.root.clone() else {
+            self.wiki.documents.error = Some("The documents folder is unavailable".into());
             cx.notify();
             return;
         };
@@ -5063,7 +5097,7 @@ impl AppShell {
         if files.is_empty() {
             return;
         }
-        let dest = self.documents.selected_dir(&root);
+        let dest = self.wiki.documents.selected_dir(&root);
         match self.store.import_documents(&files, &dest, &root) {
             Ok(results) => {
                 let errors: Vec<String> = results
@@ -5074,16 +5108,16 @@ impl AppShell {
                             .map(|message| format!("{}: {message}", source.display()))
                     })
                     .collect();
-                self.documents.expanded.insert(dest.clone());
-                self.documents.selected = Some(dest);
+                self.wiki.documents.expanded.insert(dest.clone());
+                self.wiki.documents.selected = Some(dest);
                 self.load_documents();
-                self.documents.error = if errors.is_empty() {
+                self.wiki.documents.error = if errors.is_empty() {
                     None
                 } else {
                     Some(errors.join("\n"))
                 };
             }
-            Err(error) => self.documents.error = Some(error),
+            Err(error) => self.wiki.documents.error = Some(error),
         }
         cx.notify();
     }
@@ -5095,10 +5129,10 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = self.documents.active else {
+        let Some(index) = self.wiki.documents.active else {
             return;
         };
-        let Some(tab) = self.documents.tabs.get(index) else {
+        let Some(tab) = self.wiki.documents.tabs.get(index) else {
             return;
         };
         if tab.preview || tab.kind != DocKind::Markdown {
@@ -5111,7 +5145,7 @@ impl AppShell {
             return;
         }
         let outcome = {
-            let Some(vim) = self.documents.tabs[index].vim.as_mut() else {
+            let Some(vim) = self.wiki.documents.tabs[index].vim.as_mut() else {
                 return;
             };
             vim.handle_key(event, &editor, window, cx)
@@ -5133,14 +5167,14 @@ impl AppShell {
     }
 
     fn save_active_document(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = self.documents.active_tab().map(|tab| tab.path.clone()) else {
+        let Some(path) = self.wiki.documents.active_tab().map(|tab| tab.path.clone()) else {
             return;
         };
         self.save_document_tab(&path, cx);
     }
 
     fn close_active_document(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = self.documents.active_tab().map(|tab| tab.path.clone()) else {
+        let Some(path) = self.wiki.documents.active_tab().map(|tab| tab.path.clone()) else {
             return;
         };
         self.close_doc_tab_by_path(path, cx);
@@ -5149,6 +5183,7 @@ impl AppShell {
     /// Save every tab whose buffer changed, then the session.
     fn flush_documents(&mut self, cx: &mut Context<Self>) {
         let paths: Vec<PathBuf> = self
+            .wiki
             .documents
             .tabs
             .iter()
@@ -5163,6 +5198,7 @@ impl AppShell {
     /// marks the tab dirty and schedules the debounce.
     fn doc_tab_edited(&mut self, editor: &Entity<EditorState>, cx: &mut Context<Self>) {
         let Some(index) = self
+            .wiki
             .documents
             .tabs
             .iter()
@@ -5171,7 +5207,7 @@ impl AppShell {
             return;
         };
         let value = editor.read(cx).value().to_string();
-        let tab = &mut self.documents.tabs[index];
+        let tab = &mut self.wiki.documents.tabs[index];
         if value == tab.saved {
             if tab.dirty {
                 tab.dirty = false;
@@ -5202,10 +5238,10 @@ impl AppShell {
     /// A debounce that already lost its race (a newer edit bumped the
     /// generation) bows out.
     fn autosave_document(&mut self, path: &Path, generation: u64, cx: &mut Context<Self>) {
-        let Some(index) = self.documents.tab_index(path) else {
+        let Some(index) = self.wiki.documents.tab_index(path) else {
             return;
         };
-        if self.documents.tabs[index].generation != generation {
+        if self.wiki.documents.tabs[index].generation != generation {
             return;
         }
         self.save_document_tab(path, cx);
@@ -5214,29 +5250,29 @@ impl AppShell {
     /// Write a dirty tab through core: Markdown text or the annotation
     /// sidecar. Errors keep the tab dirty so the edit is never dropped.
     fn save_document_tab(&mut self, path: &Path, cx: &mut Context<Self>) {
-        let Some(index) = self.documents.tab_index(path) else {
+        let Some(index) = self.wiki.documents.tab_index(path) else {
             return;
         };
-        match self.documents.tabs[index].kind {
+        match self.wiki.documents.tabs[index].kind {
             DocKind::Markdown => {
-                if !self.documents.tabs[index].dirty {
+                if !self.wiki.documents.tabs[index].dirty {
                     return;
                 }
-                let Some(root) = self.documents.root.clone() else {
+                let Some(root) = self.wiki.documents.root.clone() else {
                     return;
                 };
-                let Some(editor) = self.documents.tabs[index].editor.clone() else {
+                let Some(editor) = self.wiki.documents.tabs[index].editor.clone() else {
                     return;
                 };
                 let value = editor.read(cx).value().to_string();
                 match self.store.write_document(path, &root, &value) {
                     Ok(()) => {
-                        let tab = &mut self.documents.tabs[index];
+                        let tab = &mut self.wiki.documents.tabs[index];
                         tab.saved = value;
                         tab.dirty = false;
-                        self.documents.error = None;
+                        self.wiki.documents.error = None;
                     }
-                    Err(error) => self.documents.error = Some(error),
+                    Err(error) => self.wiki.documents.error = Some(error),
                 }
                 cx.notify();
             }
@@ -5245,35 +5281,35 @@ impl AppShell {
     }
 
     fn save_annotations_tab(&mut self, path: &Path, cx: &mut Context<Self>) {
-        let Some(index) = self.documents.tab_index(path) else {
+        let Some(index) = self.wiki.documents.tab_index(path) else {
             return;
         };
-        if !self.documents.tabs[index].ann_dirty {
+        if !self.wiki.documents.tabs[index].ann_dirty {
             return;
         }
-        let Some(root) = self.documents.root.clone() else {
+        let Some(root) = self.wiki.documents.root.clone() else {
             return;
         };
         let doc = AnnotationDoc {
-            annotations: self.documents.tabs[index].annotations.clone(),
+            annotations: self.wiki.documents.tabs[index].annotations.clone(),
             ..AnnotationDoc::default()
         };
         match self.store.save_annotations(path, &root, &doc) {
             Ok(()) => {
-                self.documents.tabs[index].ann_dirty = false;
-                self.documents.error = None;
+                self.wiki.documents.tabs[index].ann_dirty = false;
+                self.wiki.documents.error = None;
             }
-            Err(error) => self.documents.error = Some(error),
+            Err(error) => self.wiki.documents.error = Some(error),
         }
         cx.notify();
     }
 
     /// Mark the annotation sidecar dirty and debounce its write.
     fn mark_annotations_dirty(&mut self, path: &Path, cx: &mut Context<Self>) {
-        let Some(index) = self.documents.tab_index(path) else {
+        let Some(index) = self.wiki.documents.tab_index(path) else {
             return;
         };
-        let tab = &mut self.documents.tabs[index];
+        let tab = &mut self.wiki.documents.tabs[index];
         tab.ann_dirty = true;
         tab.ann_generation = tab.ann_generation.wrapping_add(1);
         let generation = tab.ann_generation;
@@ -5292,10 +5328,10 @@ impl AppShell {
     }
 
     fn autosave_annotations(&mut self, path: &Path, generation: u64, cx: &mut Context<Self>) {
-        let Some(index) = self.documents.tab_index(path) else {
+        let Some(index) = self.wiki.documents.tab_index(path) else {
             return;
         };
-        if self.documents.tabs[index].ann_generation != generation {
+        if self.wiki.documents.tabs[index].ann_generation != generation {
             return;
         }
         self.save_annotations_tab(path, cx);
@@ -5308,10 +5344,10 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = self.documents.tab_index(path) else {
+        let Some(index) = self.wiki.documents.tab_index(path) else {
             return;
         };
-        let text = self.documents.tabs[index]
+        let text = self.wiki.documents.tabs[index]
             .annotations
             .iter()
             .find(|ann| ann.id == id)
@@ -5323,7 +5359,7 @@ impl AppShell {
             this.doc_popover_edited(&editor, cx)
         })
         .detach();
-        let tab = &mut self.documents.tabs[index];
+        let tab = &mut self.wiki.documents.tabs[index];
         tab.popover = Some(id.to_string());
         tab.popover_editor = Some(editor);
         cx.notify();
@@ -5336,10 +5372,10 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = self.documents.tab_index(&path) else {
+        let Some(index) = self.wiki.documents.tab_index(&path) else {
             return;
         };
-        if self.documents.tabs[index].popover.as_deref() == Some(id.as_str()) {
+        if self.wiki.documents.tabs[index].popover.as_deref() == Some(id.as_str()) {
             self.close_doc_popover(path, cx);
             return;
         }
@@ -5347,10 +5383,10 @@ impl AppShell {
     }
 
     pub(crate) fn close_doc_popover(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let Some(index) = self.documents.tab_index(&path) else {
+        let Some(index) = self.wiki.documents.tab_index(&path) else {
             return;
         };
-        let tab = &mut self.documents.tabs[index];
+        let tab = &mut self.wiki.documents.tabs[index];
         tab.popover = None;
         tab.popover_editor = None;
         cx.notify();
@@ -5358,6 +5394,7 @@ impl AppShell {
 
     fn doc_popover_edited(&mut self, editor: &Entity<TextareaState>, cx: &mut Context<Self>) {
         let Some(index) = self
+            .wiki
             .documents
             .tabs
             .iter()
@@ -5365,11 +5402,11 @@ impl AppShell {
         else {
             return;
         };
-        let Some(id) = self.documents.tabs[index].popover.clone() else {
+        let Some(id) = self.wiki.documents.tabs[index].popover.clone() else {
             return;
         };
         let value = editor.read(cx).value().to_string();
-        let changed = match self.documents.tabs[index]
+        let changed = match self.wiki.documents.tabs[index]
             .annotations
             .iter_mut()
             .find(|ann| ann.id == id)
@@ -5382,7 +5419,7 @@ impl AppShell {
             _ => false,
         };
         if changed {
-            let path = self.documents.tabs[index].path.clone();
+            let path = self.wiki.documents.tabs[index].path.clone();
             self.mark_annotations_dirty(&path, cx);
         }
     }
@@ -5394,10 +5431,10 @@ impl AppShell {
         color: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = self.documents.tab_index(&path) else {
+        let Some(index) = self.wiki.documents.tab_index(&path) else {
             return;
         };
-        let changed = match self.documents.tabs[index]
+        let changed = match self.wiki.documents.tabs[index]
             .annotations
             .iter_mut()
             .find(|ann| ann.id == id)
@@ -5415,11 +5452,11 @@ impl AppShell {
     }
 
     pub(crate) fn delete_annotation(&mut self, path: PathBuf, id: String, cx: &mut Context<Self>) {
-        let Some(index) = self.documents.tab_index(&path) else {
+        let Some(index) = self.wiki.documents.tab_index(&path) else {
             return;
         };
-        let before = self.documents.tabs[index].annotations.len();
-        let tab = &mut self.documents.tabs[index];
+        let before = self.wiki.documents.tabs[index].annotations.len();
+        let tab = &mut self.wiki.documents.tabs[index];
         tab.annotations.retain(|ann| ann.id != id);
         let removed = tab.annotations.len() != before;
         if tab.popover.as_deref() == Some(id.as_str()) {
@@ -5434,7 +5471,7 @@ impl AppShell {
     }
 
     pub(crate) fn zoom_doc_by(&mut self, path: PathBuf, delta: f32, cx: &mut Context<Self>) {
-        let Some(index) = self.documents.tab_index(&path) else {
+        let Some(index) = self.wiki.documents.tab_index(&path) else {
             return;
         };
         let factor = if delta >= 0.0 {
@@ -5442,36 +5479,36 @@ impl AppShell {
         } else {
             1.0 / documents::ZOOM_STEP
         };
-        let zoom = documents_pdf::clamp_zoom(self.documents.tabs[index].zoom * factor);
-        self.documents.tabs[index].zoom = zoom;
+        let zoom = documents_pdf::clamp_zoom(self.wiki.documents.tabs[index].zoom * factor);
+        self.wiki.documents.tabs[index].zoom = zoom;
         cx.notify();
     }
 
     pub(crate) fn reset_doc_zoom(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let Some(index) = self.documents.tab_index(&path) else {
+        let Some(index) = self.wiki.documents.tab_index(&path) else {
             return;
         };
-        self.documents.tabs[index].zoom = 1.0;
+        self.wiki.documents.tabs[index].zoom = 1.0;
         cx.notify();
     }
 
     pub(crate) fn jump_doc_page(&mut self, path: PathBuf, delta: i32, cx: &mut Context<Self>) {
-        let Some(index) = self.documents.tab_index(&path) else {
+        let Some(index) = self.wiki.documents.tab_index(&path) else {
             return;
         };
-        let count = self.documents.tabs[index].page_count;
+        let count = self.wiki.documents.tabs[index].page_count;
         if count == 0 {
             return;
         }
-        let visible = self.documents.tabs[index].visible_page;
+        let visible = self.wiki.documents.tabs[index].visible_page;
         let target = (visible as i32 + delta).clamp(0, count as i32 - 1) as usize;
-        self.documents.tabs[index].jump_to = Some(target);
+        self.wiki.documents.tabs[index].jump_to = Some(target);
         cx.notify();
     }
 
     pub(crate) fn set_doc_tool(&mut self, tool: documents::Tool, cx: &mut Context<Self>) {
-        if self.documents.tool != tool {
-            self.documents.tool = tool;
+        if self.wiki.documents.tool != tool {
+            self.wiki.documents.tool = tool;
             cx.notify();
         }
     }
@@ -5488,15 +5525,18 @@ impl AppShell {
         let Some(origin) = origin else {
             return;
         };
-        let Some(index) = self.documents.tab_index(&path) else {
+        let Some(index) = self.wiki.documents.tab_index(&path) else {
             return;
         };
-        if !self.documents.tabs[index].page_texts.contains_key(&page) {
+        if !self.wiki.documents.tabs[index]
+            .page_texts
+            .contains_key(&page)
+        {
             return;
         }
-        let scale = self.documents.tabs[index].last_scale;
+        let scale = self.wiki.documents.tabs[index].last_scale;
         let start = documents::screen_to_page(origin, scale, position);
-        match self.documents.tool {
+        match self.wiki.documents.tool {
             documents::Tool::Note => {
                 let mut ann = new_annotation(
                     AnnotationKind::Note,
@@ -5506,12 +5546,12 @@ impl AppShell {
                 );
                 ann.quads = vec![documents::note_anchor_quad(start)];
                 let id = ann.id.clone();
-                self.documents.tabs[index].annotations.push(ann);
+                self.wiki.documents.tabs[index].annotations.push(ann);
                 self.open_doc_popover(&path, &id, window, cx);
                 self.mark_annotations_dirty(&path, cx);
             }
             _ => {
-                self.documents.tabs[index].selection = Some(documents::Selection {
+                self.wiki.documents.tabs[index].selection = Some(documents::Selection {
                     page,
                     start,
                     current: start,
@@ -5532,11 +5572,11 @@ impl AppShell {
         let Some(origin) = origin else {
             return;
         };
-        let Some(index) = self.documents.tab_index(&path) else {
+        let Some(index) = self.wiki.documents.tab_index(&path) else {
             return;
         };
-        let scale = self.documents.tabs[index].last_scale;
-        if let Some(sel) = &mut self.documents.tabs[index].selection
+        let scale = self.wiki.documents.tabs[index].last_scale;
+        if let Some(sel) = &mut self.wiki.documents.tabs[index].selection
             && sel.page == page
         {
             sel.current = documents::screen_to_page(origin, scale, position);
@@ -5556,22 +5596,22 @@ impl AppShell {
         let Some(origin) = origin else {
             return;
         };
-        let Some(index) = self.documents.tab_index(&path) else {
+        let Some(index) = self.wiki.documents.tab_index(&path) else {
             return;
         };
-        let scale = self.documents.tabs[index].last_scale;
-        let Some(mut sel) = self.documents.tabs[index].selection.take() else {
+        let scale = self.wiki.documents.tabs[index].last_scale;
+        let Some(mut sel) = self.wiki.documents.tabs[index].selection.take() else {
             return;
         };
         if sel.page == page {
             sel.current = documents::screen_to_page(origin, scale, position);
         }
-        if self.documents.tool != documents::Tool::Highlight || sel.page != page {
+        if self.wiki.documents.tool != documents::Tool::Highlight || sel.page != page {
             cx.notify();
             return;
         }
         let rect = sel.rect();
-        let (quads, memo) = self.documents.tabs[index]
+        let (quads, memo) = self.wiki.documents.tabs[index]
             .page_texts
             .get(&page)
             .map(|text| (text.selection_quads(&rect), text.selection_text(&rect)))
@@ -5589,7 +5629,7 @@ impl AppShell {
         );
         ann.text = memo;
         let id = ann.id.clone();
-        self.documents.tabs[index].annotations.push(ann);
+        self.wiki.documents.tabs[index].annotations.push(ann);
         self.open_doc_popover(&path, &id, window, cx);
         self.mark_annotations_dirty(&path, cx);
     }
@@ -5598,7 +5638,7 @@ impl AppShell {
     /// parse or render is outstanding (gpui has no cross-thread wake).
     pub(crate) fn pump_documents(&mut self, cx: &mut Context<Self>) {
         let mut busy = false;
-        for tab in &mut self.documents.tabs {
+        for tab in &mut self.wiki.documents.tabs {
             if let Some(rx) = tab.events.take() {
                 loop {
                     match rx.try_recv() {
@@ -5889,12 +5929,14 @@ impl AppShell {
             Section::Tasks => self.tasks_body(window, cx),
             Section::Clocks => clocks::clocks_view(&mut self.clocks, self.use_24h, &t, window, cx)
                 .into_any_element(),
-            Section::Notes => notes::notes_view(&self.notes, &t, window, cx).into_any_element(),
+            Section::Notes => {
+                notes::notes_view(&self.wiki.notes, &t, window, cx).into_any_element()
+            }
             Section::Documents => {
                 self.pump_documents(cx);
                 self.restore_documents_session(window, cx);
-                let element = documents::documents_view(&mut self.documents, &t, window, cx);
-                if self.documents.needs_repaint {
+                let element = documents::documents_view(&mut self.wiki.documents, &t, window, cx);
+                if self.wiki.documents.needs_repaint {
                     cx.notify();
                 }
                 element.into_any_element()
@@ -6579,8 +6621,8 @@ mod settings_tests {
         let shell = AppShell::with_store(Store::open_path(path));
         assert_eq!(shell.section(), Section::Clocks);
         assert!(!shell.vim_mode());
-        assert_eq!(shell.notes.tree_w, 310.0);
-        assert!(!shell.documents.tree_open);
+        assert_eq!(shell.wiki.notes.tree_w, 310.0);
+        assert!(!shell.wiki.documents.tree_open);
         assert_eq!(shell.settings.tree_width(TreePanel::Projects), 200.0);
     }
 
@@ -6593,8 +6635,8 @@ mod settings_tests {
         let shell = AppShell::with_store(Store::open_path(path));
         assert_eq!(shell.section(), Section::Tasks);
         assert!(shell.vim_mode());
-        assert_eq!(shell.notes.tree_w, settings::DEFAULT_TREE_W);
-        assert!(shell.documents.tree_open);
+        assert_eq!(shell.wiki.notes.tree_w, settings::DEFAULT_TREE_W);
+        assert!(shell.wiki.documents.tree_open);
     }
 
     fn first_card_id(shell: &AppShell) -> String {

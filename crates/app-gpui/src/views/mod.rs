@@ -20,6 +20,7 @@ pub mod notes;
 pub mod placeholder;
 pub mod projects;
 pub mod tasks;
+pub mod wiki;
 
 /// A single-line field at the mockup's `.input` metrics: 8 px side padding,
 /// `field` fill and a 5 px radius.
