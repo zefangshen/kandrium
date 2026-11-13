@@ -9,6 +9,7 @@ use gpui_kit::{Rgba, Styled, Svg, px, svg};
 /// Icons used by the gpui shell. Add entries as views need them.
 #[derive(Clone, Copy, Debug)]
 pub enum Icon {
+    Archive,
     Calendar,
     Check,
     ChevronDown,
@@ -20,6 +21,7 @@ pub enum Icon {
     FilePlus,
     FileText,
     Folder,
+    FolderColumns,
     FolderKanban,
     FolderPlus,
     Globe,
@@ -29,9 +31,11 @@ pub enum Icon {
     Pencil,
     Plane,
     Plus,
+    RotateCcw,
     Save,
     Search,
     Square,
+    SquareKanban,
     StickyNote,
     Trash2,
     Upload,
@@ -42,6 +46,7 @@ pub enum Icon {
 impl Icon {
     fn bytes(self) -> &'static [u8] {
         match self {
+            Icon::Archive => include_bytes!("../../app/assets/icons/archive.svg"),
             Icon::Calendar => include_bytes!("../../app/assets/icons/calendar.svg"),
             Icon::Check => include_bytes!("../../app/assets/icons/check.svg"),
             Icon::ChevronDown => include_bytes!("../../app/assets/icons/chevron-down.svg"),
@@ -53,6 +58,7 @@ impl Icon {
             Icon::FilePlus => include_bytes!("../../app/assets/icons/file-plus.svg"),
             Icon::FileText => include_bytes!("../../app/assets/icons/file-text.svg"),
             Icon::Folder => include_bytes!("../../app/assets/icons/folder.svg"),
+            Icon::FolderColumns => include_bytes!("../../app/assets/icons/folder-columns.svg"),
             Icon::FolderKanban => include_bytes!("../../app/assets/icons/folder-kanban.svg"),
             Icon::FolderPlus => include_bytes!("../../app/assets/icons/folder-plus.svg"),
             Icon::Globe => include_bytes!("../../app/assets/icons/globe.svg"),
@@ -62,9 +68,11 @@ impl Icon {
             Icon::Pencil => include_bytes!("../../app/assets/icons/pencil.svg"),
             Icon::Plane => include_bytes!("../../app/assets/icons/plane.svg"),
             Icon::Plus => include_bytes!("../../app/assets/icons/plus.svg"),
+            Icon::RotateCcw => include_bytes!("../../app/assets/icons/rotate-ccw.svg"),
             Icon::Save => include_bytes!("../../app/assets/icons/save.svg"),
             Icon::Search => include_bytes!("../../app/assets/icons/search.svg"),
             Icon::Square => include_bytes!("../../app/assets/icons/square.svg"),
+            Icon::SquareKanban => include_bytes!("../../app/assets/icons/square-kanban.svg"),
             Icon::StickyNote => include_bytes!("../../app/assets/icons/sticky-note.svg"),
             Icon::Trash2 => include_bytes!("../../app/assets/icons/trash-2.svg"),
             Icon::Upload => include_bytes!("../../app/assets/icons/upload.svg"),

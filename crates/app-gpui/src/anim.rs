@@ -11,7 +11,14 @@ use std::time::Duration;
 pub const LIFT: Duration = Duration::from_millis(140);
 /// Reflow of the drop indicator and the target gap.
 pub const REFLOW: Duration = Duration::from_millis(160);
-/// Return of a cancelled drag.
+/// Glide of an in-flow card into its new slot.
+pub const SHIFT: Duration = Duration::from_millis(200);
+/// Extra delay per card the moving card is away from the gap, producing the
+/// subtle wave when several cards make room at once.
+pub const STAGGER_STEP: Duration = Duration::from_millis(20);
+/// Cap on the per-card stagger so far-away cards still move promptly.
+pub const STAGGER_MAX: Duration = Duration::from_millis(100);
+/// Return of a cancelled drag, and the settle flight of a completed one.
 pub const SNAP_BACK: Duration = Duration::from_millis(260);
 
 /// CSS `cubic-bezier` sampling, same WebKit/Blink algorithm as `anim.rs`.
@@ -75,6 +82,47 @@ pub fn eased(reduced: bool, t: f32, ease: fn(f32) -> f32) -> f32 {
     if reduced { 1.0 } else { ease(t) }
 }
 
+/// How far a card at `index` trails the gap when it makes room for it.
+///
+/// Cards above the gap do not move and get no delay; cards below it wait one
+/// `STAGGER_STEP` per slot they are away from the gap.
+pub fn stagger_order(gap: Option<usize>, index: usize) -> u32 {
+    match gap {
+        Some(gap) if index >= gap => (index - gap) as u32,
+        _ => 0,
+    }
+}
+
+/// Visual offset (`top`) a card at `index` starts from when the gap moves
+/// from `previous` to `next`, before gliding back to zero.
+///
+/// The gap and every card row are the same height, so any card that ends up
+/// on the other side of the gap moved by exactly `gap_height`. The returned
+/// value is the old position minus the new one: negative means the card
+/// starts above its new slot, positive means below.
+pub fn shift_offset(
+    previous: Option<usize>,
+    next: Option<usize>,
+    index: usize,
+    gap_height: f32,
+) -> f32 {
+    match (previous, next) {
+        // Gap opened in a column that had none: cards below moved down.
+        (None, Some(next)) if index >= next => -gap_height,
+        // Gap closed: cards below moved back up.
+        (Some(previous), None) if index >= previous => gap_height,
+        // Gap moved down: cards between the two slots moved up.
+        (Some(previous), Some(next)) if next > previous && index >= previous && index < next => {
+            gap_height
+        }
+        // Gap moved up: cards between the two slots moved down.
+        (Some(previous), Some(next)) if previous > next && index >= next && index < previous => {
+            -gap_height
+        }
+        _ => 0.0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +146,42 @@ mod tests {
     fn reduced_motion_returns_the_resting_value() {
         assert_eq!(eased(true, 0.0, ease_standard), 1.0);
         assert!(eased(false, 0.5, ease_standard) < 1.0);
+    }
+
+    #[test]
+    fn a_gap_opening_pushes_the_cards_below_it_down() {
+        // The layout moves the cards below down; they start at a negative
+        // offset (above the new slot) and glide down to zero.
+        assert_eq!(shift_offset(None, Some(1), 0, 40.0), 0.0);
+        assert_eq!(shift_offset(None, Some(1), 1, 40.0), -40.0);
+        assert_eq!(shift_offset(None, Some(1), 2, 40.0), -40.0);
+    }
+
+    #[test]
+    fn a_gap_closing_pulls_the_cards_below_it_back_up() {
+        assert_eq!(shift_offset(Some(2), None, 1, 40.0), 0.0);
+        assert_eq!(shift_offset(Some(2), None, 2, 40.0), 40.0);
+    }
+
+    #[test]
+    fn moving_the_gap_moves_only_the_cards_in_between() {
+        // Gap moves from slot 1 down to slot 3: cards 1 and 2 moved up.
+        assert_eq!(shift_offset(Some(1), Some(3), 0, 40.0), 0.0);
+        assert_eq!(shift_offset(Some(1), Some(3), 1, 40.0), 40.0);
+        assert_eq!(shift_offset(Some(1), Some(3), 2, 40.0), 40.0);
+        assert_eq!(shift_offset(Some(1), Some(3), 3, 40.0), 0.0);
+        // Gap moves from slot 3 up to slot 1: cards 1 and 2 moved down.
+        assert_eq!(shift_offset(Some(3), Some(1), 1, 40.0), -40.0);
+        assert_eq!(shift_offset(Some(3), Some(1), 2, 40.0), -40.0);
+        assert_eq!(shift_offset(Some(3), Some(1), 3, 40.0), 0.0);
+    }
+
+    #[test]
+    fn stagger_grows_below_the_gap_and_stops_above_it() {
+        assert_eq!(stagger_order(Some(2), 1), 0);
+        assert_eq!(stagger_order(Some(2), 2), 0);
+        assert_eq!(stagger_order(Some(2), 3), 1);
+        assert_eq!(stagger_order(Some(2), 5), 3);
+        assert_eq!(stagger_order(None, 4), 0);
     }
 }

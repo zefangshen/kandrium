@@ -18,15 +18,16 @@ use kandrium_core::documents::{self, AnnotationDoc, DocEntry};
 use kandrium_core::fsutil::FsEntry;
 use kandrium_core::notes::{self, NoteEntry};
 use kandrium_core::projects::{
-    self as project_data, Project, ProjectFolder, ProjectNode, ProjectSummary,
+    self as project_data, Project, ProjectFolder, ProjectNode, ProjectPath, ProjectSummary,
 };
 use kandrium_core::{
-    Board, BoardWithColumns, CardStatus, Clock, CreateCardBody, Person, ProjectChoice, Travel,
-    add_clock, add_person, bootstrap, end_travel, extend_travel, get_all_board, get_board_readonly,
-    list_all_people, list_all_travels, list_boards, list_clocks, list_project_choices,
-    migrate_legacy_db, move_all_card, move_area_card, open_db, open_db_readonly, relocate_person,
-    remove_clock, remove_person, remove_travel, rename_person, reorder_clocks, resolve_db_path,
-    set_card_area, set_card_project, start_travel, update_card,
+    ArchivedCard, Board, BoardWithColumns, CardStatus, Clock, CreateCardBody, Person,
+    ProjectChoice, Travel, add_clock, add_person, bootstrap, delete_card, end_travel,
+    extend_travel, get_all_board, get_board_readonly, list_all_people, list_all_travels,
+    list_archived_cards, list_boards, list_clocks, list_project_choices, migrate_legacy_db,
+    move_all_card, move_area_card, move_card_to_board, open_db, open_db_readonly, relocate_person,
+    remove_clock, remove_person, remove_travel, rename_card, rename_person, reorder_clocks,
+    resolve_db_path, set_card_archived, set_card_area, set_card_project, start_travel, update_card,
 };
 
 /// One snapshot of the Clocks data. The app caches this so the minute tick
@@ -438,6 +439,18 @@ impl Store {
         project_data::set_source(self.wconn()?, id, source).map_err(|e| e.to_string())
     }
 
+    pub fn project_paths(&self, id: &str) -> StoreResult<Vec<ProjectPath>> {
+        project_data::list_project_paths(self.conn()?, id).map_err(|e| e.to_string())
+    }
+
+    pub fn add_project_path(&self, id: &str, path: &str) -> StoreResult<ProjectPath> {
+        project_data::add_project_path(self.wconn()?, id, path).map_err(|e| e.to_string())
+    }
+
+    pub fn remove_project_path(&self, path_id: &str) -> StoreResult<()> {
+        project_data::remove_project_path(self.wconn()?, path_id).map_err(|e| e.to_string())
+    }
+
     pub fn set_project_identifier(&self, id: &str, identifier: &str) -> StoreResult<Project> {
         project_data::set_identifier(self.wconn()?, id, identifier).map_err(|e| e.to_string())
     }
@@ -515,6 +528,67 @@ impl Store {
         before_card_id: Option<&str>,
     ) -> StoreResult<()> {
         move_all_card(self.wconn()?, card_id, status, before_card_id)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Move a card to another Tasks board, keeping its column by status when
+    /// core can (mirrors the egui modal's "Move to board").
+    pub fn move_card_to_board(&self, card_id: &str, board_id: &str) -> StoreResult<()> {
+        move_card_to_board(self.wconn()?, card_id, board_id)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Create a card in `column_id` from the inline "+ Add card" row.
+    pub fn create_card(&self, column_id: &str, title: &str) -> StoreResult<()> {
+        kandrium_core::create_card(
+            self.wconn()?,
+            column_id,
+            &CreateCardBody {
+                title: title.to_string(),
+                description: None,
+                due_date: None,
+                labels: None,
+            },
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
+    /// Rename one card's title only, through the same core path as the modal.
+    pub fn rename_card(&self, card_id: &str, title: &str) -> StoreResult<()> {
+        rename_card(self.wconn()?, card_id, title)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Every archived card with its board and column labels.
+    pub fn archived_cards(&self) -> StoreResult<Vec<ArchivedCard>> {
+        list_archived_cards(self.conn()?)
+            .map(|result| result.cards)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Archive or restore one card. Archives go through the write handle so
+    /// the board and the Archived page see the same row.
+    pub fn set_card_archived(&self, card_id: &str, archived: bool) -> StoreResult<()> {
+        set_card_archived(self.wconn()?, card_id, archived)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Delete one card permanently.
+    pub fn delete_card(&self, card_id: &str) -> StoreResult<()> {
+        delete_card(self.wconn()?, card_id)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Link (or unlink) a card to a project. This is the modal dropdown's
+    /// immediate write; it touches no other card column.
+    pub fn set_card_project(&self, card_id: &str, project_id: Option<&str>) -> StoreResult<()> {
+        set_card_project(self.wconn()?, card_id, project_id)
             .map(|_| ())
             .map_err(|e| e.to_string())
     }

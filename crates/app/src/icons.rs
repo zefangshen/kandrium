@@ -74,6 +74,10 @@ static ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/icons/sticky-note.svg"),
     ),
     ("sun", include_bytes!("../assets/icons/sun.svg")),
+    (
+        "text-book-closed",
+        include_bytes!("../assets/icons/text-book-closed.svg"),
+    ),
     ("trash-2", include_bytes!("../assets/icons/trash-2.svg")),
     ("upload", include_bytes!("../assets/icons/upload.svg")),
     ("users", include_bytes!("../assets/icons/users.svg")),

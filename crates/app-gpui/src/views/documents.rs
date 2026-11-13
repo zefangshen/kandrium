@@ -17,11 +17,12 @@ use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use gpui_kit::base::text::markdown;
-use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_kit::component::input::{Editor, EditorState, InputState, TextareaState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, DragMoveEvent, Entity, Pixels,
-    Point, RenderImage, Rgba, ScrollHandle, TestSupportExt, Window, div, point, px, rgba, size,
+    Point, RenderImage, Rgba, ScrollHandle, TestSupportExt, Window, div, point, px, relative, rgba,
+    size,
 };
 
 use kandrium_core::documents::{AnnotationKind, DocAnnotation, DocEntry};
@@ -128,7 +129,7 @@ pub struct DocTab {
     pub path: PathBuf,
     pub name: String,
     // Markdown
-    pub editor: Option<Entity<TextareaState>>,
+    pub editor: Option<Entity<EditorState>>,
     pub vim: Option<VimSession>,
     pub preview: bool,
     pub saved: String,
@@ -175,7 +176,7 @@ impl DocTab {
         path: PathBuf,
         name: String,
         text: String,
-        editor: Entity<TextareaState>,
+        editor: Entity<EditorState>,
     ) -> Self {
         Self {
             kind: DocKind::Markdown,
@@ -525,8 +526,15 @@ fn tree_splitter(t: &Tokens) -> AnyElement {
     div()
         .id("documents-tree-splitter")
         .test_support()
+        // Visually 1 px, flush on both sides: the 5 px element is centred on
+        // the rule with -2 px side margins, so its slack overlaps the two
+        // neighbours instead of leaving an empty strip, and the resize target
+        // stays comfortably wide.
         .w(px(5.))
+        .mx(px(-2.))
         .h_full()
+        .flex()
+        .justify_center()
         .flex_none()
         .cursor(CursorStyle::ResizeLeftRight)
         .hover(|style| style.bg(t.hover))
@@ -593,17 +601,16 @@ fn tree_panel(state: &mut DocumentsState, t: &Tokens, cx: &mut Context<AppShell>
                 .flex()
                 .items_center()
                 .gap(px(6.))
-                .px(px(10.))
-                .py(px(8.))
+                .h(px(38.))
+                .px(px(12.))
                 .border_b_1()
                 .border_color(t.divider)
-                .child(icon(Icon::FileText, 14., t.text_muted))
                 .child(
                     div()
                         .flex_1()
-                        .text(Text::SmallStrong)
-                        .text_color(t.text)
-                        .child("Documents"),
+                        .text(Text::Label)
+                        .text_color(t.text_muted)
+                        .child("DOCUMENTS"),
                 )
                 .child(tree_action(
                     "documents-collapse",
@@ -665,7 +672,7 @@ fn tree_panel(state: &mut DocumentsState, t: &Tokens, cx: &mut Context<AppShell>
                         .text_color(t.text_muted)
                         .child(label),
                 )
-                .child(Input::new(&draft.input)),
+                .child(crate::views::field_input(&draft.input, t)),
         );
     }
 
@@ -744,6 +751,7 @@ fn tree_row(
     let mut row = div()
         .id(format!("doc-row-{}", entry.path.display()))
         .test_support()
+        .relative()
         .w_full()
         .flex()
         .items_center()
@@ -752,8 +760,21 @@ fn tree_row(
         .pl(px(10.0 + depth as f32 * INDENT))
         .pr(px(8.))
         .cursor_pointer()
-        .when(selected, |this| this.bg(t.selected))
+        .when(selected, |this| this.bg(t.surface_2))
         .hover(|style| style.bg(t.hover));
+
+    if selected {
+        row = row.child(
+            div()
+                .absolute()
+                .left(px(0.))
+                .top(px(6.))
+                .w(px(2.))
+                .h(px(14.))
+                .rounded(px(1.))
+                .bg(t.accent),
+        );
+    }
 
     if renaming {
         let input = state
@@ -775,7 +796,12 @@ fn tree_row(
                 13.,
                 t.text_muted,
             ))
-            .child(div().flex_1().min_w_0().child(Input::new(&input)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(crate::views::field_input(&input, t)),
+            )
             .into_any_element();
     }
 
@@ -926,45 +952,28 @@ fn content(
             .into_any_element();
     }
 
-    let mut strip = div()
-        .id("documents-tabs")
-        .test_support()
-        .flex()
-        .items_center()
-        .gap(px(2.))
-        .px(px(8.))
-        .py(px(4.))
-        .border_b_1()
-        .border_color(t.divider);
+    let mut strip = crate::views::tab_strip(t);
     for (index, tab) in state.tabs.iter().enumerate() {
         let active = state.active == Some(index);
         let path = tab.path.clone();
         let close_path = tab.path.clone();
         strip = strip.child(
-            div()
-                .id(format!("doc-tab-{}", tab.path.display()))
+            crate::views::pane_tab(format!("doc-tab-{}", tab.path.display()), active, t)
                 .test_support()
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .px(px(8.))
-                .py(px(3.))
-                .rounded(px(t.radius))
-                .when(active, |this| this.bg(t.selected))
-                .hover(|style| style.bg(t.hover))
                 .cursor_pointer()
+                .hover(|style| style.bg(t.hover))
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.activate_doc_tab(path.clone(), window, cx)
                 }))
-                .child(icon(doc_icon(&tab.path), 12., t.text_muted))
+                .child(icon(doc_icon(&tab.path), 12., t.text_faint))
                 .child(
                     div()
                         .text(Text::Small)
-                        .text_color(if active { t.text } else { t.text_muted })
+                        .text_color(if active { t.text } else { t.text_faint })
                         .child(tab.name.clone()),
                 )
                 .when(tab.has_unsaved(), |this| {
-                    this.child(div().size(px(4.)).rounded(px(2.)).bg(t.accent))
+                    this.child(div().size(px(3.)).rounded(px(2.)).bg(t.accent))
                 })
                 .child(
                     div()
@@ -976,34 +985,61 @@ fn content(
                             cx.stop_propagation();
                             this.close_doc_tab_by_path(close_path.clone(), cx)
                         }))
-                        .child(icon(Icon::X, 11., t.text_faint)),
+                        .child(icon(Icon::X, 10., t.text_faint)),
                 ),
         );
     }
     strip = strip.child(div().flex_1());
-    if state
-        .active_tab()
-        .is_some_and(|tab| tab.kind == DocKind::Markdown)
-    {
-        strip = strip.child(tab_action(
-            "documents-preview",
-            if state.active_tab().is_some_and(|tab| tab.preview) {
-                "Edit"
-            } else {
-                "Preview"
-            },
-            t,
-            cx.listener(|this, _: &ClickEvent, window, cx| this.toggle_doc_preview(window, cx)),
-        ));
-    }
     body = body.child(strip);
 
     let Some(index) = state.active else {
         return body.into_any_element();
     };
 
+    let markdown = state.tabs[index].kind == DocKind::Markdown;
+    let preview = markdown && state.tabs[index].preview;
+    let mut head = div()
+        .id("documents-head")
+        .test_support()
+        .h(px(40.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .px(px(14.))
+        .border_b_1()
+        .border_color(t.divider)
+        .child(crate::views::path_label(
+            "documents-path",
+            state.tabs[index].path.display().to_string(),
+            t,
+            cx,
+        ))
+        .child(div().flex_1());
+    if markdown {
+        if let Some(vim) = state.tabs[index].vim.as_ref() {
+            head = head.child(crate::views::vim_indicator("documents-vim", vim, t));
+        }
+        head = head.child(crate::views::mode_switch(
+            "documents-preview",
+            preview,
+            t,
+            cx.listener(move |this, _: &ClickEvent, window, cx| {
+                if preview {
+                    this.toggle_doc_preview(window, cx);
+                }
+            }),
+            cx.listener(move |this, _: &ClickEvent, window, cx| {
+                if !preview {
+                    this.toggle_doc_preview(window, cx);
+                }
+            }),
+        ));
+    }
+    body = body.child(head);
+
     match state.tabs[index].kind {
-        DocKind::Markdown => body = body.child(markdown_body(state, index, t, cx)),
+        DocKind::Markdown => body = body.child(markdown_body(state, index, t, window, cx)),
         DocKind::Pdf => {
             body = body.child(crate::views::documents_pdf::viewer(state, index, t, cx));
         }
@@ -1012,7 +1048,6 @@ fn content(
     if let Some(confirm) = &state.confirm {
         body = body.child(delete_confirm(confirm, t, cx));
     }
-    let _ = window;
     body.into_any_element()
 }
 
@@ -1020,6 +1055,7 @@ fn markdown_body(
     state: &mut DocumentsState,
     index: usize,
     t: &Tokens,
+    window: &Window,
     cx: &mut Context<AppShell>,
 ) -> AnyElement {
     let tab = &state.tabs[index];
@@ -1029,114 +1065,129 @@ fn markdown_body(
             .as_ref()
             .map(|editor| editor.read(cx).value().to_string())
             .unwrap_or_default();
-        return div()
+        let pane = div()
             .id("doc-preview")
             .test_support()
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .p(px(20.))
-            .child(markdown(text.as_str()))
+            .px(px(30.))
+            .pt(px(20.))
+            .pb(px(30.))
+            .child(markdown(text.as_str()));
+        return div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(pane)
+            .child(status_bar(tab, t, cx))
             .into_any_element();
     }
 
     let editor = tab.editor.clone().expect("markdown tab has an editor");
-    let mode = mode_strip(tab, t, cx);
+    let lines = editor.read(cx).value().lines().count();
     let readonly = tab.vim.as_ref().is_none_or(|vim| !vim.is_insert());
     div()
-        .id("doc-editor-wrap")
+        .id("doc-markdown")
         .test_support()
         .flex()
         .flex_col()
         .flex_1()
+        .h_full()
         .min_h_0()
-        .child(mode)
         .child(
             div()
-                .id("doc-editor")
+                .id("doc-editor-wrap")
                 .test_support()
+                .flex()
+                .flex_col()
                 .flex_1()
                 .min_h_0()
-                .p(px(12.))
-                .child(Textarea::new(&editor).readonly(readonly)),
+                .child(
+                    div()
+                        .id("doc-editor")
+                        .test_support()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .relative()
+                                .w_full()
+                                .flex_1()
+                                .min_h_0()
+                                .child(
+                                    div().absolute().inset_0().child(
+                                        // Multi-line inputs auto-size to their
+                                        // content; pin the editor to the wrapper.
+                                        Editor::new(&editor)
+                                            .h(relative(1.))
+                                            .bordered(false)
+                                            .readonly(readonly),
+                                    ),
+                                )
+                                .child(crate::views::gutter_rule(lines, t, window)),
+                        ),
+                )
+                .capture_key_down(cx.listener(|this, event, window, cx| {
+                    this.handle_documents_key(event, window, cx)
+                })),
         )
-        .capture_key_down(
-            cx.listener(|this, event, window, cx| this.handle_documents_key(event, window, cx)),
-        )
+        .child(status_bar(tab, t, cx))
         .into_any_element()
 }
 
-/// Mode badge (also the vim on/off toggle), pending keys, ex line or error,
-/// and a short hint.
-fn mode_strip(tab: &DocTab, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
-    let Some(vim) = &tab.vim else {
+/// The editor's bottom status bar: vim mode (also the toggle), pending keys,
+/// ex line or error, cursor position, word count and save state.
+fn status_bar(tab: &DocTab, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
+    let Some(editor) = &tab.editor else {
         return div().into_any_element();
     };
-    let enabled = vim.is_enabled();
-    let mut row = div()
-        .id("doc-mode")
-        .test_support()
-        .flex()
-        .items_center()
-        .gap(px(8.))
-        .px(px(12.))
-        .py(px(3.))
-        .border_b_1()
-        .border_color(t.divider)
-        .child(
-            div()
-                .id("doc-vim-toggle")
-                .test_support()
-                .px(px(6.))
-                .py(px(1.))
-                .rounded(px(4.))
-                .bg(t.panel)
-                .text(Text::SmallStrong)
-                .text_color(if enabled { t.text_muted } else { t.text_faint })
-                .cursor_pointer()
-                .hover(|style| style.bg(t.hover))
-                .child(vim.mode_label())
-                .on_click(
-                    cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_vim_mode(cx)),
-                ),
-        );
-    if let Some(line) = vim.ex_line() {
-        row = row.child(
-            div()
-                .text(Text::Small)
-                .text_color(t.text)
-                .child(line.to_string()),
-        );
-    } else if let Some(error) = vim.ex_error() {
-        row = row.child(
-            div()
-                .text(Text::Small)
-                .text_color(t.danger)
-                .child(error.to_string()),
-        );
+    let preview = tab.preview;
+    let position = editor.read(cx).cursor_position();
+    let words = editor.read(cx).value().split_whitespace().count();
+    let enabled = tab.vim.as_ref().is_some_and(|vim| vim.is_enabled());
+    let pending = if preview {
+        None
+    } else if let Some(line) = tab.vim.as_ref().and_then(|vim| vim.ex_line()) {
+        Some((line.to_string(), false))
+    } else if let Some(error) = tab.vim.as_ref().and_then(|vim| vim.ex_error()) {
+        Some((error.to_string(), true))
     } else {
-        let pending = vim.pending();
-        if !pending.is_empty() {
-            row = row.child(
-                div()
-                    .text(Text::Small)
-                    .text_color(t.text_muted)
-                    .child(pending),
-            );
-        }
-    }
-    row.child(
-        div()
-            .flex_1()
-            .text(Text::Small)
-            .text_color(t.text_faint)
-            .child(if enabled {
+        let pending = tab
+            .vim
+            .as_ref()
+            .map(|vim| vim.pending())
+            .unwrap_or_default();
+        (!pending.is_empty()).then_some((pending, false))
+    };
+    crate::views::editor_status_bar(
+        "doc-status",
+        crate::views::EditorStatus {
+            mode: if preview {
+                "PREVIEW"
+            } else {
+                tab.vim.as_ref().map_or("vim", |vim| vim.mode_label())
+            },
+            vim: enabled,
+            pending,
+            line: position.line as usize + 1,
+            column: position.character as usize + 1,
+            words,
+            dirty: tab.has_unsaved(),
+            hint: if preview {
+                "660 px measure"
+            } else if enabled {
                 "Esc normal · i insert · :w save · :q close"
             } else {
                 "click the badge for vim"
-            }),
+            },
+        },
+        t,
+        cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_vim_mode(cx)),
     )
-    .into_any_element()
 }
 
 fn tab_action(

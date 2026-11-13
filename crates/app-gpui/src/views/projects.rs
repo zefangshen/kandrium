@@ -14,28 +14,27 @@
 //! only presentation state: expansion, filter, drafts, tabs and the drag
 //! session.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui_kit::base::text::markdown;
-use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_kit::component::input::{Editor, EditorState, InputState, TextareaState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     AnyElement, App, ClickEvent, Context, CursorStyle, DragMoveEvent, Entity, Render,
-    TestSupportExt, Window, div, px, rgba,
+    TestSupportExt, Window, div, px, relative, rgba,
 };
 
 use kandrium_core::BoardWithColumns;
 use kandrium_core::fsutil::FsEntry;
 use kandrium_core::projects::{
-    PROJECT_STATUSES, Project, ProjectNode, ProjectSummary, find_project,
+    PROJECT_STATUSES, Project, ProjectNode, ProjectPath, ProjectSummary, find_project,
 };
 
 use crate::app::AppShell;
 use crate::assets::{Icon, icon};
 use crate::theme::{Text, TextStyled, Tokens};
-use crate::views::tasks::DropTarget;
 use crate::views::{placeholder, tasks};
 use crate::vim::VimSession;
 
@@ -43,6 +42,11 @@ use crate::vim::VimSession;
 pub const TREE_W: f32 = 240.0;
 /// Collapsed rail width.
 pub const RAIL_W: f32 = 30.0;
+/// Base left inset inside a tree row, after the 6 px pill margin. Chosen so
+/// the row's leading control lines up with the header's 10 px text inset.
+const TREE_BASE_INSET: f32 = 4.0;
+/// Horizontal step per nesting level. The base moves; this does not.
+const TREE_INDENT: f32 = 12.0;
 /// Debounce before a dirty document tab is written.
 pub const AUTOSAVE: Duration = Duration::from_millis(400);
 
@@ -82,6 +86,12 @@ pub struct ProjectConfirm {
 pub struct TitleEdit {
     pub project_id: String,
     pub input: Entity<InputState>,
+    /// Name when the editor opened, restored by Esc.
+    pub original: String,
+    /// Name last written through core, so autosave never renames twice.
+    pub saved: String,
+    /// Bumped on every keystroke so a stale autosave can bow out.
+    pub generation: u64,
 }
 
 /// Overview inputs: identifier, source, description. Rebuilt only when the
@@ -89,10 +99,19 @@ pub struct TitleEdit {
 pub struct DetailEditor {
     pub project_id: String,
     pub identifier: Entity<InputState>,
-    pub source: Entity<InputState>,
     pub description: Entity<TextareaState>,
-    pub vim: VimSession,
+    /// Description as persisted; autosave diffs against it.
     pub saved_description: String,
+    /// Whether the description renders the Markdown preview instead.
+    pub preview: bool,
+    /// Bumped on every keystroke so a stale autosave can bow out.
+    pub description_generation: u64,
+    /// Identifier as persisted; Esc restores it and Save diffs against it.
+    pub saved_identifier: String,
+    /// Whether the identifier field differs from `saved_identifier`.
+    pub identifier_dirty: bool,
+    /// Inline validation message shown next to the identifier.
+    pub identifier_error: Option<String>,
 }
 
 /// Whether the documents draft creates a file or a folder.
@@ -115,7 +134,7 @@ pub struct ProjectDocTab {
     /// Project-relative path, as core expects for `read_doc` / `write_doc`.
     pub rel: PathBuf,
     pub name: String,
-    pub editor: Entity<TextareaState>,
+    pub editor: Entity<EditorState>,
     pub vim: VimSession,
     pub preview: bool,
     /// Text as last written to disk.
@@ -125,6 +144,9 @@ pub struct ProjectDocTab {
     pub generation: u64,
 }
 
+// The document variant owns an editor and a vim session; the data-free
+// variants are cheap either way, so boxing would only add indirection.
+#[allow(clippy::large_enum_variant)]
 pub enum ProjectTab {
     Overview,
     Tasks,
@@ -163,12 +185,16 @@ pub struct ProjectsState {
     /// Project the tabs belong to; a selection change rebuilds the pinned tabs.
     pub tabs_project: Option<String>,
     pub detail: Option<Project>,
+    /// Folder references attached to the selected project.
+    pub paths: Vec<ProjectPath>,
     pub summary: Option<ProjectSummary>,
     pub files: Vec<FsEntry>,
     pub filter: String,
     pub filter_input: Option<Entity<InputState>>,
     pub show_archived: bool,
     pub archived: Vec<Project>,
+    /// Whether the footer's Archived disclosure shows its inline list.
+    pub archived_open: bool,
     pub tree_open: bool,
     pub tree_w: f32,
     pub error: Option<String>,
@@ -180,6 +206,13 @@ pub struct ProjectsState {
     /// Project-relative folder targeted by the documents draft.
     pub doc_folder: PathBuf,
     pub doc_draft: Option<DocDraft>,
+    /// Projects whose documents are expanded in the tree (session state).
+    pub docs_open: HashSet<String>,
+    /// Document folders expanded inside an open project, keyed by
+    /// `"<project id>/<absolute folder path>"`.
+    pub doc_folders_open: HashSet<String>,
+    /// Cached document tree per project, refreshed with the project list.
+    pub doc_trees: HashMap<String, Vec<FsEntry>>,
     /// When the title row was last clicked, for double-click detection.
     pub last_title_click: Option<(String, std::time::Instant)>,
 }
@@ -196,12 +229,14 @@ impl Default for ProjectsState {
             active: 0,
             tabs_project: None,
             detail: None,
+            paths: Vec::new(),
             summary: None,
             files: Vec::new(),
             filter: String::new(),
             filter_input: None,
             show_archived: false,
             archived: Vec::new(),
+            archived_open: false,
             tree_open: true,
             tree_w: TREE_W,
             error: None,
@@ -212,6 +247,9 @@ impl Default for ProjectsState {
             drag: None,
             doc_folder: PathBuf::new(),
             doc_draft: None,
+            docs_open: HashSet::new(),
+            doc_folders_open: HashSet::new(),
+            doc_trees: HashMap::new(),
             last_title_click: None,
         }
     }
@@ -295,12 +333,23 @@ pub fn project_matches(project: &Project, filter: &str) -> bool {
         || project.name.to_lowercase().contains(&filter)
 }
 
-fn node_matches(node: &ProjectNode, filter: &str) -> bool {
+/// Whether a node survives the filter. A project also survives when one of
+/// its documents matches, mirroring how a folder survives on any matching
+/// descendant — the document rows are filtered too, so only the hits show.
+fn node_visible(node: &ProjectNode, filter: &str, state: &ProjectsState) -> bool {
+    let needle = filter.trim().to_lowercase();
     match node {
-        ProjectNode::Project(project) => project_matches(project, filter),
-        ProjectNode::Folder { children, .. } => {
-            children.iter().any(|child| node_matches(child, filter))
+        ProjectNode::Project(project) => {
+            project_matches(project, filter)
+                || state.doc_trees.get(&project.id).is_some_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|entry| doc_entry_matches(entry, &needle))
+                })
         }
+        ProjectNode::Folder { children, .. } => children
+            .iter()
+            .any(|child| node_visible(child, filter, state)),
     }
 }
 
@@ -335,6 +384,15 @@ pub fn first_project(nodes: &[ProjectNode]) -> Option<&Project> {
         ProjectNode::Project(project) => Some(project),
         ProjectNode::Folder { children, .. } => first_project(children),
     })
+}
+
+/// Every project id in tree order, used to warm the per-project document
+/// caches that the tree's in-place disclosure reads.
+pub fn project_ids(nodes: &[ProjectNode]) -> Vec<String> {
+    flat_projects(nodes)
+        .into_iter()
+        .map(|(project, _)| project.id.clone())
+        .collect()
 }
 
 /// All projects in tree order with their folder depth, used by the filter and
@@ -439,10 +497,9 @@ pub fn sibling_projects(nodes: &[ProjectNode], folder: Option<&str>) -> Vec<Stri
 pub fn projects_view(
     state: &ProjectsState,
     board: Option<&BoardWithColumns>,
-    drop_target: Option<&DropTarget>,
-    dragging: Option<&str>,
+    drag: tasks::BoardDrag<'_>,
     t: &Tokens,
-    _window: &mut Window,
+    window: &mut Window,
     cx: &mut Context<AppShell>,
 ) -> AnyElement {
     let mut row = div()
@@ -453,9 +510,10 @@ pub fn projects_view(
         .child(tree_panel(state, t, cx));
 
     if state.tree_open {
-        row = row
-            .child(tree_splitter(t))
-            .child(div().w(px(1.)).h_full().bg(t.divider));
+        // The splitter carries the only rule between the panel and the
+        // content: it is the 5 px drag target with a 1 px line inside, so the
+        // seam stays a single stroke while remaining full height.
+        row = row.child(tree_splitter(t));
     }
     row.on_drag_move::<ProjectsTreeDrag>(cx.listener(
         |this, event: &DragMoveEvent<ProjectsTreeDrag>, _window, cx| {
@@ -466,7 +524,7 @@ pub fn projects_view(
     .on_drop::<ProjectsTreeDrag>(cx.listener(|this, _drag: &ProjectsTreeDrag, _window, cx| {
         this.finish_tree_resize(cx);
     }))
-    .child(detail_pane(state, board, drop_target, dragging, t, cx))
+    .child(detail_pane(state, board, drag, t, window, cx))
     .into_any_element()
 }
 
@@ -474,8 +532,15 @@ fn tree_splitter(t: &Tokens) -> AnyElement {
     div()
         .id("projects-tree-splitter")
         .test_support()
+        // Visually 1 px, flush on both sides: the 5 px element is centred on
+        // the rule with -2 px side margins, so its slack overlaps the two
+        // neighbours instead of leaving an empty strip, and the resize target
+        // stays comfortably wide.
         .w(px(5.))
+        .mx(px(-2.))
         .h_full()
+        .flex()
+        .justify_center()
         .flex_none()
         .cursor(CursorStyle::ResizeLeftRight)
         .hover(|style| style.bg(t.hover))
@@ -529,6 +594,9 @@ fn tree_panel(state: &ProjectsState, t: &Tokens, cx: &mut Context<AppShell>) -> 
             .into_any_element();
     }
 
+    // The rail keeps its own right rule (there is no splitter while closed),
+    // so the open panel must not add a second one beside the splitter's line.
+    let has_project = state.selected.is_some();
     let mut panel = div()
         .id("projects-tree")
         .test_support()
@@ -536,83 +604,85 @@ fn tree_panel(state: &ProjectsState, t: &Tokens, cx: &mut Context<AppShell>) -> 
         .h_full()
         .flex()
         .flex_col()
-        .border_r_1()
-        .border_color(t.divider)
         .child(
             div()
+                .h(px(38.))
                 .flex()
                 .items_center()
-                .gap(px(4.))
-                .px(px(10.))
-                .py(px(8.))
+                .gap(px(6.))
+                .pl(px(10.))
+                .pr(px(6.))
                 .border_b_1()
                 .border_color(t.divider)
-                .child(icon(Icon::Folder, 14., t.text_muted))
                 .child(
                     div()
-                        .flex_1()
-                        .text(Text::SmallStrong)
-                        .text_color(t.text)
-                        .child("Projects"),
+                        .min_w(px(0.))
+                        .flex_shrink(1.)
+                        .truncate()
+                        .text(Text::Label)
+                        .text_color(t.text_muted)
+                        .child("PROJECTS"),
                 )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text(Text::Micro)
+                        .text_color(t.text_ghost)
+                        .child(count_projects(&state.tree).to_string()),
+                )
+                .child(div().flex_1())
+                // The four actions read left to right as project, folder,
+                // file, upload. Only New project works without a selection;
+                // the other three act inside the selected project, so they
+                // dim (same box, same row height) until one is chosen.
+                .child(header_action(
+                    "projects-new-project",
+                    Icon::FolderKanban,
+                    "New project",
+                    true,
+                    t,
+                    cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.begin_project_draft(ProjectDraftKind::Project, window, cx)
+                    }),
+                ))
+                .child(header_action(
+                    "projects-new-folder",
+                    Icon::FolderPlus,
+                    "New folder",
+                    has_project,
+                    t,
+                    cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.begin_project_doc_draft(DocDraftKind::Folder, window, cx)
+                    }),
+                ))
+                .child(header_action(
+                    "projects-new-file",
+                    Icon::FilePlus,
+                    "New file",
+                    has_project,
+                    t,
+                    cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.begin_project_doc_draft(DocDraftKind::File, window, cx)
+                    }),
+                ))
+                .child(header_action(
+                    "projects-upload",
+                    Icon::Upload,
+                    "Upload",
+                    has_project,
+                    t,
+                    cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.upload_project_documents(window, cx)
+                    }),
+                ))
+                // The collapse control is the last item, so it sits on the
+                // panel's right edge whatever width the user drags the tree
+                // to; the flex spacer above keeps the action group together.
                 .child(tree_action(
                     "projects-collapse",
                     Icon::ChevronLeft,
                     t,
                     cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_projects_tree(cx)),
-                ))
-                .child(tree_action(
-                    "projects-new-folder",
-                    Icon::FolderPlus,
-                    t,
-                    cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.begin_project_draft(ProjectDraftKind::Folder, window, cx)
-                    }),
-                ))
-                .child(tree_action(
-                    "projects-new-project",
-                    Icon::FilePlus,
-                    t,
-                    cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.begin_project_draft(ProjectDraftKind::Project, window, cx)
-                    }),
-                )),
-        )
-        .child(
-            div()
-                .px(px(10.))
-                .py(px(6.))
-                .border_b_1()
-                .border_color(t.divider)
-                .child(match &state.filter_input {
-                    Some(input) => Input::new(input).into_any_element(),
-                    None => div().into_any_element(),
-                }),
-        )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(2.))
-                .px(px(8.))
-                .py(px(4.))
-                .border_b_1()
-                .border_color(t.divider)
-                .child(view_chip(
-                    "projects-active-list",
-                    "Active",
-                    !state.show_archived,
-                    t,
-                    cx.listener(|this, _: &ClickEvent, _window, cx| this.show_active_projects(cx)),
-                ))
-                .child(view_chip(
-                    "projects-archived-list",
-                    "Archived",
-                    state.show_archived,
-                    t,
-                    cx.listener(|this, _: &ClickEvent, _window, cx| {
-                        this.show_archived_projects(cx)
-                    }),
                 )),
         );
 
@@ -642,7 +712,7 @@ fn tree_panel(state: &ProjectsState, t: &Tokens, cx: &mut Context<AppShell>) -> 
                         .text_color(t.text_muted)
                         .child(label),
                 )
-                .child(Input::new(&draft.input)),
+                .child(crate::views::field_input(&draft.input, t)),
         );
     }
 
@@ -666,7 +736,26 @@ fn tree_panel(state: &ProjectsState, t: &Tokens, cx: &mut Context<AppShell>) -> 
         .id("projects-tree-rows")
         .test_support()
         .flex_1()
-        .overflow_y_scroll();
+        .overflow_y_scroll()
+        .pb(px(8.));
+
+    // The search sits at the top of the scrolling body, so it scrolls away
+    // with the rows instead of staying pinned under the header.
+    if let Some(input) = &state.filter_input {
+        rows = rows.child(
+            div()
+                .id("projects-search")
+                .test_support()
+                .mx(px(6.))
+                .mt(px(4.))
+                .mb(px(6.))
+                .child(crate::views::field_input(input, t).prefix(icon(
+                    Icon::Search,
+                    11.,
+                    t.text_faint,
+                ))),
+        );
+    }
 
     if state.show_archived {
         if state.archived.is_empty() {
@@ -682,17 +771,207 @@ fn tree_panel(state: &ProjectsState, t: &Tokens, cx: &mut Context<AppShell>) -> 
             state
                 .tree
                 .iter()
-                .filter(|node| node_matches(node, &state.filter))
+                .filter(|node| node_visible(node, &state.filter, state))
                 .cloned()
                 .collect()
         };
         if visible.is_empty() && state.draft.is_none() {
-            rows = rows.child(empty_row("No projects yet.", t));
+            let message = if state.filter.trim().is_empty() {
+                "No projects yet."
+            } else {
+                "No matching projects."
+            };
+            rows = rows.child(empty_row(message, t));
         }
         rows = rows.child(tree_rows(&visible, 0, state, t, cx));
     }
 
-    panel.child(rows).into_any_element()
+    panel = panel.child(rows);
+    // The Archived row is the list's header, so it always sits directly above
+    // the disclosure. Collapsed, the active rows are `flex_1` and the row
+    // stays pinned to the bottom of the tree, where it reads as the tree's
+    // footer entry and keeps its old position.
+    panel = panel.child(archived_toggle_row(state, t, cx));
+    if state.archived_open && !state.show_archived {
+        panel = panel.child(archived_disclosure_list(state, t, cx));
+    }
+    panel.into_any_element()
+}
+
+/// The Archived disclosure's inline list. It shares the tree's remaining
+/// height with the active rows (both are `flex_1`), so it always takes about
+/// half the tree area and scrolls on its own.
+fn archived_disclosure_list(
+    state: &ProjectsState,
+    t: &Tokens,
+    cx: &mut Context<AppShell>,
+) -> AnyElement {
+    let mut list = div()
+        .id("projects-archived-list")
+        .test_support()
+        .min_h(px(0.))
+        .py(px(4.))
+        .when(!state.archived.is_empty(), |this| {
+            this.flex_1().overflow_y_scroll()
+        });
+    if state.archived.is_empty() {
+        list = list.child(empty_row("No archived projects.", t));
+    }
+    for project in &state.archived {
+        list = list.child(archived_tree_row(project, state, t, cx));
+    }
+    list.into_any_element()
+}
+
+/// An archived project inside the disclosure list. It reads like a tree
+/// project row: identifier label, full name on the label's tooltip, hover wash
+/// and the selection pill. Selecting it opens the project the same way the
+/// archived view does (`select_project`), which shows its Overview with the
+/// Restore action.
+fn archived_tree_row(
+    project: &Project,
+    state: &ProjectsState,
+    t: &Tokens,
+    cx: &mut Context<AppShell>,
+) -> AnyElement {
+    let selected = state.selected.as_deref() == Some(project.id.as_str());
+    let id = project.id.clone();
+    let tooltip = project.name.clone();
+    let label = if project.identifier.is_empty() {
+        project.name.clone()
+    } else {
+        project.identifier.clone()
+    };
+    div()
+        .id(format!("project-archived-tree-{}", project.id))
+        .test_support()
+        .relative()
+        .mx(px(6.))
+        .h(px(26.))
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .rounded(px(4.))
+        .pl(px(TREE_BASE_INSET))
+        .pr(px(8.))
+        .cursor_pointer()
+        .when(selected, |this| this.bg(t.surface_2))
+        .when(selected, |this| this.child(selected_marker(t)))
+        .hover(|style| style.bg(t.hover))
+        // Same slot a project row reserves for its disclosure chevron, so the
+        // icon and identifier line up with normal project rows at depth 0.
+        .child(div().w(px(12.)))
+        .child(icon(Icon::FolderColumns, 14., t.text_muted))
+        .child(
+            div()
+                .id(format!("project-archived-name-{}", project.id))
+                .test_support()
+                .flex_shrink(1.)
+                .min_w(px(0.))
+                .truncate()
+                .text(Text::Monospace)
+                .text_color(t.text)
+                .child(label)
+                .tooltip(move |_window, cx| {
+                    cx.new(|_| NameTooltip {
+                        label: tooltip.clone(),
+                    })
+                    .into()
+                }),
+        )
+        .on_click(
+            cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.select_project(&id, window, cx)
+            }),
+        )
+        .into_any_element()
+}
+
+/// Pinned footer entry for the archived projects.
+///
+/// A disclosure chevron on the left expands an inline archived list above the
+/// row; the rest of the row keeps the old chip behaviour and switches the whole
+/// tree into the archived view (`ProjectsState::show_archived`).
+fn archived_toggle_row(
+    state: &ProjectsState,
+    t: &Tokens,
+    cx: &mut Context<AppShell>,
+) -> AnyElement {
+    let open = state.archived_open;
+    div()
+        .id("projects-archived-toggle")
+        .test_support()
+        .border_t_1()
+        .border_color(t.divider)
+        .py(px(6.))
+        .child(
+            div()
+                .mx(px(6.))
+                .h(px(26.))
+                .flex()
+                .items_center()
+                .rounded(px(4.))
+                // Discloses the inline archived list; the same 12 px glyph and
+                // faint colour as the tree's own chevrons.
+                .child(
+                    div()
+                        .id("projects-archived-chevron")
+                        .test_support()
+                        .h_full()
+                        .pl(px(TREE_BASE_INSET))
+                        .pr(px(4.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(3.))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(t.pressed))
+                        .child(icon(
+                            if open {
+                                Icon::ChevronDown
+                            } else {
+                                Icon::ChevronRight
+                            },
+                            12.,
+                            t.text_faint,
+                        ))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.toggle_archived_disclosure(cx)
+                        })),
+                )
+                .child(
+                    // A header for the disclosure, not a control: only the
+                    // chevron expands and collapses the list, so the label,
+                    // icon and count take no click handling and no hover wash.
+                    div()
+                        .id("projects-archived-row")
+                        .test_support()
+                        .flex_1()
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .pl(px(2.))
+                        .pr(px(8.))
+                        .child(icon(Icon::Archive, 14., t.text_faint))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text(Text::Small)
+                                .text_color(t.text_muted)
+                                .child("Archived"),
+                        )
+                        .when(!state.archived.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .flex_none()
+                                    .text(Text::Micro)
+                                    .text_color(t.text_ghost)
+                                    .child(state.archived.len().to_string()),
+                            )
+                        }),
+                ),
+        )
+        .into_any_element()
 }
 
 fn tree_rows(
@@ -712,7 +991,7 @@ fn tree_rows(
                 let shown: Vec<ProjectNode> = if filtering {
                     children
                         .iter()
-                        .filter(|child| node_matches(child, &state.filter))
+                        .filter(|child| node_visible(child, &state.filter, state))
                         .cloned()
                         .collect()
                 } else {
@@ -724,10 +1003,30 @@ fn tree_rows(
             }
             ProjectNode::Project(project) => {
                 column = column.child(project_row(project, depth, state, t, cx));
+                if state.docs_open.contains(&project.id)
+                    && let Some(entries) = state.doc_trees.get(&project.id)
+                {
+                    for row in tree_doc_rows(&project.id, entries, depth + 1, state, t, cx) {
+                        column = column.child(row);
+                    }
+                }
             }
         }
     }
     column.into_any_element()
+}
+
+/// 2 px accent marker pinned to the left edge of a selected tree row.
+fn selected_marker(t: &Tokens) -> AnyElement {
+    div()
+        .absolute()
+        .left(px(0.))
+        .top(px(6.))
+        .bottom(px(6.))
+        .w(px(2.))
+        .rounded(px(2.))
+        .bg(t.accent)
+        .into_any_element()
 }
 
 fn folder_row(
@@ -748,15 +1047,21 @@ fn folder_row(
     div()
         .id(row_id.clone())
         .test_support()
-        .w_full()
+        .relative()
+        .mx(px(6.))
+        .h(px(26.))
         .flex()
         .items_center()
-        .gap(px(5.))
-        .pl(px(10.0 + depth as f32 * 12.0))
-        .pr(px(6.))
-        .py(px(4.))
+        .gap(px(6.))
+        .rounded(px(4.))
+        // 6 px pill margin + 4 px base = the header's own 10 px text inset,
+        // so the tree's leading glyph lines up with "PROJECTS". The 12 px
+        // chevron slot and the per-depth step below stay as they were.
+        .pl(px(TREE_BASE_INSET + depth as f32 * TREE_INDENT))
+        .pr(px(8.))
         .cursor_pointer()
-        .when(selected, |this| this.bg(t.selected))
+        .when(selected, |this| this.bg(t.surface_2))
+        .when(selected, |this| this.child(selected_marker(t)))
         .hover(|style| style.bg(t.hover))
         .child(icon(
             if open {
@@ -767,7 +1072,7 @@ fn folder_row(
             12.,
             t.text_faint,
         ))
-        .child(icon(Icon::Folder, 13., t.text_muted))
+        .child(icon(Icon::Folder, 14., t.text_muted))
         .child(
             div()
                 .flex_1()
@@ -813,7 +1118,21 @@ fn project_row(
     let drag_id = project.id.clone();
     let drag_folder = project.folder_id.clone();
     let tooltip = project.name.clone();
-    let suffix = filtering.then(|| project.name.clone());
+    // The row is labelled with the identifier, like the egui app; the full
+    // name lives in the tooltip. An identifier-less project falls back to its
+    // name so the row never renders empty.
+    let label = if project.identifier.is_empty() {
+        project.name.clone()
+    } else {
+        project.identifier.clone()
+    };
+    let drag_label = label.clone();
+    // Whether the disclosure chevron is useful: a project with no documents
+    // keeps the plain spacer instead of a control that would do nothing.
+    let has_docs = state
+        .doc_trees
+        .get(&project.id)
+        .is_some_and(|entries| !entries.is_empty());
     let hover = state
         .drag
         .as_ref()
@@ -828,42 +1147,80 @@ fn project_row(
     let mut row = div()
         .id(format!("project-row-{}", project.id))
         .test_support()
-        .w_full()
+        .relative()
+        .mx(px(6.))
+        .h(px(26.))
         .flex()
         .items_center()
-        .gap(px(5.))
-        .pl(px(10.0 + depth as f32 * 12.0))
+        .gap(px(6.))
+        .rounded(px(4.))
+        // Same base inset and step as folder rows: a project's icon lands on
+        // the folder icon's x at the same depth (the 12 px slot stands in for
+        // the folder's chevron), and the identifier stays right-aligned.
+        .pl(px(TREE_BASE_INSET + depth as f32 * TREE_INDENT))
         .pr(px(8.))
-        .py(px(4.))
         .cursor_pointer()
-        .when(selected, |this| this.bg(t.selected))
-        .when(is_dragged, |this| this.opacity(0.4))
+        .when(selected, |this| this.bg(t.surface_2))
+        .when(selected, |this| this.child(selected_marker(t)))
+        .when(is_dragged, |this| this.opacity(0.3))
         .hover(|style| style.bg(t.hover))
-        .child(div().w(px(12.)))
-        .child(icon(Icon::FolderKanban, 13., t.text_muted))
-        .child(
+        // The slot the row used to reserve for a folder-style chevron is a
+        // real disclosure control here when the project has documents; with
+        // none, the plain spacer keeps every row's icon on the same x.
+        .child(if has_docs {
+            let toggle_id = project.id.clone();
+            let expanded = state.docs_open.contains(&project.id);
             div()
-                .text(Text::SmallStrong)
+                .id(format!("project-docs-{}", project.id))
+                .test_support()
+                .w(px(12.))
+                .h(px(12.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(2.))
+                .cursor_pointer()
+                .hover(move |style| style.bg(t.hover))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                    this.toggle_project_docs(&toggle_id, cx)
+                }))
+                .child(icon(
+                    if expanded {
+                        Icon::ChevronDown
+                    } else {
+                        Icon::ChevronRight
+                    },
+                    12.,
+                    t.text_faint,
+                ))
+                .into_any_element()
+        } else {
+            div().w(px(12.)).into_any_element()
+        })
+        .child(icon(Icon::FolderColumns, 14., t.text_muted))
+        .child(
+            // The tooltip belongs to the label, not the row: it triggers on
+            // the identifier's own bounds, so hovering the disclosure chevron
+            // or the project icon does not pop the full name. The label is
+            // content-sized (shrinking only when the text is too long), which
+            // keeps the trigger region off the row's trailing padding.
+            div()
+                .id(format!("project-name-{}", project.id))
+                .test_support()
+                .flex_shrink(1.)
+                .min_w(px(0.))
+                .truncate()
+                .text(Text::Monospace)
                 .text_color(t.text)
-                .child(project.identifier.clone()),
+                .child(label.clone())
+                .tooltip(move |_window, cx| {
+                    cx.new(|_| NameTooltip {
+                        label: tooltip.clone(),
+                    })
+                    .into()
+                }),
         )
-        .when_some(suffix, |this, name| {
-            this.child(
-                div()
-                    .flex_1()
-                    .truncate()
-                    .text(Text::Small)
-                    .text_color(t.text_faint)
-                    .child(name),
-            )
-        })
-        .when(!filtering, |this| this.child(div().flex_1()))
-        .tooltip(move |_window, cx| {
-            cx.new(|_| NameTooltip {
-                label: tooltip.clone(),
-            })
-            .into()
-        })
         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
             this.select_project(&project_id, window, cx)
         }));
@@ -882,7 +1239,7 @@ fn project_row(
                         shell.update(cx, |this, cx| this.begin_project_drag(&id, cx));
                     }
                     cx.new(|_| ProjectDragGhost {
-                        label: id.chars().take(6).collect(),
+                        label: drag_label.clone(),
                     })
                 },
             )
@@ -922,6 +1279,113 @@ fn project_row(
     column.into_any_element()
 }
 
+/// A document row under an expanded project in the tree.
+///
+/// Mirrors the Overview document list — folders nest behind their own
+/// chevron, Markdown files open a tab, other files are marked external — but
+/// uses the tree's inset and step so it lines up with folder rows at the same
+/// depth. While filtering, only rows whose subtree contains a hit survive and
+/// folders open themselves.
+fn tree_doc_rows(
+    project_id: &str,
+    entries: &[FsEntry],
+    depth: usize,
+    state: &ProjectsState,
+    t: &Tokens,
+    cx: &mut Context<AppShell>,
+) -> Vec<AnyElement> {
+    let filter = state.filter.trim().to_lowercase();
+    let project_dir = state.root.as_ref().map(|root| root.join(project_id));
+    let mut rows = Vec::new();
+    for entry in entries {
+        if !filter.is_empty() && !doc_entry_matches(entry, &filter) {
+            continue;
+        }
+        let key = format!("{project_id}:{}", entry.path.display());
+        let open = !filter.is_empty() || state.doc_folders_open.contains(&key);
+        let rel = project_dir
+            .as_ref()
+            .and_then(|dir| entry.path.strip_prefix(dir).ok())
+            .map(Path::to_path_buf);
+        let name = div()
+            .flex_1()
+            .truncate()
+            .text(Text::Small)
+            .text_color(t.text)
+            .child(entry.name.clone());
+        let mut row = div()
+            .id(format!("project-tree-doc-{key}"))
+            .test_support()
+            .mx(px(6.))
+            .h(px(24.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .rounded(px(4.))
+            .pl(px(TREE_BASE_INSET + depth as f32 * TREE_INDENT))
+            .pr(px(8.))
+            .cursor_pointer()
+            .hover(|style| style.bg(t.hover));
+        if entry.is_dir {
+            let toggle = key.clone();
+            row = row
+                .child(icon(
+                    if open {
+                        Icon::ChevronDown
+                    } else {
+                        Icon::ChevronRight
+                    },
+                    12.,
+                    t.text_faint,
+                ))
+                .child(icon(Icon::Folder, 14., t.text_muted))
+                .child(name)
+                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                    this.toggle_project_doc_folder(toggle.clone(), cx)
+                }));
+        } else if let Some(rel) = rel.filter(|rel| is_text_doc(rel)) {
+            let open_doc = rel.clone();
+            row = row
+                .child(div().w(px(12.)))
+                .child(icon(Icon::FileText, 14., t.text_muted))
+                .child(name)
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.open_project_doc(open_doc.clone(), window, cx)
+                }));
+        } else {
+            row = row
+                .child(div().w(px(12.)))
+                .child(icon(Icon::FileText, 14., t.text_muted))
+                .child(name)
+                .child(
+                    div()
+                        .text(Text::Micro)
+                        .text_color(t.text_faint)
+                        .child("external"),
+                );
+        }
+        rows.push(row.into_any_element());
+        if entry.is_dir
+            && open
+            && let Some(children) = &entry.children
+        {
+            rows.extend(tree_doc_rows(project_id, children, depth + 1, state, t, cx));
+        }
+    }
+    rows
+}
+
+/// A document entry survives the filter when its own name matches or any
+/// descendant does, so folders stay visible around a hit.
+fn doc_entry_matches(entry: &FsEntry, needle: &str) -> bool {
+    entry.name.to_lowercase().contains(needle)
+        || entry.children.as_deref().is_some_and(|children| {
+            children
+                .iter()
+                .any(|child| doc_entry_matches(child, needle))
+        })
+}
+
 fn archived_row(
     project: &Project,
     state: &ProjectsState,
@@ -934,30 +1398,34 @@ fn archived_row(
     div()
         .id(format!("project-archived-{}", project.id))
         .test_support()
-        .w_full()
+        .relative()
+        .mx(px(6.))
+        .h(px(26.))
         .flex()
         .items_center()
         .gap(px(6.))
-        .pl(px(10.))
+        .rounded(px(4.))
+        .pl(px(8.))
         .pr(px(8.))
-        .py(px(5.))
         .cursor_pointer()
-        .when(selected, |this| this.bg(t.selected))
+        .when(selected, |this| this.bg(t.surface_2))
+        .when(selected, |this| this.child(selected_marker(t)))
         .hover(|style| style.bg(t.hover))
-        .child(icon(Icon::FolderKanban, 13., t.text_faint))
-        .child(
-            div()
-                .text(Text::SmallStrong)
-                .text_color(t.text_muted)
-                .child(project.identifier.clone()),
-        )
+        .child(icon(Icon::FolderColumns, 14., t.text_faint))
         .child(
             div()
                 .flex_1()
                 .truncate()
                 .text(Text::Small)
-                .text_color(t.text_faint)
+                .text_color(t.text_muted)
                 .child(project.name.clone()),
+        )
+        .child(
+            div()
+                .flex_none()
+                .text(Text::Micro)
+                .text_color(t.text_ghost)
+                .child(project.identifier.clone()),
         )
         .tooltip(move |_window, cx| {
             cx.new(|_| NameTooltip {
@@ -973,6 +1441,16 @@ fn archived_row(
         .into_any_element()
 }
 
+fn count_projects(nodes: &[ProjectNode]) -> usize {
+    nodes
+        .iter()
+        .map(|node| match node {
+            ProjectNode::Project(_) => 1,
+            ProjectNode::Folder { children, .. } => count_projects(children),
+        })
+        .sum()
+}
+
 fn empty_row(message: &'static str, t: &Tokens) -> AnyElement {
     div()
         .px(px(12.))
@@ -981,6 +1459,42 @@ fn empty_row(message: &'static str, t: &Tokens) -> AnyElement {
         .text_color(t.text_faint)
         .child(message)
         .into_any_element()
+}
+
+/// A tree-header action with a tooltip and a disabled state.
+///
+/// The box and padding match [`tree_action`], so adding an action never
+/// changes the header's height or the 19 px rhythm. Disabled actions keep the
+/// same box and glyph size; only the colour dims and the hover/click handlers
+/// are dropped, so the row never reflows when a project is selected.
+fn header_action(
+    id: impl Into<gpui_kit::ElementId>,
+    glyph: Icon,
+    label: &'static str,
+    enabled: bool,
+    t: &Tokens,
+    listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let el = div()
+        .id(id)
+        .test_support()
+        .p(px(3.))
+        .rounded(px(4.))
+        .tooltip(move |_window, cx| {
+            cx.new(|_| NameTooltip {
+                label: label.to_string(),
+            })
+            .into()
+        });
+    let el = if enabled {
+        el.cursor_pointer()
+            .hover(|style| style.bg(t.hover))
+            .on_click(listener)
+            .child(icon(glyph, 13., t.text_muted))
+    } else {
+        el.child(icon(glyph, 13., t.text_ghost))
+    };
+    el.into_any_element()
 }
 
 fn tree_action(
@@ -998,29 +1512,6 @@ fn tree_action(
         .hover(|style| style.bg(t.hover))
         .on_click(listener)
         .child(icon(glyph, 13., t.text_muted))
-        .into_any_element()
-}
-
-fn view_chip(
-    id: impl Into<gpui_kit::ElementId>,
-    label: &'static str,
-    selected: bool,
-    t: &Tokens,
-    listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> AnyElement {
-    div()
-        .id(id)
-        .test_support()
-        .px(px(8.))
-        .py(px(3.))
-        .rounded(px(t.radius))
-        .cursor_pointer()
-        .when(selected, |this| this.bg(t.selected))
-        .hover(|style| style.bg(t.hover))
-        .text(Text::Small)
-        .text_color(if selected { t.text } else { t.text_muted })
-        .on_click(listener)
-        .child(label)
         .into_any_element()
 }
 
@@ -1042,9 +1533,9 @@ impl Render for ProjectDragGhost {
     }
 }
 
-/// Small floating label used as the project row's tooltip.
-struct NameTooltip {
-    label: String,
+/// Small floating label used as a row/tab tooltip.
+pub(crate) struct NameTooltip {
+    pub(crate) label: String,
 }
 
 impl Render for NameTooltip {
@@ -1069,9 +1560,9 @@ impl Render for NameTooltip {
 fn detail_pane(
     state: &ProjectsState,
     board: Option<&BoardWithColumns>,
-    drop_target: Option<&DropTarget>,
-    dragging: Option<&str>,
+    drag: tasks::BoardDrag<'_>,
     t: &Tokens,
+    window: &Window,
     cx: &mut Context<AppShell>,
 ) -> AnyElement {
     let mut body = div()
@@ -1095,16 +1586,12 @@ fn detail_pane(
             .into_any_element();
     }
 
-    let mut strip = div()
-        .id("project-tabs")
-        .test_support()
-        .flex()
-        .items_center()
-        .gap(px(2.))
-        .px(px(8.))
-        .py(px(4.))
-        .border_b_1()
-        .border_color(t.divider);
+    let mut strip = crate::views::tab_strip(t);
+    // Pinned pages and open documents share the one segment row; the pinned
+    // pair never shrinks or scrolls, the documents scroll inside their own
+    // lane once the row runs out of width.
+    let mut pinned: Vec<AnyElement> = Vec::new();
+    let mut documents: Vec<AnyElement> = Vec::new();
     for (index, tab) in state.tabs.iter().enumerate() {
         let active = state.active == index;
         let (label, closable) = match tab {
@@ -1112,30 +1599,25 @@ fn detail_pane(
             ProjectTab::Tasks => ("Tasks".to_string(), false),
             ProjectTab::Doc(doc) => (doc.name.clone(), true),
         };
-        let mut item = div()
-            .id(format!("project-tab-{index}"))
+        let mut item = crate::views::pane_tab(format!("project-tab-{index}"), active, t)
             .test_support()
-            .flex()
-            .items_center()
-            .gap(px(6.))
-            .px(px(8.))
-            .py(px(3.))
-            .rounded(px(t.radius))
-            .when(active, |this| this.bg(t.selected))
-            .hover(|style| style.bg(t.hover))
             .cursor_pointer()
+            .hover(|style| style.bg(t.hover))
             .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                 this.activate_project_tab(index, cx)
-            }))
-            .child(
-                div()
-                    .text(Text::Small)
-                    .text_color(if active { t.text } else { t.text_muted })
-                    .child(label),
-            );
+            }));
+        if matches!(tab, ProjectTab::Doc(_)) {
+            item = item.child(icon(Icon::FileText, 12., t.text_faint));
+        }
+        item = item.child(
+            div()
+                .text(Text::Small)
+                .text_color(if active { t.text } else { t.text_faint })
+                .child(label),
+        );
         if let ProjectTab::Doc(doc) = tab {
             if doc.dirty {
-                item = item.child(div().size(px(4.)).rounded(px(2.)).bg(t.accent));
+                item = item.child(div().size(px(3.)).rounded(px(2.)).bg(t.accent));
             }
             if closable {
                 item = item.child(
@@ -1148,16 +1630,43 @@ fn detail_pane(
                             cx.stop_propagation();
                             this.close_project_doc(index, cx)
                         }))
-                        .child(icon(Icon::X, 11., t.text_faint)),
+                        .child(icon(Icon::X, 10., t.text_faint)),
                 );
             }
         }
-        strip = strip.child(item);
+        if index < 2 {
+            pinned.push(item.into_any_element());
+        } else {
+            documents.push(item.into_any_element());
+        }
     }
+    strip = strip.child(
+        div()
+            .flex()
+            .items_stretch()
+            .flex_shrink_0()
+            .children(pinned),
+    );
+    if !documents.is_empty() {
+        strip = strip.child(
+            div()
+                .id("project-tab-documents")
+                .test_support()
+                .flex()
+                .items_stretch()
+                .flex_shrink(1.)
+                .min_w(px(0.))
+                .overflow_x_scroll()
+                .children(documents),
+        );
+    }
+    strip = strip.child(div().flex_1());
     body = body.child(strip);
 
     match state.active_tab() {
-        Some(ProjectTab::Overview) => body.child(overview_panel(state, t, cx)).into_any_element(),
+        Some(ProjectTab::Overview) => body
+            .child(overview_panel(state, t, window, cx))
+            .into_any_element(),
         Some(ProjectTab::Tasks) => {
             let content = match (state.detail.as_ref(), board) {
                 (Some(_), Some(board)) => div()
@@ -1165,7 +1674,20 @@ fn detail_pane(
                     .test_support()
                     .flex_1()
                     .min_h_0()
-                    .child(tasks::board_view(board, drop_target, dragging, t, cx))
+                    // Project boards create cards through the card modal, so
+                    // the board surface never shows an add row here.
+                    .child(tasks::board_view(
+                        board,
+                        drag,
+                        tasks::AddCard {
+                            allowed: false,
+                            form: None,
+                        },
+                        "",
+                        None,
+                        t,
+                        cx,
+                    ))
                     .into_any_element(),
                 _ => placeholder::message(
                     "project-task-loading",
@@ -1178,82 +1700,75 @@ fn detail_pane(
             };
             body.child(content).into_any_element()
         }
-        Some(ProjectTab::Doc(_)) => body.child(doc_body(state, t, cx)).into_any_element(),
+        Some(ProjectTab::Doc(_)) => body
+            .child(doc_body(state, t, window, cx))
+            .into_any_element(),
         None => body.into_any_element(),
     }
 }
 
-fn overview_panel(state: &ProjectsState, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
+fn overview_panel(
+    state: &ProjectsState,
+    t: &Tokens,
+    window: &Window,
+    cx: &mut Context<AppShell>,
+) -> AnyElement {
     let Some(project) = &state.detail else {
         return div().into_any_element();
     };
     let archived = find_project(&state.tree, &project.id).is_none();
 
+    // One measure for the whole page: the panel caps at 880 px and every block
+    // below fills its 26 px-inset content box, so their right edges line up.
     let mut panel = div()
         .id("project-overview")
         .test_support()
         .flex_1()
         .min_h_0()
         .overflow_y_scroll()
-        .p(px(20.))
+        .px(px(26.))
+        .pt(px(22.))
+        .pb(px(16.))
         .flex()
         .flex_col()
-        .gap(px(14.));
+        .gap(px(15.))
+        .max_w(px(880.));
 
-    // Title row: inline editor on double-click, otherwise the name.
+    // Title row: a plain label that turns into the inline editor on
+    // double-click. There is no edit button; the field autosaves while typing
+    // and commits on Enter or blur, while Esc restores the previous name.
     let editing_title = state
         .title_edit
         .as_ref()
         .is_some_and(|edit| edit.project_id == project.id);
-    let mut title_row =
-        div()
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .child(icon(Icon::FolderKanban, 18., t.text_muted));
+    let mut title_row = div().flex().items_center().gap(px(9.));
     if editing_title {
         let input = state.title_edit.as_ref().map(|edit| edit.input.clone());
         if let Some(input) = input {
             title_row = title_row
-                .child(div().flex_1().child(Input::new(&input)))
+                .child(div().flex_1().child(crate::views::field_input(&input, t)))
                 .capture_key_down(cx.listener(|this, event, window, cx| {
                     this.handle_project_title_key(event, window, cx)
-                }))
-                .child(action_button(
-                    "project-title-save",
-                    "Save",
-                    t,
-                    cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.commit_project_title(window, cx)
-                    }),
-                ));
+                }));
         }
     } else {
         let id = project.id.clone();
-        let edit_id = project.id.clone();
-        title_row = title_row
-            .child(
-                div()
-                    .id("project-title-name")
-                    .test_support()
-                    .flex_1()
-                    .text(Text::Heading)
-                    .text_color(t.text)
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.project_title_clicked(&id, window, cx)
-                    }))
-                    .child(project.name.clone()),
-            )
-            .child(tree_action(
-                "project-title-edit",
-                Icon::Pencil,
-                t,
-                cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.begin_project_title_edit(&edit_id, window, cx)
-                }),
-            ));
+        title_row = title_row.child(
+            div()
+                .id("project-title-name")
+                .test_support()
+                .flex_1()
+                .text(Text::Display)
+                .text_color(t.text)
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.project_title_clicked(&id, window, cx)
+                }))
+                .child(project.name.clone()),
+        );
     }
+    // Archived projects keep their Restore action here; Archive and Delete
+    // live at the bottom of the page.
     if archived {
         title_row = title_row.child(action_button(
             "project-restore",
@@ -1261,121 +1776,258 @@ fn overview_panel(state: &ProjectsState, t: &Tokens, cx: &mut Context<AppShell>)
             t,
             cx.listener(|this, _: &ClickEvent, _window, cx| this.restore_selected_project(cx)),
         ));
-    } else {
-        title_row = title_row.child(action_button(
+    }
+    // Title block: the title owns its row and the identifier group sits
+    // directly beneath it at the same left edge.
+    let mut title_block = div()
+        .id("project-title-block")
+        .test_support()
+        .flex()
+        .flex_col()
+        .gap(px(10.))
+        .child(title_row);
+    // The Overview scrolls as one page, so a flexed field inside it would
+    // collapse. Size the description from the window instead: it grows on tall
+    // windows, shrinks on short ones, and the page keeps its scroll and pinned
+    // Archive/Delete pair.
+    let desc_h = (f32::from(window.viewport_size().height) * 0.32).clamp(180., 420.);
+    if let Some(editor) = &state.detail_editor {
+        // Identifier: a normal field sized for about 24 monospace characters.
+        // It only writes through the Save button, which appears while the
+        // value differs from the persisted one. The validation message sits on
+        // its own line below the field, not inside the row.
+        let mut identifier_row = div()
+            .id("project-identifier")
+            .test_support()
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .capture_key_down(
+                cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
+                    if event.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        this.cancel_project_identifier(window, cx);
+                    }
+                }),
+            )
+            .child(
+                div()
+                    .w(px(92.))
+                    .text(Text::Small)
+                    .text_color(t.text_faint)
+                    .child("Identifier"),
+            )
+            .child(
+                div()
+                    .w(px(210.))
+                    .child(crate::views::field_input(&editor.identifier, t)),
+            );
+        if editor.identifier_dirty {
+            identifier_row = identifier_row.child(action_button(
+                "project-identifier-save",
+                "Save",
+                t,
+                cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.save_project_identifier(window, cx)
+                }),
+            ));
+        }
+        title_block = title_block.child(identifier_row);
+        if let Some(error) = &editor.identifier_error {
+            title_block = title_block.child(
+                div()
+                    .id("project-identifier-error")
+                    .test_support()
+                    // Aligns under the field: caption width plus the row gap.
+                    .pl(px(92. + 12.))
+                    .text(Text::Small)
+                    .text_color(t.danger)
+                    .child(error.clone()),
+            );
+        }
+    }
+    panel = panel.child(title_block);
+
+    // Status: one three-option segmented control, the same control language as
+    // the Edit | Preview switch.
+    let mut status_row = div().flex().items_center().gap(px(12.)).child(
+        div()
+            .w(px(92.))
+            .text(Text::Small)
+            .text_color(t.text_faint)
+            .child("Status"),
+    );
+    let mut status_group = div()
+        .flex()
+        .items_center()
+        .gap(px(2.))
+        .p(px(2.))
+        .rounded(px(7.))
+        .bg(t.hover);
+    for (key, label) in PROJECT_STATUSES {
+        status_group = status_group.child(crate::views::segmented_option(
+            format!("project-status-{key}"),
+            label,
+            project.status == key,
+            false,
+            t,
+            cx.listener(move |this, _: &ClickEvent, _window, cx| this.set_project_status(key, cx)),
+        ));
+    }
+    status_row = status_row.child(status_group);
+    panel = panel.child(status_row);
+
+    panel = panel.child(folders_list(state, t, cx));
+
+    if let Some(summary) = &state.summary {
+        let cells = [
+            (summary.todo, "TO DO"),
+            (summary.in_progress, "IN PROGRESS"),
+            (summary.done, "DONE"),
+            (summary.total, "TOTAL"),
+            (summary.file_count as i64, "FILES"),
+        ];
+        let mut strip = div()
+            .id("project-summary")
+            .test_support()
+            .flex()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(t.border)
+            .bg(t.card)
+            .overflow_hidden();
+        for (index, (value, label)) in cells.into_iter().enumerate() {
+            let mut cell = div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .px(px(13.))
+                .pt(px(9.))
+                .pb(px(10.));
+            if index < cells.len() - 1 {
+                cell = cell.border_r_1().border_color(t.border);
+            }
+            strip = strip.child(
+                cell.child(
+                    div()
+                        .text(Text::Metric)
+                        .text_color(t.text)
+                        .child(value.to_string()),
+                )
+                .child(
+                    div()
+                        .text(Text::Label)
+                        .text_color(t.text_faint)
+                        .child(label),
+                ),
+            );
+        }
+        panel = panel.child(strip);
+    }
+
+    if let Some(editor) = &state.detail_editor {
+        // The description autosaves (debounced, flushed on blur and on leaving
+        // the project or section) and has no vim mode and no Save button: the
+        // field is the only surface. The compact Edit | Preview switch is
+        // right-aligned on the row above the field, so its trailing edge lines
+        // up with the field's.
+        let preview = editor.preview;
+        let description_text = editor.description.read(cx).value().to_string();
+        panel = panel
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .w(px(92.))
+                            .text(Text::Small)
+                            .text_color(t.text_faint)
+                            .child("Description"),
+                    )
+                    .child(div().flex_1())
+                    .child(crate::views::mode_switch_compact(
+                        "project-description-toggle",
+                        preview,
+                        t,
+                        cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.set_project_description_preview(false, cx)
+                        }),
+                        cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.set_project_description_preview(true, cx)
+                        }),
+                    )),
+            )
+            .child(
+                div()
+                    .id("project-description")
+                    .test_support()
+                    .h(px(desc_h))
+                    .when(preview, |this| {
+                        this.child(
+                            div()
+                                .id("project-description-preview")
+                                .test_support()
+                                .w_full()
+                                .h(px(desc_h))
+                                .rounded(px(t.radius))
+                                .bg(t.field)
+                                .border_1()
+                                .border_color(t.border)
+                                .p(px(8.))
+                                .overflow_y_scroll()
+                                .text(Text::Body)
+                                .text_color(t.text)
+                                .when(description_text.trim().is_empty(), |this| {
+                                    this.child(
+                                        div()
+                                            .text(Text::Small)
+                                            .text_color(t.text_faint)
+                                            .child("Nothing to preview."),
+                                    )
+                                })
+                                .when(!description_text.trim().is_empty(), |this| {
+                                    this.child(markdown(description_text.as_str()))
+                                }),
+                        )
+                    })
+                    .when(!preview, |this| {
+                        this.child(
+                            crate::views::field_textarea(&editor.description, t).h(px(desc_h)),
+                        )
+                    }),
+            );
+    }
+
+    panel = panel.child(documents_panel(state, project, archived, t, cx));
+
+    // Archive and Delete sit at the bottom of the page. The spacer above them
+    // absorbs the leftover height on short pages so the pair never floats
+    // mid-page; it collapses to nothing once the content overflows.
+    panel = panel.child(div().flex_1().min_h(px(12.)));
+    let mut actions = div()
+        .id("project-actions")
+        .test_support()
+        .flex()
+        .items_center()
+        .gap(px(8.));
+    if !archived {
+        actions = actions.child(action_button(
             "project-archive",
             "Archive",
             t,
             cx.listener(|this, _: &ClickEvent, _window, cx| this.archive_selected_project(cx)),
         ));
     }
-    title_row = title_row.child(action_button(
+    actions = actions.child(action_button_danger(
         "project-delete",
         "Delete",
         t,
         cx.listener(|this, _: &ClickEvent, _window, cx| this.ask_delete_selected_project(cx)),
     ));
-    panel = panel.child(title_row);
-
-    // Status chips.
-    let mut status_row = div().flex().items_center().gap(px(6.)).child(
-        div()
-            .w(px(80.))
-            .text(Text::Small)
-            .text_color(t.text_muted)
-            .child("Status"),
-    );
-    for (key, label) in PROJECT_STATUSES {
-        let selected = project.status == key;
-        status_row = status_row.child(view_chip(
-            format!("project-status-{key}"),
-            label,
-            selected,
-            t,
-            cx.listener(move |this, _: &ClickEvent, _window, cx| this.set_project_status(key, cx)),
-        ));
-    }
-    panel = panel.child(status_row);
-
-    if let Some(editor) = &state.detail_editor {
-        panel = panel
-            .child(field_row(
-                "project-identifier",
-                "Identifier",
-                &editor.identifier,
-                t,
-            ))
-            .child(field_row("project-source", "Source", &editor.source, t))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(action_button(
-                        "project-save-fields",
-                        "Save fields",
-                        t,
-                        cx.listener(|this, _: &ClickEvent, _window, cx| {
-                            this.save_project_fields(cx)
-                        }),
-                    ))
-                    .child(
-                        div()
-                            .text(Text::Small)
-                            .text_color(t.text_faint)
-                            .child("Saving the identifier locks it against renames."),
-                    ),
-            );
-    }
-
-    if let Some(summary) = &state.summary {
-        panel = panel.child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(12.))
-                .text(Text::Small)
-                .text_color(t.text_muted)
-                .child(format!("To do {}", summary.todo))
-                .child(format!("In progress {}", summary.in_progress))
-                .child(format!("Done {}", summary.done))
-                .child(format!("Total {}", summary.total))
-                .child(format!("Files {}", summary.file_count)),
-        );
-    }
-
-    if let Some(editor) = &state.detail_editor {
-        panel = panel
-            .child(vim_strip(
-                &editor.vim,
-                "project-description-vim-toggle",
-                "Esc normal · i insert",
-                t,
-                cx,
-            ))
-            .child(
-                div()
-                    .id("project-description")
-                    .test_support()
-                    .h(px(150.))
-                    .rounded(px(t.radius))
-                    .border_1()
-                    .border_color(t.border)
-                    .p(px(8.))
-                    .child(Textarea::new(&editor.description).readonly(!editor.vim.is_insert()))
-                    .capture_key_down(cx.listener(|this, event, window, cx| {
-                        this.handle_project_description_key(event, window, cx)
-                    })),
-            )
-            .child(action_button(
-                "project-save-description",
-                "Save description",
-                t,
-                cx.listener(|this, _: &ClickEvent, _window, cx| this.save_project_description(cx)),
-            ));
-    }
-
-    panel = panel.child(documents_panel(state, project, t, cx));
+    panel = panel.child(actions);
 
     if let Some(confirm) = &state.confirm {
         panel = panel.child(confirm_bar(confirm, t, cx));
@@ -1383,27 +2035,123 @@ fn overview_panel(state: &ProjectsState, t: &Tokens, cx: &mut Context<AppShell>)
     panel.into_any_element()
 }
 
-fn field_row(
-    id: &'static str,
-    label: &'static str,
-    input: &Entity<InputState>,
-    t: &Tokens,
-) -> AnyElement {
-    div()
-        .id(id)
+/// Folder references attached to the selected project.
+///
+/// Each row shows one path (middle-ellipsized so long paths never wrap), a
+/// remove button, and an "Add folder" action that opens a native picker.
+/// Removing a row only drops the reference; the folder on disk is untouched.
+fn folders_list(state: &ProjectsState, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
+    let mut column = div().flex().items_start().gap(px(12.)).child(
+        div()
+            .w(px(92.))
+            .pt(px(4.))
+            .text(Text::Small)
+            .text_color(t.text_faint)
+            .child("Folders"),
+    );
+    let mut rows = div()
+        .id("project-folders")
         .test_support()
+        .flex_1()
+        .min_w(px(0.))
         .flex()
-        .items_center()
-        .gap(px(8.))
-        .child(
+        .flex_col()
+        .gap(px(4.));
+    if state.paths.is_empty() {
+        // One actionable line rather than a bare button under a blank slot.
+        rows = rows.child(
             div()
-                .w(px(80.))
-                .text(Text::Small)
-                .text_color(t.text_muted)
-                .child(label),
-        )
-        .child(div().flex_1().child(Input::new(input)))
-        .into_any_element()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .min_h(px(26.))
+                .child(
+                    div()
+                        .text(Text::Small)
+                        .text_color(t.text_faint)
+                        .child("No folders yet"),
+                )
+                .child(action_button(
+                    "project-folder-add",
+                    "Add folder",
+                    t,
+                    cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.add_project_folder(window, cx)
+                    }),
+                )),
+        );
+    } else {
+        for path in &state.paths {
+            let path_id = path.id.clone();
+            rows = rows.child(
+                div()
+                    .id(format!("project-folder-{}", path.id))
+                    .test_support()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.))
+                    .px(px(8.))
+                    .py(px(4.))
+                    .rounded(px(t.radius))
+                    .bg(t.card)
+                    .child(icon(Icon::Folder, 12., t.text_faint))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text(Text::Monospace)
+                            .text_color(t.text_muted)
+                            .child(ellipsize_middle(&path.path, 64)),
+                    )
+                    .tooltip({
+                        let full = path.path.clone();
+                        move |_window, cx| {
+                            cx.new(|_| NameTooltip {
+                                label: full.clone(),
+                            })
+                            .into()
+                        }
+                    })
+                    .child(
+                        div()
+                            .id(format!("project-folder-remove-{}", path.id))
+                            .p(px(2.))
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(t.pressed))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                                this.remove_project_folder(&path_id, cx)
+                            }))
+                            .child(icon(Icon::X, 11., t.text_faint)),
+                    ),
+            );
+        }
+        rows = rows.child(action_button(
+            "project-folder-add",
+            "Add folder",
+            t,
+            cx.listener(|this, _: &ClickEvent, window, cx| this.add_project_folder(window, cx)),
+        ));
+    }
+    column = column.child(rows);
+    column.into_any_element()
+}
+
+/// Shorten a path for display by removing characters from the middle, keeping
+/// the beginning and end readable. Full paths are available in the tooltip.
+pub(crate) fn ellipsize_middle(path: &str, max: usize) -> String {
+    let count = path.chars().count();
+    if count <= max {
+        return path.to_string();
+    }
+    let keep = (max.saturating_sub(1)) / 2;
+    let head: String = path.chars().take(keep).collect();
+    let tail: String = path
+        .chars()
+        .skip(count.saturating_sub(max.saturating_sub(1) - keep))
+        .collect();
+    format!("{head}…{tail}")
 }
 
 fn action_button(
@@ -1432,74 +2180,26 @@ fn action_button(
         .into_any_element()
 }
 
-fn vim_strip(
-    vim: &VimSession,
-    toggle_id: &'static str,
-    hint: &'static str,
+/// Destructive variant of [`action_button`]: same box, danger text.
+fn action_button_danger(
+    id: &'static str,
+    label: &'static str,
     t: &Tokens,
-    cx: &mut Context<AppShell>,
+    listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
-    let enabled = vim.is_enabled();
-    let mut row = div()
-        .id("project-mode")
+    div()
+        .id(id)
         .test_support()
-        .flex()
-        .items_center()
-        .gap(px(8.))
-        .child(
-            div()
-                .id(toggle_id)
-                .test_support()
-                .px(px(6.))
-                .py(px(1.))
-                .rounded(px(4.))
-                .bg(t.panel)
-                .text(Text::SmallStrong)
-                .text_color(if enabled { t.text_muted } else { t.text_faint })
-                .cursor_pointer()
-                .hover(|style| style.bg(t.hover))
-                .child(vim.mode_label())
-                .on_click(
-                    cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_vim_mode(cx)),
-                ),
-        );
-    if let Some(line) = vim.ex_line() {
-        row = row.child(
-            div()
-                .text(Text::Small)
-                .text_color(t.text)
-                .child(line.to_string()),
-        );
-    } else if let Some(error) = vim.ex_error() {
-        row = row.child(
-            div()
-                .text(Text::Small)
-                .text_color(t.danger)
-                .child(error.to_string()),
-        );
-    } else {
-        let pending = vim.pending();
-        if !pending.is_empty() {
-            row = row.child(
-                div()
-                    .text(Text::Small)
-                    .text_color(t.text_muted)
-                    .child(pending),
-            );
-        }
-    }
-    row.child(
-        div()
-            .flex_1()
-            .text(Text::Small)
-            .text_color(t.text_faint)
-            .child(if enabled {
-                hint
-            } else {
-                "click the badge for vim"
-            }),
-    )
-    .into_any_element()
+        .px(px(8.))
+        .py(px(3.))
+        .rounded(px(t.radius))
+        .border_1()
+        .border_color(t.border)
+        .cursor_pointer()
+        .hover(|style| style.bg(t.hover))
+        .on_click(listener)
+        .child(div().text(Text::Small).text_color(t.danger).child(label))
+        .into_any_element()
 }
 
 fn confirm_bar(confirm: &ProjectConfirm, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
@@ -1550,9 +2250,11 @@ fn confirm_bar(confirm: &ProjectConfirm, t: &Tokens, cx: &mut Context<AppShell>)
 fn documents_panel(
     state: &ProjectsState,
     project: &Project,
+    archived: bool,
     t: &Tokens,
     cx: &mut Context<AppShell>,
 ) -> AnyElement {
+    let editable = !archived;
     let mut panel = div()
         .id("project-documents")
         .test_support()
@@ -1571,20 +2273,35 @@ fn documents_panel(
                         .text_color(t.text)
                         .child("Documents"),
                 )
-                .child(tree_action(
+                // Same order as the tree header: folder, file, upload.
+                .child(header_action(
                     "project-doc-new-folder",
                     Icon::FolderPlus,
+                    "New folder",
+                    editable,
                     t,
                     cx.listener(|this, _: &ClickEvent, window, cx| {
                         this.begin_project_doc_draft(DocDraftKind::Folder, window, cx)
                     }),
                 ))
-                .child(tree_action(
+                .child(header_action(
                     "project-doc-new-file",
                     Icon::FilePlus,
+                    "New file",
+                    editable,
                     t,
                     cx.listener(|this, _: &ClickEvent, window, cx| {
                         this.begin_project_doc_draft(DocDraftKind::File, window, cx)
+                    }),
+                ))
+                .child(header_action(
+                    "project-doc-upload",
+                    Icon::Upload,
+                    "Upload",
+                    editable,
+                    t,
+                    cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.upload_project_documents(window, cx)
                     }),
                 )),
         );
@@ -1614,7 +2331,7 @@ fn documents_panel(
                         .text_color(t.text_muted)
                         .child(label),
                 )
-                .child(Input::new(&draft.input)),
+                .child(crate::views::field_input(&draft.input, t)),
         );
     }
 
@@ -1657,12 +2374,12 @@ fn doc_rows(
             .id(row_id.clone())
             .test_support()
             .w_full()
+            .h(px(26.))
             .flex()
             .items_center()
-            .gap(px(6.))
+            .gap(px(7.))
             .pl(px(8.0 + depth as f32 * 14.0))
-            .pr(px(6.))
-            .py(px(3.))
+            .pr(px(8.))
             .rounded(px(4.))
             .hover(|style| style.bg(t.hover))
             .child(icon(
@@ -1673,6 +2390,8 @@ fn doc_rows(
             .child(
                 div()
                     .flex_1()
+                    .min_w(px(0.))
+                    .overflow_hidden()
                     .text(Text::Small)
                     .text_color(t.text)
                     .child(name),
@@ -1709,16 +2428,13 @@ fn doc_rows(
                 ));
         } else if let Some(rel) = rel.filter(|rel| is_text_doc(rel)) {
             let open = rel.clone();
-            row = row.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                this.open_project_doc(open.clone(), window, cx)
-            }));
+            row = row.child(doc_tag("MD", t)).on_click(cx.listener(
+                move |this, _: &ClickEvent, window, cx| {
+                    this.open_project_doc(open.clone(), window, cx)
+                },
+            ));
         } else {
-            row = row.child(
-                div()
-                    .text(Text::Small)
-                    .text_color(t.text_faint)
-                    .child("external"),
-            );
+            row = row.child(doc_tag("EXTERNAL", t));
         }
         rows.push(row.into_any_element());
         if is_dir && let Some(children) = &entry.children {
@@ -1726,6 +2442,16 @@ fn doc_rows(
         }
     }
     rows
+}
+
+/// Trailing tag on a document row, right-aligned after the flexible name.
+fn doc_tag(label: &'static str, t: &Tokens) -> AnyElement {
+    div()
+        .flex_none()
+        .text(Text::Micro)
+        .text_color(t.text_ghost)
+        .child(label)
+        .into_any_element()
 }
 
 fn is_text_doc(path: &Path) -> bool {
@@ -1738,7 +2464,12 @@ fn is_text_doc(path: &Path) -> bool {
     )
 }
 
-fn doc_body(state: &ProjectsState, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
+fn doc_body(
+    state: &ProjectsState,
+    t: &Tokens,
+    window: &Window,
+    cx: &mut Context<AppShell>,
+) -> AnyElement {
     let Some(tab) = state.active_doc() else {
         return div().into_any_element();
     };
@@ -1749,28 +2480,38 @@ fn doc_body(state: &ProjectsState, t: &Tokens, cx: &mut Context<AppShell>) -> An
         .min_h_0()
         .flex()
         .flex_col();
+    let tab_preview = tab.preview;
     body = body.child(
         div()
+            .h(px(40.))
+            .flex_none()
             .flex()
             .items_center()
             .gap(px(8.))
-            .px(px(12.))
-            .py(px(3.))
+            .px(px(14.))
             .border_b_1()
             .border_color(t.divider)
-            .child(vim_strip(
-                &tab.vim,
-                "project-doc-vim-toggle",
-                "Esc normal · i insert · :w save · :q close",
+            .child(crate::views::path_label(
+                "project-doc-path",
+                tab.rel.display().to_string(),
                 t,
                 cx,
             ))
-            .child(action_button(
+            .child(div().flex_1())
+            .child(crate::views::vim_indicator("project-doc-vim", &tab.vim, t))
+            .child(crate::views::mode_switch(
                 "project-doc-preview",
-                if tab.preview { "Edit" } else { "Preview" },
+                tab.preview,
                 t,
-                cx.listener(|this, _: &ClickEvent, window, cx| {
-                    this.toggle_project_doc_preview(window, cx)
+                cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    if tab_preview {
+                        this.toggle_project_doc_preview(window, cx);
+                    }
+                }),
+                cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    if !tab_preview {
+                        this.toggle_project_doc_preview(window, cx);
+                    }
                 }),
             )),
     );
@@ -1788,6 +2529,7 @@ fn doc_body(state: &ProjectsState, t: &Tokens, cx: &mut Context<AppShell>) -> An
                 .child(markdown(text.as_str())),
         );
     } else {
+        let lines = tab.editor.read(cx).value().lines().count();
         body = body
             .child(
                 div()
@@ -1795,14 +2537,75 @@ fn doc_body(state: &ProjectsState, t: &Tokens, cx: &mut Context<AppShell>) -> An
                     .test_support()
                     .flex_1()
                     .min_h_0()
-                    .p(px(12.))
-                    .child(Textarea::new(&tab.editor).readonly(!tab.vim.is_insert())),
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .relative()
+                            .w_full()
+                            .flex_1()
+                            .min_h_0()
+                            .child(
+                                div().absolute().inset_0().child(
+                                    // Multi-line inputs auto-size to their
+                                    // content; pin the editor to the wrapper.
+                                    Editor::new(&tab.editor)
+                                        .h(relative(1.))
+                                        .bordered(false)
+                                        .readonly(!tab.vim.is_insert()),
+                                ),
+                            )
+                            .child(crate::views::gutter_rule(lines, t, window)),
+                    ),
             )
             .capture_key_down(cx.listener(|this, event, window, cx| {
                 this.handle_project_doc_key(event, window, cx)
             }));
     }
+    body = body.child(doc_status_bar(tab, t, cx));
     body.into_any_element()
+}
+
+/// The project document's bottom status bar, matching Notes and Documents.
+fn doc_status_bar(tab: &ProjectDocTab, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
+    let preview = tab.preview;
+    let position = tab.editor.read(cx).cursor_position();
+    let words = tab.editor.read(cx).value().split_whitespace().count();
+    let pending = if preview {
+        None
+    } else if let Some(line) = tab.vim.ex_line() {
+        Some((line.to_string(), false))
+    } else if let Some(error) = tab.vim.ex_error() {
+        Some((error.to_string(), true))
+    } else {
+        let pending = tab.vim.pending();
+        (!pending.is_empty()).then_some((pending, false))
+    };
+    crate::views::editor_status_bar(
+        "project-doc-status",
+        crate::views::EditorStatus {
+            mode: if preview {
+                "PREVIEW"
+            } else {
+                tab.vim.mode_label()
+            },
+            vim: tab.vim.is_enabled(),
+            pending,
+            line: position.line as usize + 1,
+            column: position.character as usize + 1,
+            words,
+            dirty: tab.dirty,
+            hint: if preview {
+                "660 px measure"
+            } else if tab.vim.is_enabled() {
+                "Esc normal · i insert · :w save · :q close"
+            } else {
+                "click the badge for vim"
+            },
+        },
+        t,
+        cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_vim_mode(cx)),
+    )
 }
 
 // ---------------------------------------------------------------------------

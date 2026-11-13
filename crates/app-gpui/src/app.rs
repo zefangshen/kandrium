@@ -4,30 +4,36 @@
 //! Tasks, Clocks, Notes and Documents read and write the real data; Projects
 //! is the last section still on the placeholder.
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_kit::TestSupportExt;
-use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
+use gpui_kit::component::input::{EditorState, InputEvent, InputState, TextareaState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, ClickEvent, Context, DragMoveEvent, Entity, Focusable, IntoElement, KeyDownEvent,
-    Pixels, Point, Render, RenderImage, Window, div, px,
+    Animation, AnimationExt, AnyElement, App, Bounds, ClickEvent, Context, DragMoveEvent, Entity,
+    FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseUpEvent,
+    Pixels, Point, Render, RenderImage, ScrollHandle, Window, div, px, rgba,
 };
 use jiff::Timestamp;
 use jiff::civil::Date;
-use kandrium_core::documents::{AnnotationDoc, AnnotationKind, new_annotation};
+use kandrium_core::documents::{AnnotationDoc, AnnotationKind, import_file, new_annotation};
 use kandrium_core::{
-    ALL_BOARD_ID, Board, BoardWithColumns, CardStatus, CreateCardBody, Person, ProjectChoice,
-    Travel, day_end_seconds, day_start_seconds,
+    ALL_BOARD_ID, ArchivedCard, Board, BoardWithColumns, Card, CardStatus, CreateCardBody, Person,
+    ProjectChoice, Travel, day_end_seconds, day_start_seconds, project_dir,
 };
 use pdf_render::{Event as PdfEvent, PdfWorker};
 use smallvec::smallvec;
 
+use crate::anim::{SNAP_BACK, ease_snap, eased};
 use crate::assets::{Icon, icon};
 use crate::settings::{self, TreePanel};
 use crate::store::Store;
 use crate::theme::{Text, TextStyled, Tokens};
+use crate::views::archive;
 use crate::views::card_modal::{self, EditSession, ModalContext};
 use crate::views::clocks::{
     self, ClockDrag, ClockState, ConfirmKind, ConfirmState, DragState, FormKind, FormState,
@@ -40,7 +46,9 @@ use crate::views::projects::{
     ProjectConfirm, ProjectConfirmKind, ProjectDocTab, ProjectDraft, ProjectDraftKind, ProjectTab,
     ProjectsState, TitleEdit as ProjectTitleEdit, folder_name, project_folder, sibling_projects,
 };
-use crate::views::tasks::DropTarget;
+use crate::views::tasks::{
+    COLUMN_W, CardMetrics, DropTarget, GAP_FALLBACK, SLOT_H, card_body, title_row,
+};
 use crate::views::{
     notes::{self, DraftKind, NameDraft, NoteTab, NotesState},
     placeholder, tasks,
@@ -96,11 +104,11 @@ impl Section {
 
     pub fn icon(self) -> Icon {
         match self {
-            Section::Tasks => Icon::FolderKanban,
+            Section::Tasks => Icon::SquareKanban,
             Section::Clocks => Icon::Globe,
             Section::Notes => Icon::StickyNote,
             Section::Documents => Icon::FileText,
-            Section::Projects => Icon::Folder,
+            Section::Projects => Icon::FolderKanban,
         }
     }
 }
@@ -109,6 +117,52 @@ impl std::fmt::Display for Section {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.label())
     }
+}
+
+/// The inline "+ Add card" draft open on one column of a normal Tasks board.
+pub(crate) struct AddCardForm {
+    pub column_id: String,
+    pub input: Entity<InputState>,
+}
+
+/// The inline title editor open on one card row.
+pub(crate) struct CardTitleEdit {
+    pub card_id: String,
+    /// Title the card had when the editor opened; Esc and empty drafts keep it.
+    pub original: String,
+    pub input: Entity<InputState>,
+}
+
+/// The card right-click menu, anchored at the pointer.
+pub(crate) struct CardMenu {
+    pub card_id: String,
+    pub position: Point<Pixels>,
+}
+
+/// A pending destructive card action, shown as a confirmation dialog.
+pub(crate) struct CardConfirm {
+    pub card_id: String,
+    pub title: &'static str,
+    pub message: &'static str,
+    /// Delete runs from the Archived page rather than a board row.
+    pub from_archive: bool,
+}
+
+/// The shell-owned ghost that flies to the destination after release.
+///
+/// gpui tears down its drag view on mouse-up, so the settle and snap-back
+/// flight is an overlay animated by the shell instead. It carries the source
+/// card's snapshot, not just its title: the overlay paints the same body as
+/// the resting card, so the meta row never blinks out between the drop and
+/// the settle.
+struct DragFlight {
+    card_id: String,
+    card: Card,
+    /// Release pointer, in window coordinates.
+    from: Point<Pixels>,
+    /// Destination insertion row, measured by the board.
+    to: Bounds<Pixels>,
+    token: u64,
 }
 
 /// Root view. Owns the database handles and the data each section renders.
@@ -122,11 +176,65 @@ pub struct AppShell {
     board: Option<BoardWithColumns>,
     board_error: Option<String>,
     drop_target: Option<DropTarget>,
+    /// The target the gap occupied before the latest change. The renderer
+    /// derives each displaced card's glide offset from the pair.
+    previous_target: Option<DropTarget>,
     dragging_card: Option<String>,
     drop_generation: u64,
+    /// Row height of the dragged card, and of the gap replacing it.
+    drag_gap_height: f32,
+    /// Where inside the card the drag was picked up, so the shell's flight
+    /// ghost starts exactly where gpui's drag view was.
+    drag_grab: Point<Pixels>,
+    /// The source card's rect and insertion point, for a snap-back.
+    drag_origin: Option<Bounds<Pixels>>,
+    drag_origin_target: Option<DropTarget>,
+    drag_flight: Option<DragFlight>,
+    drag_flight_token: u64,
+    /// Card that just landed, faded in once so the handoff from the ghost
+    /// does not pop.
+    settled_card: Option<(String, u64)>,
+    /// Row rects measured by the board.
+    drag_metrics: CardMetrics,
     editing: Option<EditSession>,
+    /// Open inline title editor on one card row, and the row under the
+    /// pointer whose hover pencil is showing.
+    title_edit: Option<CardTitleEdit>,
+    hovered_card: Option<String>,
+    /// The board strip's card search field, kept for the session so opening a
+    /// card and closing it again preserves the query.
+    board_search: Option<Entity<InputState>>,
+    /// Per-column card-list scroll handles, kept for the session so an offset
+    /// survives reloads, section switches and card round trips.
+    column_scrolls: HashMap<String, ScrollHandle>,
+    /// Pointer position during a card drag, written by the columns and read
+    /// while rendering to keep edge-scrolling while the pointer rests.
+    drag_pointer: Rc<Cell<Option<Point<Pixels>>>>,
+    /// Query of the last board render; a change resets the scrolled lists.
+    board_query: String,
+    /// Open card right-click menu and the delete confirmation.
+    card_menu: Option<CardMenu>,
+    card_menu_focus: Option<FocusHandle>,
+    card_confirm: Option<CardConfirm>,
+    card_confirm_focus: Option<FocusHandle>,
+    /// Archived tab selection and the page rows.
+    showing_archive: bool,
+    archive: Option<archive::ArchiveState>,
+    archive_cards: Option<Vec<ArchivedCard>>,
+    archive_error: Option<String>,
+    /// Window bounds of the archive board-filter trigger, published by the
+    /// page and consumed by the root-level filter menu overlay.
+    archive_filter_anchor: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    archive_filter_focus: Option<FocusHandle>,
+    /// Open "+ Add card" draft and the per-column stashed text.
+    add_card: Option<AddCardForm>,
+    add_card_drafts: HashMap<String, String>,
     project_choices: Vec<ProjectChoice>,
     pub(crate) clocks: ClockState,
+    /// Clock id shown in the titlebar; the persisted user pick.
+    titlebar_clock: Option<String>,
+    /// Whether the titlebar city menu is open.
+    titlebar_clock_menu: bool,
     /// Bumped to retarget or stop the minute tick.
     clock_tick: u64,
     /// Generation of the tick loop currently allowed to run.
@@ -149,6 +257,47 @@ pub struct AppShell {
     watcher_running: Option<u64>,
     /// An external change arrived mid-drag and is applied on a later frame.
     pending_sync: bool,
+}
+
+/// Native window drag for the titlebar row: a single press hands the window to
+/// the system move loop, a double click is the standard macOS zoom.
+fn titlebar_drag(event: &MouseDownEvent, window: &mut Window, _cx: &mut App) {
+    if event.click_count == 2 {
+        window.zoom_window();
+    } else {
+        window.start_window_move();
+    }
+}
+
+/// `Wed 11 Nov 8:13 pm` in the given zone: three-letter weekday, day without
+/// a leading zero, three-letter month, lowercase 12-hour time.
+fn format_titlebar_clock(now: Timestamp, zone: &jiff::tz::TimeZone) -> String {
+    let zoned = now.to_zoned(zone.clone());
+    format!(
+        "{} {} {} {}",
+        zoned.strftime("%a"),
+        zoned.strftime("%-d"),
+        zoned.strftime("%b"),
+        zoned.strftime("%-I:%M %P"),
+    )
+}
+
+/// `Thu 12 Nov 3:28 am` for a menu row: weekday, day, month, then the time.
+/// The clock itself drops the date; rows show both so cities in far zones read
+/// unambiguously. The time follows the app's 12/24-hour preference.
+fn format_clock_menu_meta(now: Timestamp, zone: &jiff::tz::TimeZone, use_24h: bool) -> String {
+    let zoned = now.to_zoned(zone.clone());
+    let time = if use_24h {
+        zoned.strftime("%H:%M").to_string()
+    } else {
+        zoned.strftime("%-I:%M %P").to_string()
+    };
+    format!(
+        "{} {} {} {time}",
+        zoned.strftime("%a"),
+        zoned.strftime("%-d"),
+        zoned.strftime("%b"),
+    )
 }
 
 impl AppShell {
@@ -177,6 +326,7 @@ impl AppShell {
         projects.tree_w = settings.tree_width(TreePanel::Projects);
         let section = settings.section();
         let vim_mode = settings.vim_mode();
+        let titlebar_clock = settings.titlebar_clock().map(str::to_string);
 
         let mut shell = Self {
             section,
@@ -188,11 +338,40 @@ impl AppShell {
             board: None,
             board_error: None,
             drop_target: None,
+            previous_target: None,
             dragging_card: None,
             drop_generation: 0,
+            drag_gap_height: GAP_FALLBACK,
+            drag_grab: Point::default(),
+            drag_origin: None,
+            drag_origin_target: None,
+            drag_flight: None,
+            drag_flight_token: 0,
+            settled_card: None,
+            drag_metrics: Rc::new(RefCell::new(HashMap::new())),
             editing: None,
+            title_edit: None,
+            hovered_card: None,
+            board_search: None,
+            column_scrolls: HashMap::new(),
+            drag_pointer: Rc::new(Cell::new(None)),
+            board_query: String::new(),
+            card_menu: None,
+            card_menu_focus: None,
+            card_confirm: None,
+            card_confirm_focus: None,
+            showing_archive: settings.tasks_archive(),
+            archive: None,
+            archive_cards: None,
+            archive_error: None,
+            archive_filter_anchor: Rc::new(RefCell::new(None)),
+            archive_filter_focus: None,
+            add_card: None,
+            add_card_drafts: HashMap::new(),
             project_choices: Vec::new(),
             clocks: ClockState::new(),
+            titlebar_clock,
+            titlebar_clock_menu: false,
             clock_tick: 0,
             clock_tick_running: None,
             notes,
@@ -209,6 +388,9 @@ impl AppShell {
         };
         shell.load_tasks();
         shell.load_clocks();
+        if shell.showing_archive {
+            shell.load_archived();
+        }
         match section {
             Section::Notes => shell.load_notes(),
             Section::Documents => shell.load_documents(),
@@ -239,6 +421,9 @@ impl AppShell {
             .set_tree_open(TreePanel::Projects, self.projects.tree_open);
         self.settings
             .set_tree_width(TreePanel::Projects, self.projects.tree_w);
+        self.settings
+            .set_titlebar_clock(self.titlebar_clock.as_deref());
+        self.settings.set_tasks_archive(self.showing_archive);
         let path = self.settings_path();
         if let Err(error) = self.settings.save(&path) {
             kandrium_core::logging::warn!("could not write settings {}: {error}", path.display());
@@ -261,10 +446,6 @@ impl AppShell {
             if let (Some(vim), Some(editor)) = (tab.vim.as_mut(), tab.editor.clone()) {
                 vim.set_enabled(enabled, &editor, cx);
             }
-        }
-        if let Some(editor) = self.projects.detail_editor.as_mut() {
-            let description = editor.description.clone();
-            editor.vim.set_enabled(enabled, &description, cx);
         }
         for tab in &mut self.projects.tabs {
             if let ProjectTab::Doc(doc) = tab {
@@ -325,10 +506,14 @@ impl AppShell {
         self.vim_mode
     }
 
-    fn select(&mut self, section: Section, cx: &mut Context<Self>) {
+    fn select(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
         if self.section == section {
             return;
         }
+        // Leaving a section unmounts its fields, but gpui keeps the focus
+        // handle alive, so the caret would silently reappear when the section
+        // comes back. Drop focus with the section it belonged to.
+        window.blur(cx);
         if self.section == Section::Notes {
             self.flush_active_note(cx);
         }
@@ -337,11 +522,12 @@ impl AppShell {
             self.save_documents_session();
         }
         if self.section == Section::Projects {
-            self.flush_project_fields(cx);
+            self.flush_project_fields(window, cx);
             self.save_project_description(cx);
             self.flush_project_docs(cx);
             self.project_board_shown = None;
         }
+        self.clear_drag_state();
         self.section = section;
         match section {
             Section::Tasks => self.load_tasks(),
@@ -416,27 +602,629 @@ impl AppShell {
         }
     }
 
-    /// Switch the Tasks tab to `id`.
-    pub(crate) fn open_board(&mut self, id: &str, cx: &mut Context<Self>) {
+    /// Switch the Tasks tab to `id` (and off the Archived page).
+    pub(crate) fn open_board(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // A board switch swaps the whole surface under the strip, so no field
+        // from the old board — the card search included — may keep the caret.
+        window.blur(cx);
+        let from_archive = self.showing_archive;
+        if from_archive {
+            self.showing_archive = false;
+            self.persist_settings();
+        }
         if self.active_board_id.as_deref() == Some(id) {
+            if from_archive {
+                cx.notify();
+            }
             return;
         }
-        self.drop_target = None;
+        self.clear_drag_state();
         if let Err(error) = self.load_board(id) {
             self.board_error = Some(error);
         }
         cx.notify();
     }
 
-    /// Record where a drop would land. No-op when the target has not changed,
-    /// so a drag does not repaint on every mouse move.
-    pub(crate) fn begin_card_drag(&mut self, card_id: &str, cx: &mut Context<Self>) {
-        if self.dragging_card.as_deref() != Some(card_id) {
-            self.dragging_card = Some(card_id.to_string());
+    /// Open the inline "+ Add card" draft on `column_id`, restoring any text
+    /// stashed for that column.
+    pub(crate) fn begin_add_card(
+        &mut self,
+        column_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .add_card
+            .as_ref()
+            .is_some_and(|form| form.column_id == column_id)
+        {
+            return;
+        }
+        // Switching columns mid-draft stashes the outgoing text.
+        self.cancel_add_card(cx);
+        let draft = self.add_card_drafts.remove(column_id).unwrap_or_default();
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Enter a title…")
+                .default_value(draft)
+        });
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.add_card = Some(AddCardForm {
+            column_id: column_id.to_string(),
+            input,
+        });
+        cx.notify();
+    }
+
+    /// Close the draft, keeping its text for the next open on that column.
+    pub(crate) fn cancel_add_card(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self.add_card.take() else {
+            return;
+        };
+        let text = form.input.read(cx).value().trim().to_string();
+        if !text.is_empty() {
+            self.add_card_drafts.insert(form.column_id, text);
+        }
+        cx.notify();
+    }
+
+    /// Enter in the draft: create the card in its column and close the form.
+    pub(crate) fn submit_add_card(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self.add_card.as_ref() else {
+            return;
+        };
+        let title = form.input.read(cx).value().trim().to_string();
+        let column_id = form.column_id.clone();
+        if title.is_empty() {
+            // An empty draft keeps the form open, like egui.
+            return;
+        }
+        match self.store.create_card(&column_id, &title) {
+            Ok(()) => {
+                self.add_card = None;
+                self.add_card_drafts.remove(&column_id);
+                self.board_error = None;
+                self.reload_active_board();
+            }
+            Err(error) => self.board_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    /// Keys routed to the open add-card draft before the input sees them.
+    pub(crate) fn handle_add_card_key(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                cx.stop_propagation();
+                self.cancel_add_card(cx);
+            }
+            "enter" => {
+                cx.stop_propagation();
+                self.submit_add_card(cx);
+            }
+            _ => {}
+        }
+    }
+
+    /// Show the hover pencil on the card row under the pointer.
+    pub(crate) fn set_card_hover(&mut self, card_id: Option<String>, cx: &mut Context<Self>) {
+        if self.hovered_card == card_id {
+            return;
+        }
+        self.hovered_card = card_id;
+        cx.notify();
+    }
+
+    /// Replace one card's title with an inline field, seeded with the current
+    /// title and the caret at the end.
+    pub(crate) fn begin_card_title_edit(
+        &mut self,
+        card_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .title_edit
+            .as_ref()
+            .is_some_and(|edit| edit.card_id == card_id)
+        {
+            return;
+        }
+        let Some(title) = self
+            .board
+            .as_ref()
+            .into_iter()
+            .flat_map(|board| board.columns.iter())
+            .flat_map(|column| column.ordered_cards())
+            .find(|card| card.id == card_id)
+            .map(|card| card.title.clone())
+        else {
+            return;
+        };
+        // One inline draft at a time: the add-card form and the title editor
+        // share the board's press-away handling.
+        self.cancel_add_card(cx);
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Card title"));
+        input.update(cx, |state, cx| {
+            // `set_value` leaves the caret at the end of a single-line field.
+            state.set_value(title.clone(), window, cx);
+            state.focus(window, cx);
+        });
+        self.title_edit = Some(CardTitleEdit {
+            card_id: card_id.to_string(),
+            original: title,
+            input,
+        });
+        cx.notify();
+    }
+
+    /// Commit the inline title editor: Enter, a press outside the field, or a
+    /// board/section switch. An empty or whitespace-only draft is rejected and
+    /// the card keeps its title.
+    pub(crate) fn commit_card_title_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.title_edit.take() else {
+            return;
+        };
+        let title = edit.input.read(cx).value().trim().to_string();
+        if !title.is_empty() && title != edit.original {
+            match self.store.rename_card(&edit.card_id, &title) {
+                Ok(()) => self.patch_card_title(&edit.card_id, &title),
+                Err(error) => self.board_error = Some(error),
+            }
+        }
+        cx.notify();
+    }
+
+    /// Esc in the inline editor: drop the draft, leaving the title unchanged.
+    pub(crate) fn cancel_card_title_edit(&mut self, cx: &mut Context<Self>) {
+        if self.title_edit.take().is_some() {
             cx.notify();
         }
     }
 
+    /// Keys routed to the inline editor before the input sees them.
+    pub(crate) fn handle_card_title_key(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                cx.stop_propagation();
+                self.cancel_card_title_edit(cx);
+            }
+            "enter" => {
+                cx.stop_propagation();
+                self.commit_card_title_edit(cx);
+            }
+            _ => {}
+        }
+    }
+
+    /// Patch the loaded board in place after a rename, so the row updates
+    /// without a rebuild that would drop the scroll offset and the open state.
+    fn patch_card_title(&mut self, card_id: &str, title: &str) {
+        let Some(board) = self.board.as_mut() else {
+            return;
+        };
+        for column in &mut board.columns {
+            for card in column.cards.iter_mut().chain(column.mirrored.iter_mut()) {
+                if card.id == card_id {
+                    card.title = title.to_string();
+                }
+            }
+        }
+    }
+
+    // -- board search -------------------------------------------------------
+
+    /// The board strip's search field, created once per session.
+    fn ensure_board_search(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<InputState> {
+        if let Some(input) = &self.board_search {
+            return input.clone();
+        }
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search cards…"));
+        // Filtering happens in the board render, so every keystroke must
+        // repaint the shell.
+        cx.observe(&input, |_: &mut AppShell, _, cx| cx.notify())
+            .detach();
+        self.board_search = Some(input.clone());
+        input
+    }
+
+    /// Clear the search from the clear button or Esc.
+    pub(crate) fn clear_board_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(input) = self.board_search.clone() {
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+        }
+        cx.notify();
+    }
+
+    // -- column scrolling ---------------------------------------------------
+
+    /// Give every column of the loaded board a persistent scroll handle, and
+    /// restart the lists at the top whenever the filter changes what they
+    /// hold — a stale offset would point past the new content.
+    fn prepare_column_scrolls(&mut self, query: &str) {
+        let ids: Vec<String> = match &self.board {
+            Some(board) => board
+                .columns
+                .iter()
+                .map(|column| column.id.clone())
+                .collect(),
+            None => return,
+        };
+        for id in ids {
+            self.column_scrolls.entry(id).or_default();
+        }
+        if self.board_query != query {
+            self.board_query = query.to_string();
+            for scroll in self.column_scrolls.values() {
+                scroll.set_offset(Point::default());
+            }
+        }
+    }
+
+    /// While a card is dragged near the top or bottom of a column list, step
+    /// that list so cards out of view come into reach. Runs on every board
+    /// render; the animation frame it requests keeps stepping while the
+    /// pointer rests at the edge, and it stops as soon as the drag ends.
+    fn column_edge_scroll(&mut self, window: &mut Window) {
+        if self.dragging_card.is_none() {
+            return;
+        }
+        let Some(pointer) = self.drag_pointer.get() else {
+            return;
+        };
+        const EDGE: f32 = 28.0;
+        const STEP: f32 = 14.0;
+        let mut stepped = false;
+        for scroll in self.column_scrolls.values() {
+            let bounds = scroll.bounds();
+            let max = scroll.max_offset().y;
+            if max <= px(0.) || bounds.size.height <= px(0.) {
+                continue;
+            }
+            // The bar's gutter is part of the column, so a pointer just past
+            // the list's right edge still counts.
+            if pointer.x < bounds.left() || pointer.x > bounds.right() + px(12.) {
+                continue;
+            }
+            let (top, bottom) = (bounds.top() + px(EDGE), bounds.bottom() - px(EDGE));
+            let delta = if pointer.y < top {
+                px(-STEP)
+            } else if pointer.y > bottom {
+                px(STEP)
+            } else {
+                continue;
+            };
+            let offset = scroll.offset();
+            let y = (offset.y + delta).clamp(px(0.), max);
+            if y != offset.y {
+                scroll.set_offset(Point { x: offset.x, y });
+                stepped = true;
+            }
+        }
+        if stepped {
+            window.request_animation_frame();
+        }
+    }
+
+    // -- card menu / archive ------------------------------------------------
+
+    /// Open the right-click menu at the pointer, clamped inside the window.
+    pub(crate) fn open_card_menu(
+        &mut self,
+        card_id: &str,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // One overlay at a time: the inline editor and the add-card draft close
+        // before the menu opens.
+        self.commit_card_title_edit(cx);
+        self.cancel_add_card(cx);
+        self.card_confirm = None;
+        let viewport = window.viewport_size();
+        let max_x = (viewport.width - px(168.)).max(px(8.));
+        let max_y = (viewport.height - px(84.)).max(px(8.));
+        let position = Point {
+            x: position.x.max(px(8.)).min(max_x),
+            y: position.y.max(px(8.)).min(max_y),
+        };
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+        self.card_menu_focus = Some(focus);
+        self.card_menu = Some(CardMenu {
+            card_id: card_id.to_string(),
+            position,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn close_card_menu(&mut self, cx: &mut Context<Self>) {
+        if self.card_menu.take().is_some() {
+            self.card_menu_focus = None;
+            cx.notify();
+        }
+    }
+
+    /// Archive one card. Mirrors carry the real card id, so the write and the
+    /// row removal always target the card, never a copy.
+    pub(crate) fn archive_card(&mut self, card_id: &str, cx: &mut Context<Self>) {
+        self.card_menu = None;
+        self.card_menu_focus = None;
+        match self.store.set_card_archived(card_id, true) {
+            Ok(()) => {
+                self.remove_card_from_board(card_id);
+                self.archive_cards = None;
+                self.board_error = None;
+            }
+            Err(error) => self.board_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    /// Delete on a board row: ask first, exactly like egui.
+    pub(crate) fn request_delete_card(&mut self, card_id: &str, cx: &mut Context<Self>) {
+        self.card_menu = None;
+        self.card_menu_focus = None;
+        self.card_confirm = Some(CardConfirm {
+            card_id: card_id.to_string(),
+            title: "Delete card",
+            message: "Delete this card permanently?",
+            from_archive: false,
+        });
+        cx.notify();
+    }
+
+    /// Delete on the Archived page: egui names the permanence explicitly.
+    pub(crate) fn request_delete_archived_card(&mut self, card_id: &str, cx: &mut Context<Self>) {
+        self.card_confirm = Some(CardConfirm {
+            card_id: card_id.to_string(),
+            title: "Delete archived card",
+            message: "Permanently delete this archived card? This cannot be undone.",
+            from_archive: true,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_card_confirm(&mut self, cx: &mut Context<Self>) {
+        if self.card_confirm.take().is_some() {
+            self.card_confirm_focus = None;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn confirm_card_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(confirm) = self.card_confirm.take() else {
+            return;
+        };
+        self.card_confirm_focus = None;
+        match self.store.delete_card(&confirm.card_id) {
+            Ok(()) => {
+                if confirm.from_archive {
+                    self.load_archived();
+                } else {
+                    self.remove_card_from_board(&confirm.card_id);
+                }
+                self.board_error = None;
+            }
+            Err(error) => self.board_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    /// Drop one card from the loaded board without a reload, so the scroll
+    /// offset and the rest of the rows stay put.
+    fn remove_card_from_board(&mut self, card_id: &str) {
+        if self
+            .title_edit
+            .as_ref()
+            .is_some_and(|edit| edit.card_id == card_id)
+        {
+            self.title_edit = None;
+        }
+        if self.dragging_card.as_deref() == Some(card_id) {
+            self.clear_drag_state();
+        }
+        if self
+            .editing
+            .as_ref()
+            .is_some_and(|session| session.card_id == card_id)
+        {
+            self.editing = None;
+        }
+        if let Some(board) = self.board.as_mut() {
+            for column in &mut board.columns {
+                column.cards.retain(|card| card.id != card_id);
+                column.mirrored.retain(|card| card.id != card_id);
+            }
+        }
+    }
+
+    // -- Archived page ------------------------------------------------------
+
+    fn load_archived(&mut self) {
+        match self.store.archived_cards() {
+            Ok(cards) => {
+                self.archive_cards = Some(cards);
+                self.archive_error = None;
+            }
+            Err(error) => {
+                self.archive_cards = Some(Vec::new());
+                self.archive_error = Some(error);
+            }
+        }
+    }
+
+    fn ensure_archive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.archive.is_none() {
+            self.archive = Some(archive::ArchiveState::new(window, cx));
+        }
+        if self.archive_cards.is_none() {
+            self.load_archived();
+        }
+    }
+
+    /// Show the Archived page instead of a board.
+    pub(crate) fn open_archive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.showing_archive {
+            return;
+        }
+        // The board strip and its search unmount here; leaving focus on them
+        // would hand the caret back when a board is reopened.
+        window.blur(cx);
+        self.commit_card_title_edit(cx);
+        self.cancel_add_card(cx);
+        self.clear_drag_state();
+        self.card_menu = None;
+        self.showing_archive = true;
+        self.ensure_archive(window, cx);
+        self.persist_settings();
+        cx.notify();
+    }
+
+    /// Open or close the board filter. The menu floats at the root, so opening
+    /// it never moves the table or its scroll offset.
+    pub(crate) fn toggle_archive_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.archive.as_mut() else {
+            return;
+        };
+        state.filter_open = !state.filter_open;
+        if state.filter_open {
+            let focus = cx.focus_handle();
+            window.focus(&focus, cx);
+            self.archive_filter_focus = Some(focus);
+        } else {
+            self.archive_filter_focus = None;
+        }
+        cx.notify();
+    }
+
+    /// Dismiss the menu without touching the selection (Esc / outside press).
+    pub(crate) fn close_archive_filter(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = self.archive.as_mut() {
+            state.filter_open = false;
+        }
+        self.archive_filter_focus = None;
+        cx.notify();
+    }
+
+    pub(crate) fn set_archive_filter(&mut self, board_id: &str, cx: &mut Context<Self>) {
+        if let Some(state) = self.archive.as_mut() {
+            state.board_filter = board_id.to_string();
+            state.filter_open = false;
+        }
+        self.archive_filter_focus = None;
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_archive_sort(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = self.archive.as_mut() {
+            state.sort_newest = !state.sort_newest;
+        }
+        cx.notify();
+    }
+
+    /// Restore one archived card; the board is refreshed in the background so
+    /// switching back shows it in place.
+    pub(crate) fn restore_archived_card(&mut self, card_id: &str, cx: &mut Context<Self>) {
+        match self.store.set_card_archived(card_id, false) {
+            Ok(()) => {
+                self.load_archived();
+                self.reload_active_board();
+                self.board_error = None;
+            }
+            Err(error) => self.archive_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    /// Enter the drag session at the card's own slot.
+    ///
+    /// The dragged card leaves the flow and a same-height gap takes its row,
+    /// so pickup itself never shifts anything. `grab` is gpui's grab offset
+    /// inside the card, reused by the release flight.
+    pub(crate) fn begin_card_drag(
+        &mut self,
+        card_id: &str,
+        column_id: &str,
+        before: Option<String>,
+        grab: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dragging_card.as_deref() == Some(card_id) {
+            return;
+        }
+        // The inline editor owns that row's pointer; never start a drag under it.
+        if self
+            .title_edit
+            .as_ref()
+            .is_some_and(|edit| edit.card_id == card_id)
+        {
+            return;
+        }
+        let bounds = self.drag_metrics.borrow().get(card_id).copied();
+        self.drag_gap_height = bounds
+            .map(|bounds| bounds.size.height.as_f32())
+            .filter(|height| *height > 0.0)
+            .unwrap_or(GAP_FALLBACK);
+        // The card's row starts with a 6 px slot; the flight lands on the body.
+        self.drag_origin = bounds.map(|bounds| {
+            Bounds::new(
+                bounds.origin
+                    + Point {
+                        x: px(0.0),
+                        y: px(SLOT_H),
+                    },
+                bounds.size,
+            )
+        });
+        self.drag_grab = grab;
+        self.drop_generation = self.drop_generation.wrapping_add(1);
+        let target = DropTarget {
+            column_id: column_id.to_string(),
+            before,
+            generation: self.drop_generation,
+        };
+        self.drop_target = Some(target.clone());
+        self.drag_origin_target = Some(target.clone());
+        // At pickup the gap replaces the card's row exactly, so no card moves:
+        // seeding the previous target with the same slot makes the offset
+        // table return zero for every sibling.
+        self.previous_target = Some(target);
+        self.drag_flight = None;
+        self.settled_card = None;
+        self.dragging_card = Some(card_id.to_string());
+        cx.notify();
+    }
+
+    /// Whether the pointer is inside a measured row (a card or the gap).
+    ///
+    /// Rows register their own `on_drag_move`, but the column's fallback runs
+    /// first because it is an ancestor. Without this check every pointer move
+    /// first moved the gap to the column's end and then back to the hovered
+    /// slot, so the whole column reflowed twice per move.
+    pub(crate) fn pointer_over_row(&self, position: Point<Pixels>) -> bool {
+        self.drag_metrics
+            .borrow()
+            .values()
+            .any(|bounds| bounds.contains(&position))
+    }
+
+    /// Record where a drop would land. The previous target is kept so the
+    /// renderer can glide the cards the change displaces.
     pub(crate) fn set_drop_target(
         &mut self,
         column_id: &str,
@@ -450,7 +1238,8 @@ impl AppShell {
         if same {
             return;
         }
-        self.drop_generation += 1;
+        self.previous_target = self.drop_target.take();
+        self.drop_generation = self.drop_generation.wrapping_add(1);
         self.drop_target = Some(DropTarget {
             column_id: column_id.to_string(),
             before,
@@ -459,25 +1248,53 @@ impl AppShell {
         cx.notify();
     }
 
-    pub(crate) fn clear_drop_target(&mut self, cx: &mut Context<Self>) {
-        let had_target = self.drop_target.take().is_some();
-        let had_drag = self.dragging_card.take().is_some();
-        if had_target || had_drag {
-            cx.notify();
+    /// Release outside every drop zone, or a release that never produced a
+    /// drop: park the gap back at the source slot and fly the ghost there.
+    pub(crate) fn cancel_card_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.drag_flight.is_some() {
+            // A drop handler already started the settle flight.
+            return;
         }
+        let Some(card_id) = self.dragging_card.clone() else {
+            return;
+        };
+        let card = self.card_snapshot(&card_id);
+        let origin = self.drag_origin;
+        self.restore_origin_gap();
+        self.start_drag_flight(&card_id, card, window, origin, cx);
     }
 
     /// Commit a drop. The target recorded by `on_drag_move` decides the
     /// insertion point; a drop on a column without one appends.
-    pub(crate) fn drop_card(&mut self, card_id: &str, column_id: &str, cx: &mut Context<Self>) {
+    pub(crate) fn drop_card(
+        &mut self,
+        card_id: &str,
+        column_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let before = self
             .drop_target
             .clone()
             .filter(|target| target.column_id == column_id)
             .and_then(|target| target.before)
             .filter(|before| before != card_id);
-        self.drop_target = None;
-        self.dragging_card = None;
+        let origin_target = self.drag_origin_target.clone();
+        let same_slot = origin_target
+            .as_ref()
+            .is_some_and(|target| target.column_id == column_id && target.before == before);
+        // Snapshot the card before the move: the flight overlay renders this
+        // card body, and the reload below replaces the board it came from.
+        let card = self.card_snapshot(card_id);
+        let origin = self.drag_origin;
+
+        if same_slot {
+            // Dropped on its own slot: a cancel, never a move.
+            self.restore_origin_gap();
+            self.start_drag_flight(card_id, card, window, origin, cx);
+            return;
+        }
+
         // All-board columns are synthetic `all:<status>` ids: a drop there
         // changes the card's status on its home board (core handles the move).
         let result = match column_id
@@ -493,15 +1310,186 @@ impl AppShell {
                 // The board on screen may be a project's, so reload whatever
                 // the section is displaying rather than the Tasks board.
                 self.reload_displayed_board();
+                // Keep the gap at the destination until the ghost lands, so
+                // the real card appears exactly where it was released.
+                self.drop_generation = self.drop_generation.wrapping_add(1);
+                let target = DropTarget {
+                    column_id: column_id.to_string(),
+                    before,
+                    generation: self.drop_generation,
+                };
+                self.previous_target = self.drop_target.take();
+                self.drop_target = Some(target);
+                let destination = self
+                    .drag_metrics
+                    .borrow()
+                    .get(&format!("gap:{card_id}"))
+                    .copied()
+                    .or(origin);
+                self.start_drag_flight(card_id, card, window, destination, cx);
             }
-            Err(error) => self.board_error = Some(error),
+            Err(error) => {
+                self.board_error = Some(error);
+                self.restore_origin_gap();
+                self.start_drag_flight(card_id, card, window, origin, cx);
+            }
         }
+    }
+
+    /// The card on the displayed board, for the flight overlay.
+    ///
+    /// The overlay paints the same body as the resting card, so it needs the
+    /// card's meta label, due date and labels — not just its title.
+    fn card_snapshot(&self, card_id: &str) -> Option<Card> {
+        self.board
+            .as_ref()
+            .into_iter()
+            .flat_map(|board| board.columns.iter())
+            .flat_map(|column| column.ordered_cards())
+            .find(|card| card.id == card_id)
+            .cloned()
+    }
+
+    /// Move the insertion gap back to the card's own slot.
+    fn restore_origin_gap(&mut self) {
+        let Some(origin) = self.drag_origin_target.clone() else {
+            return;
+        };
+        self.previous_target = self.drop_target.take();
+        self.drop_generation = self.drop_generation.wrapping_add(1);
+        self.drop_target = Some(DropTarget {
+            generation: self.drop_generation,
+            ..origin
+        });
+    }
+
+    /// Fly the released card to `to`. With reduced motion the drag simply
+    /// ends: no flight, no wait.
+    fn start_drag_flight(
+        &mut self,
+        card_id: &str,
+        card: Option<Card>,
+        window: &mut Window,
+        to: Option<Bounds<Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(to) = to else {
+            self.finish_drag_state(card_id, cx);
+            return;
+        };
+        if cx.reduce_motion() {
+            self.finish_drag_state(card_id, cx);
+            return;
+        }
+        // Without a snapshot there is no body to paint, so end the drag at
+        // once instead of flying an empty shell.
+        let Some(card) = card else {
+            self.finish_drag_state(card_id, cx);
+            return;
+        };
+        self.drag_flight_token = self.drag_flight_token.wrapping_add(1);
+        let token = self.drag_flight_token;
+        let from = window.mouse_position() - self.drag_grab;
+        self.drag_flight = Some(DragFlight {
+            card_id: card_id.to_string(),
+            card,
+            from,
+            to,
+            token,
+        });
         cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SNAP_BACK).await;
+            this.update(cx, |this, cx| this.finish_drag_flight(token, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Drop every piece of drag state without touching the settle marker.
+    fn clear_drag_state(&mut self) {
+        self.drop_target = None;
+        self.previous_target = None;
+        self.dragging_card = None;
+        self.drag_flight = None;
+    }
+
+    /// End the current drag without a flight: the card reappears at once.
+    fn finish_drag_state(&mut self, card_id: &str, cx: &mut Context<Self>) {
+        self.drag_flight_token = self.drag_flight_token.wrapping_add(1);
+        self.settled_card = Some((card_id.to_string(), self.drag_flight_token));
+        self.clear_drag_state();
+        cx.notify();
+    }
+
+    fn finish_drag_flight(&mut self, token: u64, cx: &mut Context<Self>) {
+        let card_id = match self.drag_flight.as_ref() {
+            Some(flight) if flight.token == token => flight.card_id.clone(),
+            _ => return,
+        };
+        self.finish_drag_state(&card_id, cx);
+    }
+
+    /// The shell-owned ghost that flies from the release point to the slot.
+    ///
+    /// gpui removes its drag view on mouse-up, so the settle and snap-back
+    /// flight is re-created here and animated with the snap-back curve. The
+    /// overlay paints the source card's full body — meta label, due date and
+    /// label dots included — because that is what was on screen under the
+    /// pointer a frame earlier; a title-only shell would blink the meta row
+    /// out between the drop and the settle.
+    fn drag_flight_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let flight = self.drag_flight.as_ref()?;
+        let t = self.tokens;
+        let reduced = cx.reduce_motion();
+        let from = flight.from;
+        let to = flight.to.origin;
+        let token = flight.token;
+        let card = &flight.card;
+        let body = card_body(
+            card,
+            card.meta_label.as_deref(),
+            title_row(card.title.clone(), None, &t),
+            false,
+            &t,
+        );
+        let from_x = from.x.as_f32();
+        let from_y = from.y.as_f32();
+        let to_x = to.x.as_f32();
+        let to_y = to.y.as_f32();
+        Some(
+            div()
+                .id("drag-flight")
+                .test_support()
+                .absolute()
+                .w(px(COLUMN_W - 16.0))
+                .child(body)
+                .with_animation(
+                    format!("drag-flight-{token}"),
+                    Animation::new(SNAP_BACK).with_easing(ease_snap),
+                    move |el, delta| {
+                        let progress = eased(reduced, delta, ease_snap);
+                        el.left(px(from_x + (to_x - from_x) * progress))
+                            .top(px(from_y + (to_y - from_y) * progress))
+                            .opacity(0.97 + 0.03 * progress)
+                    },
+                )
+                .into_any_element(),
+        )
     }
 
     /// Open the card editor for `card_id`, resolving the card from the board
     /// currently on screen (mirrors included).
     pub(crate) fn open_card(&mut self, card_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // The row being edited has no click handler; this is the belt-and-braces
+        // guard against a modal opening under the field.
+        if self
+            .title_edit
+            .as_ref()
+            .is_some_and(|edit| edit.card_id == card_id)
+        {
+            return;
+        }
         let card = {
             let Some(board) = &self.board else {
                 return;
@@ -532,14 +1520,24 @@ impl AppShell {
                 .default_value(card.title.clone())
                 .placeholder("Card title")
         });
-        let description =
-            cx.new(|cx| TextareaState::new(window, cx).default_value(card.description.clone()));
+        let description = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .default_value(card.description.clone())
+                .placeholder("Add a more detailed description…")
+        });
         let due = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value(card.due_date.clone())
                 .placeholder("YYYY-MM-DD")
         });
         title.update(cx, |state, cx| state.focus(window, cx));
+        // The calendar opens on the stored date's month, or the current month.
+        let due_month = card
+            .due_date
+            .trim()
+            .parse::<Date>()
+            .unwrap_or_else(|_| jiff::Zoned::now().date())
+            .first_of_month();
         // Vim starts in Normal mode: the description only accepts plain typing
         // after `i`, so it starts read-only unless the preference is off.
         let mut vim = crate::vim::VimSession::new();
@@ -549,13 +1547,20 @@ impl AppShell {
         self.editing = Some(EditSession {
             card_id: card.id,
             is_project_card,
+            home_board_id: card.board_id,
             title,
             description,
             due,
+            due_menu: false,
+            due_month,
+            due_anchor: Rc::new(RefCell::new(None)),
+            due_viewport: Rc::new(RefCell::new(None)),
             focus,
             vim,
             labels: card.labels,
             project_id: card.project_id,
+            project_menu: false,
+            project_anchor: Rc::new(RefCell::new(None)),
             area_board_id: card.area_board_id,
             preview: false,
             error: None,
@@ -635,6 +1640,30 @@ impl AppShell {
         self.persist_editing(cx);
     }
 
+    /// Persist the editor, then move the card to `board_id` and close. Edits
+    /// are written first so a move never discards what the user typed; an
+    /// error keeps the modal open.
+    pub(crate) fn move_editing_card(&mut self, board_id: String, cx: &mut Context<Self>) {
+        let Some(card_id) = self.editing.as_ref().map(|session| session.card_id.clone()) else {
+            return;
+        };
+        if !self.persist_editing(cx) {
+            return;
+        }
+        match self.store.move_card_to_board(&card_id, &board_id) {
+            Ok(()) => {
+                self.editing = None;
+                self.reload_displayed_board();
+            }
+            Err(error) => {
+                if let Some(session) = self.editing.as_mut() {
+                    session.error = Some(error);
+                }
+            }
+        }
+        cx.notify();
+    }
+
     /// Keys routed to the open card modal before the textarea sees them.
     ///
     /// `Esc` in Normal mode (or outside the description) closes the editor;
@@ -648,6 +1677,13 @@ impl AppShell {
         let Some(session) = self.editing.as_ref() else {
             return;
         };
+        // A popup inside the editor takes Escape first: it closes the popup,
+        // not the whole modal.
+        if event.keystroke.key == "escape" && (session.project_menu || session.due_menu) {
+            cx.stop_propagation();
+            self.close_editing_menu(cx);
+            return;
+        }
         let description_focused = session
             .description
             .read(cx)
@@ -701,12 +1737,110 @@ impl AppShell {
         }
     }
 
-    /// Set the project tag of a normal card. An empty id clears it.
+    /// Apply a project pick from the modal's dropdown. The link is written
+    /// immediately through `kandrium_core::set_card_project`, then the open
+    /// board is reloaded so its rows and `meta_label` catch up without the
+    /// editor closing. An empty id clears the link.
     pub(crate) fn set_editing_project(&mut self, project_id: String, cx: &mut Context<Self>) {
+        let Some(card_id) = self.editing.as_ref().map(|session| session.card_id.clone()) else {
+            return;
+        };
+        let next = (!project_id.is_empty()).then_some(project_id);
+        let result = self.store.set_card_project(&card_id, next.as_deref());
         if let Some(session) = self.editing.as_mut() {
-            session.project_id = (!project_id.is_empty()).then_some(project_id);
+            session.project_menu = false;
+            match &result {
+                Ok(()) => {
+                    session.project_id = next;
+                    session.error = None;
+                }
+                Err(error) => session.error = Some(error.clone()),
+            }
+        }
+        if result.is_ok() {
+            self.reload_active_board();
+        }
+        cx.notify();
+    }
+
+    /// Toggle the modal's project dropdown.
+    pub(crate) fn toggle_editing_project_menu(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = self.editing.as_mut() {
+            session.project_menu = !session.project_menu;
             cx.notify();
         }
+    }
+
+    /// Close any open modal popup (project dropdown, calendar) without
+    /// touching values.
+    pub(crate) fn close_editing_menu(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.editing.as_mut() else {
+            return;
+        };
+        if session.project_menu || session.due_menu {
+            session.project_menu = false;
+            session.due_menu = false;
+            cx.notify();
+        }
+    }
+
+    /// Open or close the due-date calendar. Opening seeds the displayed month
+    /// from whatever is typed into the field (falling back to today).
+    pub(crate) fn toggle_editing_due_menu(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.editing.as_mut() else {
+            return;
+        };
+        if session.due_menu {
+            session.due_menu = false;
+            cx.notify();
+            return;
+        }
+        let today = jiff::Zoned::now().date();
+        let typed = session.due.read(cx).value().trim().to_string();
+        session.due_month = typed.parse::<Date>().unwrap_or(today).first_of_month();
+        session.due_menu = true;
+        cx.notify();
+    }
+
+    /// Move the calendar to another month (arrows and Today).
+    pub(crate) fn set_editing_due_month(&mut self, month: Date, cx: &mut Context<Self>) {
+        if let Some(session) = self.editing.as_mut() {
+            session.due_month = month.first_of_month();
+            cx.notify();
+        }
+    }
+
+    /// Pick a day in the calendar: write it into the field and persist it
+    /// through the card update path.
+    pub(crate) fn pick_editing_due(
+        &mut self,
+        date: Date,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.editing.as_mut() else {
+            return;
+        };
+        let due = session.due.clone();
+        due.update(cx, |state, cx| {
+            state.set_value(date.to_string(), window, cx)
+        });
+        session.due_month = date.first_of_month();
+        session.due_menu = false;
+        self.persist_editing(cx);
+        cx.notify();
+    }
+
+    /// Clear the due date from the calendar and persist it.
+    pub(crate) fn clear_editing_due(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = self.editing.as_mut() else {
+            return;
+        };
+        let due = session.due.clone();
+        due.update(cx, |state, cx| state.set_value("", window, cx));
+        session.due_menu = false;
+        self.persist_editing(cx);
+        cx.notify();
     }
 
     /// Set the area board of a project card. An empty id unfiles it.
@@ -744,6 +1878,7 @@ impl AppShell {
     /// Load a project's board into the shared surface without touching
     /// `active_board_id`; the Tasks section keeps its own board selection.
     fn load_project_board(&mut self, id: &str) -> Result<(), String> {
+        self.clear_drag_state();
         match self.store.board(id) {
             Ok(board) => {
                 self.project_board_shown = Some(board.id.clone());
@@ -805,6 +1940,17 @@ impl AppShell {
         self.projects.tree = tree;
         self.projects.archived = archived;
         self.projects.error = None;
+        // The tree can expand a project's documents in place, and a project
+        // with no documents shows no chevron. One scan per project is enough
+        // to answer both, refreshed whenever the project list reloads.
+        self.projects.doc_trees.clear();
+        if let Some(root) = self.projects.root.clone() {
+            let ids = projects::project_ids(&self.projects.tree);
+            for id in ids {
+                let entries = self.store.project_files(&root, &id).unwrap_or_default();
+                self.projects.doc_trees.insert(id, entries);
+            }
+        }
 
         let selected_valid = self.projects.selected.as_deref().is_some_and(|id| {
             kandrium_core::projects::find_project(&self.projects.tree, id).is_some()
@@ -845,12 +1991,19 @@ impl AppShell {
             self.projects.detail = None;
             self.projects.summary = None;
             self.projects.files.clear();
+            self.projects.paths.clear();
             return;
         };
         match self.store.project(&id) {
             Ok(project) => {
                 self.projects.summary = self.store.project_summary(&root, &id).ok();
                 self.projects.files = self.store.project_files(&root, &id).unwrap_or_default();
+                self.projects.paths = self.store.project_paths(&id).unwrap_or_default();
+                // Keep the tree's in-place document rows in step with edits
+                // made through the Overview.
+                self.projects
+                    .doc_trees
+                    .insert(id.clone(), self.projects.files.clone());
                 self.projects.detail = Some(project);
             }
             Err(error) => {
@@ -858,6 +2011,7 @@ impl AppShell {
                 self.projects.detail = None;
                 self.projects.summary = None;
                 self.projects.files.clear();
+                self.projects.paths.clear();
             }
         }
     }
@@ -879,18 +2033,52 @@ impl AppShell {
         }
         let identifier =
             cx.new(|cx| InputState::new(window, cx).default_value(project.identifier.clone()));
-        let source = cx.new(|cx| InputState::new(window, cx).default_value(project.source.clone()));
-        let description =
-            cx.new(|cx| TextareaState::new(window, cx).default_value(project.description.clone()));
-        let mut vim = crate::vim::VimSession::new();
-        vim.set_enabled(self.vim_mode, &description, cx);
+        let description = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .default_value(project.description.clone())
+                .placeholder("Add a description… Markdown is supported")
+        });
+        // The identifier only writes on Save; track dirtiness so the button
+        // can appear and a duplicate can be reported inline.
+        cx.subscribe_in(
+            &identifier,
+            window,
+            |this: &mut AppShell, input, event: &InputEvent, _window, cx| {
+                if !matches!(event, InputEvent::Change) {
+                    return;
+                }
+                let value = input.read(cx).value().trim().to_string();
+                if let Some(editor) = this.projects.detail_editor.as_mut() {
+                    editor.identifier_dirty = value != editor.saved_identifier;
+                    editor.identifier_error = None;
+                }
+                cx.notify();
+            },
+        )
+        .detach();
+        // The description autosaves: a debounced timer per keystroke, plus a
+        // flush on blur. Vim is off for this field.
+        cx.subscribe_in(
+            &description,
+            window,
+            |this: &mut AppShell, _input, event: &InputEvent, _window, cx| match event {
+                InputEvent::Change => this.schedule_project_description_autosave(cx),
+                InputEvent::Blur => this.save_project_description(cx),
+                _ => {}
+            },
+        )
+        .detach();
+        let saved_identifier = project.identifier.clone();
         self.projects.detail_editor = Some(DetailEditor {
             project_id: project.id.clone(),
             identifier,
-            source,
             description,
-            vim,
             saved_description: project.description,
+            preview: false,
+            description_generation: 0,
+            saved_identifier,
+            identifier_dirty: false,
+            identifier_error: None,
         });
     }
 
@@ -898,7 +2086,7 @@ impl AppShell {
         if self.projects.filter_input.is_some() {
             return;
         }
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter projects"));
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search projects…"));
         cx.subscribe_in(
             &input,
             window,
@@ -913,16 +2101,11 @@ impl AppShell {
         self.projects.filter_input = Some(input);
     }
 
-    pub(crate) fn select_project(
-        &mut self,
-        id: &str,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn select_project(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.projects.selected.as_deref() == Some(id) {
             return;
         }
-        self.flush_project_fields(cx);
+        self.flush_project_fields(window, cx);
         self.save_project_description(cx);
         self.flush_project_docs(cx);
         self.projects.selected = Some(id.to_string());
@@ -954,17 +2137,33 @@ impl AppShell {
         cx.notify();
     }
 
-    pub(crate) fn show_active_projects(&mut self, cx: &mut Context<Self>) {
-        self.projects.show_archived = false;
-        self.projects.selected = None;
-        self.load_projects();
+    /// Expand or collapse a project's documents in the tree. Session state:
+    /// the document cache is already loaded with the project list.
+    pub(crate) fn toggle_project_docs(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.projects.docs_open.remove(id) {
+            self.projects.docs_open.insert(id.to_string());
+        }
         cx.notify();
     }
 
-    pub(crate) fn show_archived_projects(&mut self, cx: &mut Context<Self>) {
-        self.projects.show_archived = true;
-        self.projects.selected = None;
-        self.load_projects();
+    /// Expand or collapse one document folder under an open project.
+    pub(crate) fn toggle_project_doc_folder(&mut self, key: String, cx: &mut Context<Self>) {
+        if !self.projects.doc_folders_open.remove(&key) {
+            self.projects.doc_folders_open.insert(key);
+        }
+        cx.notify();
+    }
+
+    /// Expands or collapses the footer's inline archived list without leaving
+    /// the active tree. Archiving or restoring a project reloads the list
+    /// already, but re-reading on open keeps it fresh after external commits.
+    pub(crate) fn toggle_archived_disclosure(&mut self, cx: &mut Context<Self>) {
+        self.projects.archived_open = !self.projects.archived_open;
+        if self.projects.archived_open
+            && let Ok(archived) = self.store.archived_projects()
+        {
+            self.projects.archived = archived;
+        }
         cx.notify();
     }
 
@@ -1149,15 +2348,21 @@ impl AppShell {
         if project.id != id {
             return;
         }
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(project.name.clone()));
-        input.update(cx, |state, cx| state.focus(window, cx));
+        let name = project.name.clone();
+        let input = cx.new(|cx| InputState::new(window, cx));
+        input.update(cx, |state, cx| {
+            // `set_value` leaves the caret at the end of a single-line field.
+            state.set_value(name.clone(), window, cx);
+            state.focus(window, cx);
+        });
         cx.subscribe_in(
             &input,
             window,
-            |this: &mut AppShell, _, event: &InputEvent, window, cx| match event {
+            |this: &mut AppShell, _input, event: &InputEvent, window, cx| match event {
                 InputEvent::PressEnter { .. } | InputEvent::Blur => {
                     this.commit_project_title(window, cx)
                 }
+                InputEvent::Change => this.schedule_project_title_autosave(cx),
                 _ => {}
             },
         )
@@ -1165,7 +2370,67 @@ impl AppShell {
         self.projects.title_edit = Some(ProjectTitleEdit {
             project_id: id.to_string(),
             input,
+            original: name.clone(),
+            saved: name,
+            generation: 0,
         });
+        cx.notify();
+    }
+
+    /// Debounce the title's autosave: every keystroke bumps the generation and
+    /// schedules a write; a newer keystroke makes the older timer a no-op.
+    fn schedule_project_title_autosave(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.projects.title_edit.as_mut() else {
+            return;
+        };
+        edit.generation = edit.generation.wrapping_add(1);
+        let generation = edit.generation;
+        let project_id = edit.project_id.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(600))
+                .await;
+            this.update(cx, |this, cx| {
+                this.autosave_project_title(&project_id, generation, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Write the title in place without closing the field. Whitespace-only
+    /// names are rejected and stay in the editor.
+    fn autosave_project_title(
+        &mut self,
+        project_id: &str,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(edit) = self.projects.title_edit.as_ref() else {
+            return;
+        };
+        if edit.project_id != project_id || edit.generation != generation {
+            return;
+        }
+        let name = edit.input.read(cx).value().trim().to_string();
+        if name.is_empty() || name == edit.saved {
+            return;
+        }
+        match self.store.rename_project(project_id, &name) {
+            Ok(_) => {
+                if let Some(edit) = self.projects.title_edit.as_mut() {
+                    edit.saved = name;
+                }
+                self.projects.error = None;
+                // The rename may regenerate the identifier, and the board
+                // title follows the name, so refresh both.
+                self.projects.detail_editor = None;
+                self.project_board_shown = None;
+                self.load_projects();
+            }
+            Err(error) => self.projects.error = Some(error),
+        }
         cx.notify();
     }
 
@@ -1211,17 +2476,25 @@ impl AppShell {
     }
 
     pub(crate) fn commit_project_title(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(edit) = self.projects.title_edit.take() else {
+        let Some(edit) = self.projects.title_edit.as_ref() else {
             return;
         };
         let name = edit.input.read(cx).value().trim().to_string();
         if name.is_empty() {
+            // Keep the field open: an empty name is rejected, not saved.
             self.projects.error = Some("A project name is required".into());
             cx.notify();
             return;
         }
-        match self.store.rename_project(&edit.project_id, &name) {
+        let project_id = edit.project_id.clone();
+        if name == edit.saved {
+            self.projects.title_edit = None;
+            cx.notify();
+            return;
+        }
+        match self.store.rename_project(&project_id, &name) {
             Ok(_) => {
+                self.projects.title_edit = None;
                 self.projects.detail_editor = None;
                 self.projects.error = None;
                 // The board title follows the rename; force the Tasks tab to
@@ -1234,48 +2507,131 @@ impl AppShell {
         cx.notify();
     }
 
+    /// Esc closes the editor and puts the previous name back, including when
+    /// a debounced autosave already wrote the new one.
     pub(crate) fn cancel_project_title(&mut self, cx: &mut Context<Self>) {
-        if self.projects.title_edit.take().is_some() {
-            cx.notify();
-        }
-    }
-
-    pub(crate) fn save_project_fields(&mut self, cx: &mut Context<Self>) {
-        if !self.flush_project_fields(cx) {
-            cx.notify();
+        let Some(edit) = self.projects.title_edit.take() else {
             return;
+        };
+        if edit.saved != edit.original
+            && self
+                .store
+                .rename_project(&edit.project_id, &edit.original)
+                .is_ok()
+        {
+            self.projects.detail_editor = None;
+            self.project_board_shown = None;
+            self.load_projects();
         }
-        self.projects.error = None;
-        self.projects.detail_editor = None;
-        self.load_projects();
         cx.notify();
     }
 
-    /// Persist the Overview identifier and source without closing the editor
-    /// or reloading the tree. Used by Save and whenever the project is about
-    /// to stop being displayed, so a valid edit is not silently dropped on a
-    /// switch (matching egui's commit-on-blur). Returns `false` when a field
-    /// was rejected; the message is left in `projects.error`.
-    fn flush_project_fields(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(editor) = &self.projects.detail_editor else {
-            return true;
-        };
-        let Some(project) = &self.projects.detail else {
-            return true;
-        };
-        let identifier = editor.identifier.read(cx).value().trim().to_string();
-        let source = editor.source.read(cx).value().to_string();
-        let id = project.id.clone();
-        if identifier != project.identifier
-            && let Err(error) = self.store.set_project_identifier(&id, &identifier)
-        {
-            self.projects.error = Some(error);
-            return false;
+    /// Save the identifier only when explicitly asked. Validates the core
+    /// charset, then checks the other projects case-insensitively so the
+    /// inline error can name the conflict instead of just quoting SQLite.
+    pub(crate) fn save_project_identifier(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(error) = self.try_save_project_identifier(window, cx) {
+            if let Some(editor) = self.projects.detail_editor.as_mut() {
+                editor.identifier_error = Some(error);
+                editor
+                    .identifier
+                    .update(cx, |state, cx| state.focus(window, cx));
+            }
+            cx.notify();
         }
-        if source != project.source
-            && let Err(error) = self.store.set_project_source(&id, &source)
-        {
-            self.projects.error = Some(error);
+    }
+
+    /// Esc in the identifier field: restore the persisted value.
+    pub(crate) fn cancel_project_identifier(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.projects.detail_editor.as_mut() else {
+            return;
+        };
+        let saved = editor.saved_identifier.clone();
+        editor.identifier_error = None;
+        editor.identifier_dirty = false;
+        editor
+            .identifier
+            .update(cx, |state, cx| state.set_value(saved, window, cx));
+        cx.notify();
+    }
+
+    fn try_save_project_identifier(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> std::result::Result<(), String> {
+        let Some(editor) = self.projects.detail_editor.as_ref() else {
+            return Ok(());
+        };
+        let Some(project) = self.projects.detail.as_ref() else {
+            return Ok(());
+        };
+        let raw = editor.identifier.read(cx).value();
+        let identifier = kandrium_core::validate_identifier(&raw).map_err(|e| e.to_string())?;
+        let project_id = project.id.clone();
+        if identifier == project.identifier {
+            if let Some(editor) = self.projects.detail_editor.as_mut() {
+                editor.identifier_dirty = false;
+                editor.identifier_error = None;
+            }
+            return Ok(());
+        }
+        if let Some(taken) = self.identifier_owner(&identifier, &project_id) {
+            return Err(format!(
+                "Identifier \"{identifier}\" is already used by \"{taken}\""
+            ));
+        }
+        self.store
+            .set_project_identifier(&project_id, &identifier)
+            .map_err(|e| e.to_string())?;
+        if let Some(editor) = self.projects.detail_editor.as_mut() {
+            editor.saved_identifier = identifier.clone();
+            editor.identifier_dirty = false;
+            editor.identifier_error = None;
+            editor.identifier.update(cx, |state, cx| {
+                state.set_value(identifier.clone(), window, cx);
+            });
+        }
+        self.projects.error = None;
+        // The tree labels projects with the identifier; refresh it.
+        self.load_projects();
+        cx.notify();
+        Ok(())
+    }
+
+    /// Name of a different project that already owns this identifier,
+    /// compared case-insensitively across the tree and the archive.
+    fn identifier_owner(&self, identifier: &str, project_id: &str) -> Option<String> {
+        let taken = |project: &&kandrium_core::Project| {
+            project.id != project_id && project.identifier.eq_ignore_ascii_case(identifier)
+        };
+        crate::views::projects::flat_projects(&self.projects.tree)
+            .into_iter()
+            .map(|(project, _)| project)
+            .find(taken)
+            .map(|project| project.name.clone())
+            .or_else(|| {
+                self.projects
+                    .archived
+                    .iter()
+                    .find(taken)
+                    .map(|project| project.name.clone())
+            })
+    }
+
+    /// Persist a valid identifier edit; used when the project is about to
+    /// stop being displayed so a valid edit is not silently dropped on a
+    /// switch (matching egui's commit-on-blur). Returns `false` when the value
+    /// was rejected; the message is left inline.
+    fn flush_project_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if let Err(error) = self.try_save_project_identifier(window, cx) {
+            if let Some(editor) = self.projects.detail_editor.as_mut() {
+                editor.identifier_error = Some(error);
+            }
             return false;
         }
         true
@@ -1317,6 +2673,24 @@ impl AppShell {
             }
             Err(error) => self.projects.error = Some(error),
         }
+        cx.notify();
+    }
+
+    /// Switch the Overview description between its editor and the Markdown
+    /// preview. The textarea stays mounted in edit mode only, but the text
+    /// lives on the entity, so toggling back returns the same content.
+    pub(crate) fn set_project_description_preview(
+        &mut self,
+        preview: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.projects.detail_editor.as_mut() else {
+            return;
+        };
+        if editor.preview == preview {
+            return;
+        }
+        editor.preview = preview;
         cx.notify();
     }
 
@@ -1442,8 +2816,12 @@ impl AppShell {
         };
         match self.store.read_project_doc(&root, &id, &rel) {
             Ok(text) => {
-                let editor =
-                    cx.new(|cx| TextareaState::new(window, cx).default_value(text.clone()));
+                let editor = cx.new(|cx| {
+                    EditorState::new(window, cx)
+                        .default_value(text.clone())
+                        .placeholder("Start writing… Markdown is supported")
+                        .language("markdown")
+                });
                 let mut session = crate::vim::VimSession::new();
                 session.set_enabled(self.vim_mode, &editor, cx);
                 cx.observe(&editor, |this: &mut AppShell, editor, cx| {
@@ -1489,7 +2867,7 @@ impl AppShell {
         cx.notify();
     }
 
-    fn project_doc_edited(&mut self, editor: &Entity<TextareaState>, cx: &mut Context<Self>) {
+    fn project_doc_edited(&mut self, editor: &Entity<EditorState>, cx: &mut Context<Self>) {
         let Some(index) = self
             .projects
             .tabs
@@ -1631,34 +3009,41 @@ impl AppShell {
         }
     }
 
-    pub(crate) fn handle_project_description_key(
+    /// Debounce the description autosave. Every keystroke bumps the
+    /// generation and schedules a write; a newer keystroke makes the older
+    /// timer a no-op, so typing is never interrupted by a reload.
+    fn schedule_project_description_autosave(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.projects.detail_editor.as_mut() else {
+            return;
+        };
+        editor.description_generation = editor.description_generation.wrapping_add(1);
+        let generation = editor.description_generation;
+        let project_id = editor.project_id.clone();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(600))
+                .await;
+            this.update(cx, |this, cx| {
+                this.autosave_project_description(&project_id, generation, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn autosave_project_description(
         &mut self,
-        event: &KeyDownEvent,
-        window: &mut Window,
+        project_id: &str,
+        generation: u64,
         cx: &mut Context<Self>,
     ) {
-        let Some(editor) = &self.projects.detail_editor else {
+        let Some(editor) = self.projects.detail_editor.as_ref() else {
             return;
         };
-        let description = editor.description.clone();
-        if !description.read(cx).focus_handle(cx).is_focused(window) {
+        if editor.project_id != project_id || editor.description_generation != generation {
             return;
         }
-        let outcome = self
-            .projects
-            .detail_editor
-            .as_mut()
-            .map(|editor| editor.vim.handle_key(event, &description, window, cx));
-        let Some(outcome) = outcome else {
-            return;
-        };
-        if outcome.handled {
-            cx.stop_propagation();
-            cx.notify();
-        }
-        if matches!(outcome.ex, Some(vim::ExCommand::Write)) {
-            self.save_project_description(cx);
-        }
+        self.save_project_description(cx);
     }
 
     pub(crate) fn begin_project_doc_draft(
@@ -1685,6 +3070,9 @@ impl AppShell {
             ProjectDocDraftKind::File => "name.md",
             ProjectDocDraftKind::Folder => "Folder name",
         };
+        // The draft field lives in the Overview's document list, so surface
+        // that tab — the header actions start these drafts from the tree.
+        self.projects.active = 0;
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         input.update(cx, |state, cx| state.focus(window, cx));
         self.projects.doc_draft = Some(ProjectDocDraft {
@@ -1759,6 +3147,92 @@ impl AppShell {
         cx.notify();
     }
 
+    /// Copy picked files into the selected project's current document folder.
+    ///
+    /// Mirrors the Documents section's upload: the same PDF/Markdown filter,
+    /// the same collision handling (a second `report.pdf` lands as
+    /// `report-2.pdf`) and the same per-file error reporting. The project
+    /// directory is the guard root, so nothing can be written outside it.
+    pub(crate) fn upload_project_documents(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(root), Some(id)) = (self.projects.root.clone(), self.projects.selected.clone())
+        else {
+            return;
+        };
+        let Some(files) = rfd::FileDialog::new()
+            .add_filter("Documents", &["pdf", "md", "markdown"])
+            .pick_files()
+        else {
+            return;
+        };
+        if files.is_empty() {
+            return;
+        }
+        let project_root = project_dir(&root, &id);
+        let requested = project_root.join(&self.projects.doc_folder);
+        // A stale document folder falls back to the project root instead of
+        // failing the whole upload.
+        let dest = if requested.is_dir() {
+            requested
+        } else {
+            project_root.clone()
+        };
+        let mut errors = Vec::new();
+        for source in &files {
+            match import_file(source, &dest, &project_root) {
+                Ok(_) => {}
+                Err(error) => errors.push(format!("{}: {error}", source.display())),
+            }
+        }
+        self.projects.error = if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join("\n"))
+        };
+        self.projects.active = 0;
+        self.reload_project_detail();
+        cx.notify();
+    }
+
+    /// Attach a folder to the selected project through a native picker. Only
+    /// the reference is stored; nothing is copied or created on disk.
+    pub(crate) fn add_project_folder(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project_id) = self.projects.selected.clone() else {
+            return;
+        };
+        let Some(dir) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        let path = dir.display().to_string();
+        match self.store.add_project_path(&project_id, &path) {
+            Ok(_) => {
+                self.projects.paths = self.store.project_paths(&project_id).unwrap_or_default();
+                self.projects.error = None;
+            }
+            Err(error) => self.projects.error = Some(error),
+        }
+        cx.notify();
+    }
+
+    /// Drop a folder reference from the selected project. The folder on disk
+    /// is untouched.
+    pub(crate) fn remove_project_folder(&mut self, path_id: &str, cx: &mut Context<Self>) {
+        let Some(project_id) = self.projects.selected.clone() else {
+            return;
+        };
+        match self.store.remove_project_path(path_id) {
+            Ok(()) => {
+                self.projects.paths = self.store.project_paths(&project_id).unwrap_or_default();
+                self.projects.error = None;
+            }
+            Err(error) => self.projects.error = Some(error),
+        }
+        cx.notify();
+    }
+
     /// Read one consistent snapshot of cities, people and trips. Rendering and
     /// the minute tick work from this cache, so a tick never touches SQLite.
     fn load_clocks(&mut self) {
@@ -1798,9 +3272,10 @@ impl AppShell {
         self.clock_tick_running = None;
     }
 
-    /// Keep one tick loop alive while Clocks is on screen. It waits for the
-    /// nearer of the next minute and the nearest travel boundary, then
-    /// refreshes `now` from the cached rows only.
+    /// Keep one tick loop alive while the shell is on screen. The titlebar
+    /// clock is visible in every section, so the loop never gates on the
+    /// foreground section. It waits for the nearer of the next minute and the
+    /// nearest travel boundary, then refreshes `now` from the cached rows only.
     fn ensure_clock_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let generation = self.clock_tick;
         if self.clock_tick_running == Some(generation) {
@@ -1810,9 +3285,7 @@ impl AppShell {
         cx.spawn_in(window, async move |this, cx| {
             loop {
                 let wait = this.update_in(cx, |this, _window, cx| {
-                    if this.clock_tick_running != Some(generation)
-                        || this.section != Section::Clocks
-                    {
+                    if this.clock_tick_running != Some(generation) {
                         return None;
                     }
                     this.clocks.set_now(Timestamp::now());
@@ -1905,9 +3378,12 @@ impl AppShell {
             self.pending_sync = true;
             return;
         }
+        // The titlebar clock lists saved cities in every section, so the
+        // snapshot is always refreshed, not only while Clocks is open.
+        self.load_clocks();
         match self.section {
             Section::Tasks => self.load_tasks(),
-            Section::Clocks => self.load_clocks(),
+            Section::Clocks => {}
             Section::Projects => {
                 self.load_projects();
                 // The tree/detail reload above does not touch the board
@@ -2704,8 +4180,12 @@ impl AppShell {
         };
         match self.store.read_note(&path, &root) {
             Ok(text) => {
-                let editor =
-                    cx.new(|cx| TextareaState::new(window, cx).default_value(text.clone()));
+                let editor = cx.new(|cx| {
+                    EditorState::new(window, cx)
+                        .default_value(text.clone())
+                        .placeholder("Start writing… Markdown is supported")
+                        .language("markdown")
+                });
                 let mut session = crate::vim::VimSession::new();
                 session.set_enabled(self.vim_mode, &editor, cx);
                 cx.observe(&editor, |this: &mut AppShell, editor, cx| {
@@ -2721,14 +4201,16 @@ impl AppShell {
                     name,
                     editor: editor.clone(),
                     vim: session,
-                    preview: false,
+                    preview: true,
                     saved: text,
                     dirty: false,
                     generation: 0,
                 });
                 self.notes.active = Some(self.notes.tabs.len() - 1);
                 self.notes.error = None;
-                editor.update(cx, |state, cx| state.focus(window, cx));
+                if self.notes.tabs.last().is_some_and(|tab| !tab.preview) {
+                    editor.update(cx, |state, cx| state.focus(window, cx));
+                }
             }
             Err(error) => self.notes.error = Some(error.to_string()),
         }
@@ -2746,7 +4228,9 @@ impl AppShell {
         };
         self.notes.active = Some(index);
         let editor = self.notes.tabs[index].editor.clone();
-        editor.update(cx, |state, cx| state.focus(window, cx));
+        if !self.notes.tabs[index].preview {
+            editor.update(cx, |state, cx| state.focus(window, cx));
+        }
         cx.notify();
     }
 
@@ -2767,7 +4251,7 @@ impl AppShell {
 
     /// A textarea notification. Only a value that differs from the last write
     /// marks the tab dirty and schedules the debounce.
-    fn note_edited(&mut self, editor: &Entity<TextareaState>, cx: &mut Context<Self>) {
+    fn note_edited(&mut self, editor: &Entity<EditorState>, cx: &mut Context<Self>) {
         let Some(index) = self.notes.tabs.iter().position(|tab| tab.editor == *editor) else {
             return;
         };
@@ -3240,8 +4724,12 @@ impl AppShell {
         } else if kandrium_core::documents::is_markdown(&path) {
             match self.store.read_document(&path, &root) {
                 Ok(text) => {
-                    let editor =
-                        cx.new(|cx| TextareaState::new(window, cx).default_value(text.clone()));
+                    let editor = cx.new(|cx| {
+                        EditorState::new(window, cx)
+                            .default_value(text.clone())
+                            .placeholder("Start writing… Markdown is supported")
+                            .language("markdown")
+                    });
                     cx.observe(&editor, |this: &mut AppShell, editor, cx| {
                         this.doc_tab_edited(&editor, cx)
                     })
@@ -3673,7 +5161,7 @@ impl AppShell {
 
     /// A textarea notification. Only a value that differs from the last write
     /// marks the tab dirty and schedules the debounce.
-    fn doc_tab_edited(&mut self, editor: &Entity<TextareaState>, cx: &mut Context<Self>) {
+    fn doc_tab_edited(&mut self, editor: &Entity<EditorState>, cx: &mut Context<Self>) {
         let Some(index) = self
             .documents
             .tabs
@@ -4137,44 +5625,242 @@ impl AppShell {
         }
     }
 
-    fn titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn titlebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.tokens;
+        // The native titlebar is transparent and the content starts at the
+        // window's top edge, so this row *is* the titlebar: the macOS traffic
+        // lights float over the left inset (68 px) and the sections sit beside
+        // them. `app_owns_titlebar_drag` hands the move to us, so ONLY these
+        // two empty stretches drag the window (and zoom on double click).
+        // Nothing attached to the section control or the clock may carry a
+        // drag handler, or a press on a chip would move the window.
         div()
             .id("titlebar")
             .test_support()
             .w_full()
-            .h(px(48.))
+            .h(px(38.))
             .flex_shrink_0()
             .flex()
             .items_center()
-            .gap(px(16.))
-            .px(px(14.))
+            .gap(px(10.))
+            .px(px(10.))
             .bg(t.titlebar)
             .border_b_1()
             .border_color(t.border)
-            .child(self.section_control(cx))
-            .child(div().flex_1())
             .child(
                 div()
-                    .text(Text::Small)
-                    .text_color(t.text_faint)
-                    .child("gpui preview"),
+                    .id("titlebar-drag-left")
+                    .test_support()
+                    .h_full()
+                    .w(px(68.))
+                    .flex_shrink_0()
+                    .bg(t.titlebar)
+                    .on_mouse_down(MouseButton::Left, titlebar_drag),
             )
+            .child(self.section_control(window, cx))
+            .child(
+                div()
+                    .id("titlebar-drag-right")
+                    .test_support()
+                    .h_full()
+                    .flex_1()
+                    .bg(t.titlebar)
+                    .on_mouse_down(MouseButton::Left, titlebar_drag),
+            )
+            .when_some(self.titlebar_clock(cx), |el, clock| el.child(clock))
     }
 
-    fn section_control(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The clock of the city picked for the titlebar, if any cities are saved.
+    /// Resolution never writes settings: a deleted city falls back to the
+    /// first saved one until the user picks again.
+    fn resolved_titlebar_clock(&self) -> Option<&clocks::ClockEntry> {
+        self.titlebar_clock
+            .as_deref()
+            .and_then(|id| self.clocks.entry(id))
+            .or_else(|| self.clocks.entries.first())
+    }
+
+    /// `Wed 11 Nov 8:13 pm City` — one mono run in the titlebar. Mono keeps
+    /// the numerals from shifting as the minute changes.
+    fn titlebar_clock_label(&self, now: Timestamp, zone: Option<&jiff::tz::TimeZone>) -> String {
+        zone.map(|zone| format_titlebar_clock(now, zone))
+            .unwrap_or_else(|| "--:--".to_string())
+    }
+
+    /// Date, 12-hour time and city name in one run, in the mockup's 10 px mono
+    /// ghost type; a click opens the city menu. Deliberately carries no drag
+    /// handler: the titlebar row is app-owned.
+    fn titlebar_clock(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let t = self.tokens;
+        let entry = self.resolved_titlebar_clock()?;
+        let label = format!(
+            "{} {}",
+            self.titlebar_clock_label(self.clocks.now, entry.zone.as_ref()),
+            entry.city
+        );
+        let tokens = t;
+        Some(
+            div()
+                .id("titlebar-clock")
+                .test_support()
+                .aria_label(label.clone())
+                .h(px(26.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .rounded(px(5.))
+                .cursor_pointer()
+                .hover(move |style| style.bg(tokens.hover))
+                .child(
+                    div()
+                        .id("titlebar-clock-text")
+                        .test_support()
+                        .text(Text::Micro)
+                        .text_color(t.text_ghost)
+                        .whitespace_nowrap()
+                        .child(label),
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                    this.titlebar_clock_menu = !this.titlebar_clock_menu;
+                    cx.notify();
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// The city list under the titlebar clock. Rendered as an overlay on
+    /// `app-root` (like the card modal) so it paints above the section body;
+    /// a transparent backdrop turns any outside press into a dismissal.
+    fn titlebar_clock_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let t = self.tokens;
+        let selected = self.resolved_titlebar_clock().map(|entry| entry.id.clone());
+        let now = self.clocks.now;
+        let use_24h = self.use_24h;
+        let entries = &self.clocks.entries;
+        let row_count = entries.len();
+        if row_count == 0 {
+            return None;
+        }
+        Some(
+            div()
+                .id("titlebar-clock-menu-layer")
+                .absolute()
+                .inset_0()
+                .child(
+                    div()
+                        .id("titlebar-clock-backdrop")
+                        .test_support()
+                        .absolute()
+                        .inset_0()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                this.titlebar_clock_menu = false;
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("titlebar-clock-menu")
+                        .test_support()
+                        .absolute()
+                        .top(px(40.))
+                        .right(px(8.))
+                        .w(px(240.))
+                        .p(px(4.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(1.))
+                        .rounded(px(t.radius_lg))
+                        .bg(t.card)
+                        .border_1()
+                        .border_color(t.border)
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .children(entries.iter().map(|entry| {
+                            let id = entry.id.clone();
+                            let is_selected = selected.as_deref() == Some(entry.id.as_str());
+                            let meta = entry
+                                .zone
+                                .as_ref()
+                                .map(|zone| format_clock_menu_meta(now, zone, use_24h))
+                                .unwrap_or_else(|| "--".into());
+                            let tokens = t;
+                            div()
+                                .id(format!("titlebar-clock-item-{}", entry.id))
+                                .test_support()
+                                .h(px(26.))
+                                .px(px(8.))
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .rounded(px(4.))
+                                .cursor_pointer()
+                                .hover(move |style| style.bg(tokens.hover))
+                                .child(
+                                    div()
+                                        .w(px(6.))
+                                        .h(px(14.))
+                                        .rounded_full()
+                                        .bg(if is_selected { t.accent } else { t.titlebar }),
+                                )
+                                .child(
+                                    div()
+                                        .id(format!("titlebar-clock-city-{}", entry.id))
+                                        .test_support()
+                                        .flex_1()
+                                        .text(Text::Micro)
+                                        .text_color(if is_selected { t.text } else { t.text_muted })
+                                        .truncate()
+                                        .child(entry.city.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .id(format!("titlebar-clock-meta-{}", entry.id))
+                                        .test_support()
+                                        .text(Text::Micro)
+                                        .text_color(t.text_faint)
+                                        .whitespace_nowrap()
+                                        .child(meta),
+                                )
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                                    this.select_titlebar_clock(&id, cx)
+                                }))
+                        }))
+                        .into_any_element(),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Point the titlebar at one saved city and persist the choice.
+    pub(crate) fn select_titlebar_clock(&mut self, clock_id: &str, cx: &mut Context<Self>) {
+        if self.clocks.entry(clock_id).is_none() {
+            return;
+        }
+        self.titlebar_clock = Some(clock_id.to_string());
+        self.titlebar_clock_menu = false;
+        self.persist_settings();
+        cx.notify();
+    }
+
+    /// The mockup's nav: text-only chips on the titlebar surface, 26 px tall,
+    /// 5 px radius, 1 px apart. The active one sits on `surface2`; hover is a
+    /// faint wash and full-strength text. Below 980 px the mockup tightens the
+    /// horizontal padding to 8 px, which covers the 940 px minimum window.
+    fn section_control(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = self.tokens;
+        let pad = if window.bounds().size.width <= px(980.) {
+            px(8.)
+        } else {
+            px(10.)
+        };
         div()
             .id("section-control")
             .test_support()
             .flex()
             .items_center()
-            .gap(px(2.))
-            .p(px(2.))
-            .rounded(px(t.radius))
-            .bg(t.field)
-            .border_1()
-            .border_color(t.border)
+            .gap(px(1.))
             .children(Section::ALL.into_iter().map(|section| {
                 let selected = section == self.section;
                 div()
@@ -4182,30 +5868,17 @@ impl AppShell {
                     .test_support()
                     .flex()
                     .items_center()
-                    .gap(px(6.))
                     .h(px(26.))
-                    .px(px(10.))
-                    .rounded(px(4.))
+                    .px(pad)
+                    .rounded(px(5.))
                     .cursor_pointer()
                     .text(Text::Button)
-                    .text_color(if selected {
-                        t.accent_text
-                    } else {
-                        t.text_muted
-                    })
-                    .when(selected, |el| el.bg(t.accent_soft))
-                    .child(icon(
-                        section.icon(),
-                        14.,
-                        if selected {
-                            t.accent_text
-                        } else {
-                            t.text_muted
-                        },
-                    ))
+                    .text_color(if selected { t.text } else { t.text_muted })
+                    .when(selected, |el| el.bg(t.surface_2))
+                    .hover(move |style| style.bg(t.hover).text_color(t.text))
                     .child(section.label())
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                        this.select(section, cx);
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.select(section, window, cx);
                     }))
             }))
     }
@@ -4213,7 +5886,7 @@ impl AppShell {
     fn body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = self.tokens;
         match self.section {
-            Section::Tasks => self.tasks_body(cx),
+            Section::Tasks => self.tasks_body(window, cx),
             Section::Clocks => clocks::clocks_view(&mut self.clocks, self.use_24h, &t, window, cx)
                 .into_any_element(),
             Section::Notes => notes::notes_view(&self.notes, &t, window, cx).into_any_element(),
@@ -4230,13 +5903,31 @@ impl AppShell {
                 self.ensure_project_filter(window, cx);
                 self.ensure_project_editor(window, cx);
                 self.sync_project_board();
+                self.prepare_column_scrolls("");
+                self.column_edge_scroll(window);
                 projects::projects_view(
                     &self.projects,
                     self.board
                         .as_ref()
                         .filter(|_| self.project_board_shown.is_some()),
-                    self.drop_target.as_ref(),
-                    self.dragging_card.as_deref(),
+                    tasks::BoardDrag {
+                        target: self.drop_target.as_ref(),
+                        previous: self.previous_target.as_ref(),
+                        dragging: self.dragging_card.as_deref(),
+                        gap_height: self.drag_gap_height,
+                        metrics: &self.drag_metrics,
+                        settled: self
+                            .settled_card
+                            .as_ref()
+                            .map(|(id, token)| (id.as_str(), *token)),
+                        editing: self
+                            .title_edit
+                            .as_ref()
+                            .map(|edit| (edit.card_id.as_str(), &edit.input)),
+                        hovered: self.hovered_card.as_deref(),
+                        scrolls: &self.column_scrolls,
+                        pointer: self.drag_pointer.clone(),
+                    },
                     &t,
                     window,
                     cx,
@@ -4246,8 +5937,56 @@ impl AppShell {
         }
     }
 
-    fn tasks_body(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn tasks_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = self.tokens;
+        let search = self.ensure_board_search(window, cx);
+        let query = search.read(cx).value().to_string();
+        self.prepare_column_scrolls(&query);
+        self.column_edge_scroll(window);
+        if self.showing_archive {
+            self.ensure_archive(window, cx);
+            let tabs = tasks::task_tabs(&self.boards, None);
+            let state = self.archive.as_ref().expect("archive state");
+            let cards = self.archive_cards.as_deref().unwrap_or(&[]);
+            let page = archive::archive_view(
+                cards,
+                &self.boards,
+                state,
+                &self.archive_filter_anchor,
+                &t,
+                cx,
+            );
+            let error = self.archive_error.clone();
+            return div()
+                .id("tasks-body")
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(tasks::tabs_strip(
+                    &tabs,
+                    None,
+                    0,
+                    true,
+                    tasks::Search {
+                        input: &search,
+                        query: "",
+                    },
+                    &t,
+                    cx,
+                ))
+                .when_some(error, |el, error| {
+                    el.child(
+                        div()
+                            .px(px(16.))
+                            .py(px(6.))
+                            .text(Text::Body)
+                            .text_color(t.danger)
+                            .child(error),
+                    )
+                })
+                .child(div().flex_1().min_h_0().child(page))
+                .into_any_element();
+        }
         if let Some(error) = &self.board_error {
             return placeholder::message(
                 "tasks-error",
@@ -4275,6 +6014,18 @@ impl AppShell {
             title: board.title.clone(),
         };
         let tabs = tasks::task_tabs(&self.boards, Some(&active));
+        let active_cards: usize = board
+            .columns
+            .iter()
+            .map(|column| column.ordered_cards().len())
+            .sum();
+        // "+ Add card" belongs to real boards only: the synthetic All board has
+        // no column to write to, and a project board creates cards in its modal.
+        let allow_add = self.boards.iter().any(|candidate| candidate.id == board.id);
+        let add_form = self
+            .add_card
+            .as_ref()
+            .map(|form| (form.column_id.as_str(), &form.input));
         div()
             .id("tasks-body")
             .size_full()
@@ -4283,16 +6034,46 @@ impl AppShell {
             .child(tasks::tabs_strip(
                 &tabs,
                 self.active_board_id.as_deref(),
+                active_cards,
+                false,
+                tasks::Search {
+                    input: &search,
+                    query: &query,
+                },
                 &t,
                 cx,
             ))
-            .child(div().flex_1().min_h_0().child(tasks::board_view(
-                board,
-                self.drop_target.as_ref(),
-                self.dragging_card.as_deref(),
-                &t,
-                cx,
-            )))
+            .child(
+                div().flex_1().min_h_0().child(tasks::board_view(
+                    board,
+                    tasks::BoardDrag {
+                        target: self.drop_target.as_ref(),
+                        previous: self.previous_target.as_ref(),
+                        dragging: self.dragging_card.as_deref(),
+                        gap_height: self.drag_gap_height,
+                        metrics: &self.drag_metrics,
+                        settled: self
+                            .settled_card
+                            .as_ref()
+                            .map(|(id, token)| (id.as_str(), *token)),
+                        editing: self
+                            .title_edit
+                            .as_ref()
+                            .map(|edit| (edit.card_id.as_str(), &edit.input)),
+                        hovered: self.hovered_card.as_deref(),
+                        scrolls: &self.column_scrolls,
+                        pointer: self.drag_pointer.clone(),
+                    },
+                    tasks::AddCard {
+                        allowed: allow_add,
+                        form: add_form,
+                    },
+                    &query,
+                    self.title_edit.as_ref().map(|edit| edit.card_id.as_str()),
+                    &t,
+                    cx,
+                )),
+            )
             .into_any_element()
     }
 }
@@ -4391,15 +6172,243 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+impl AppShell {
+    /// The archive board-filter menu, floated at the root over the table.
+    fn archive_filter_layer(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.showing_archive {
+            return None;
+        }
+        let state = self.archive.as_ref()?;
+        if !state.filter_open {
+            return None;
+        }
+        let anchor = (*self.archive_filter_anchor.borrow())?;
+        let viewport = window.viewport_size();
+        let panel = archive::filter_menu_panel(
+            anchor,
+            &self.boards,
+            &state.board_filter,
+            viewport.width,
+            viewport.height,
+            &self.tokens,
+            cx,
+        );
+        let focus = self.archive_filter_focus.clone();
+        Some(
+            div()
+                .id("archive-board-filter-layer")
+                .absolute()
+                .inset_0()
+                .when_some(focus, |el, focus| el.track_focus(&focus))
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                    if event.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        this.close_archive_filter(cx);
+                    }
+                }))
+                .child(
+                    div()
+                        .id("archive-board-filter-catcher")
+                        .test_support()
+                        .absolute()
+                        .inset_0()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                this.close_archive_filter(cx)
+                            }),
+                        ),
+                )
+                .child(panel)
+                .into_any_element(),
+        )
+    }
+
+    /// The card right-click menu: a press-catching backdrop plus the two
+    /// entries, anchored at the clamped pointer position.
+    fn card_menu_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let menu = self.card_menu.as_ref()?;
+        let t = self.tokens;
+        let position = menu.position;
+        let menu_card_id = menu.card_id.clone();
+        let focus = self.card_menu_focus.clone();
+        Some(
+            div()
+                .id("card-menu-layer")
+                .absolute()
+                .inset_0()
+                .when_some(focus, |el, focus| el.track_focus(&focus))
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                    if event.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        this.close_card_menu(cx);
+                    }
+                }))
+                .child(
+                    div()
+                        .id("card-menu-backdrop")
+                        .test_support()
+                        .absolute()
+                        .inset_0()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                this.close_card_menu(cx)
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                this.close_card_menu(cx)
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("card-menu")
+                        .test_support()
+                        .absolute()
+                        .left(position.x)
+                        .top(position.y)
+                        .w(px(160.))
+                        .p(px(4.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(1.))
+                        .rounded(px(t.radius_lg))
+                        .bg(t.card)
+                        .border_1()
+                        .border_color(t.border)
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(menu_item(
+                            "card-menu-archive",
+                            Icon::Archive,
+                            "Archive",
+                            t.text,
+                            &t,
+                            {
+                                let card_id = menu_card_id.clone();
+                                cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                                    this.archive_card(&card_id, cx)
+                                })
+                            },
+                        ))
+                        .child(menu_item(
+                            "card-menu-delete",
+                            Icon::Trash2,
+                            "Delete",
+                            t.danger,
+                            &t,
+                            {
+                                let card_id = menu_card_id;
+                                cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                                    this.request_delete_card(&card_id, cx)
+                                })
+                            },
+                        )),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The confirmation dialog: a dim backdrop, Esc to cancel, and Cancel /
+    /// Delete buttons.
+    fn card_confirm_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let confirm = self.card_confirm.as_ref()?;
+        let t = self.tokens;
+        let title = confirm.title;
+        let message = confirm.message;
+        let focus = self.card_confirm_focus.clone();
+        let panel = div()
+            .id("card-confirm")
+            .test_support()
+            .w(px(360.))
+            .p(px(18.))
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .rounded(px(t.radius_lg))
+            .bg(t.card)
+            .border_1()
+            .border_color(t.border)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().text(Text::Heading).text_color(t.text).child(title))
+            .child(
+                div()
+                    .text(Text::Body)
+                    .text_color(t.text_muted)
+                    .child(message),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(dialog_button(
+                        "card-confirm-cancel",
+                        "Cancel",
+                        t.text,
+                        t.field,
+                        cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.cancel_card_confirm(cx)
+                        }),
+                    ))
+                    .child(dialog_button(
+                        "card-confirm-delete",
+                        "Delete",
+                        t.accent_text,
+                        t.danger,
+                        cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.confirm_card_delete(cx)
+                        }),
+                    )),
+            );
+        Some(
+            div()
+                .id("card-confirm-layer")
+                .absolute()
+                .inset_0()
+                .when_some(focus, |el, focus| el.track_focus(&focus))
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                    if event.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        this.cancel_card_confirm(cx);
+                    }
+                }))
+                .child(
+                    div()
+                        .id("card-confirm-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .bg(rgba(0x00000059))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                this.cancel_card_confirm(cx)
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(panel),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
 impl Render for AppShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // One clock reading per frame; the tick only refreshes this cache.
-        if self.section == Section::Clocks {
-            self.clocks.set_now(Timestamp::now());
-            self.ensure_clock_tick(window, cx);
-        } else if self.clock_tick_running.is_some() {
-            self.invalidate_clock_tick();
-        }
+        // One clock reading per frame; the tick only refreshes this cache. The
+        // titlebar clock renders in every section, so the loop always runs.
+        self.clocks.set_now(Timestamp::now());
+        self.ensure_clock_tick(window, cx);
         // An external change that arrived mid-drag lands once the drop has
         // finished, so the board never rearranges under the pointer.
         if self.pending_sync
@@ -4423,6 +6432,21 @@ impl Render for AppShell {
                 cx,
             )
         });
+        let clock_menu = if self.titlebar_clock_menu {
+            self.titlebar_clock_menu(cx)
+        } else {
+            None
+        };
+        let flight = self.drag_flight_overlay(cx);
+        // The confirmation takes focus so Esc reaches its layer.
+        if self.card_confirm.is_some() && self.card_confirm_focus.is_none() {
+            let focus = cx.focus_handle();
+            window.focus(&focus, cx);
+            self.card_confirm_focus = Some(focus);
+        }
+        let card_menu = self.card_menu_layer(cx);
+        let card_confirm = self.card_confirm_layer(cx);
+        let archive_filter = self.archive_filter_layer(window, cx);
         div()
             .id("app-root")
             .relative()
@@ -4437,7 +6461,7 @@ impl Render for AppShell {
                     .bg(t.pasteboard)
                     .text(Text::Body)
                     .text_color(t.text)
-                    .child(self.titlebar(cx))
+                    .child(self.titlebar(window, cx))
                     .child(
                         div()
                             .id("section-body")
@@ -4449,7 +6473,82 @@ impl Render for AppShell {
                     ),
             )
             .children(overlay)
+            .children(clock_menu)
+            .children(flight)
+            .children(archive_filter)
+            .children(card_menu)
+            .children(card_confirm)
+            // A press anywhere outside the inline title field commits it, the
+            // same way egui's blur does; the field stops propagation for its
+            // own presses.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.commit_card_title_edit(cx)
+                }),
+            )
+            // A release outside the board still ends the drag. Drop handlers
+            // stop propagation, so this only runs when nothing accepted the
+            // drop — the refused-drop snap-back.
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, window, cx| this.cancel_card_drag(window, cx)),
+            )
     }
+}
+
+/// One row in a small context menu.
+fn menu_item(
+    id: &'static str,
+    glyph: Icon,
+    label: &'static str,
+    color: gpui_kit::Rgba,
+    t: &Tokens,
+    handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let tokens = *t;
+    div()
+        .id(id)
+        .test_support()
+        .h(px(26.))
+        .px(px(8.))
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .rounded(px(4.))
+        .cursor_pointer()
+        .hover(move |style| style.bg(tokens.hover))
+        .text(Text::Body)
+        .text_color(color)
+        .child(icon(glyph, 13., color))
+        .child(label)
+        .on_click(handler)
+        .into_any_element()
+}
+
+/// One button in the delete confirmation.
+fn dialog_button(
+    id: &'static str,
+    label: &'static str,
+    color: gpui_kit::Rgba,
+    background: gpui_kit::Rgba,
+    handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .test_support()
+        .h(px(28.))
+        .px(px(12.))
+        .flex()
+        .items_center()
+        .rounded(px(5.))
+        .bg(background)
+        .cursor_pointer()
+        .text(Text::Button)
+        .text_color(color)
+        .child(label)
+        .on_click(handler)
+        .into_any_element()
 }
 
 #[cfg(test)]
@@ -4558,7 +6657,11 @@ mod settings_tests {
         cx.update(|window, cx| window.render_frame(cx));
 
         let card_id = cx.update(|_window, app| first_card_id(view.read(app)));
-        cx.update(|_window, app| view.update(app, |shell, cx| shell.begin_card_drag(&card_id, cx)));
+        cx.update(|_window, app| {
+            view.update(app, |shell, cx| {
+                shell.begin_card_drag(&card_id, "col-test", None, Point::default(), cx)
+            })
+        });
 
         let db = kandrium_core::open_db(&path).expect("second connection");
         kandrium_core::rename_card(&db, &card_id, "Renamed elsewhere").expect("external rename");
@@ -4629,5 +6732,271 @@ mod settings_tests {
         );
         assert_eq!(tab.pending.len(), 1);
         assert_eq!(tab.error.as_deref(), Some("boom"));
+    }
+
+    /// The titlebar clock uses one exact run: weekday, day, month, lowercase
+    /// 12-hour time — no leading zeros, no seconds, no 24-hour form.
+    #[test]
+    fn titlebar_clock_format_matches_the_spec() {
+        let utc = jiff::tz::TimeZone::get("UTC").expect("UTC zone");
+        let noon: Timestamp = "2026-11-11T20:13:00Z".parse().unwrap();
+        assert_eq!(format_titlebar_clock(noon, &utc), "Wed 11 Nov 8:13 pm");
+        let midnight: Timestamp = "2026-01-05T00:05:00Z".parse().unwrap();
+        assert_eq!(
+            format_titlebar_clock(midnight, &utc),
+            "Mon 5 Jan 12:05 am",
+            "single-digit day and hour keep no leading zero"
+        );
+    }
+
+    /// Menu rows run `weekday day month time`, with the time following the
+    /// app's 12/24-hour preference.
+    #[test]
+    fn clock_menu_meta_matches_the_row_spec() {
+        let utc = jiff::tz::TimeZone::get("UTC").expect("UTC zone");
+        let afternoon: Timestamp = "2026-11-12T15:28:00Z".parse().unwrap();
+        assert_eq!(
+            format_clock_menu_meta(afternoon, &utc, false),
+            "Thu 12 Nov 3:28 pm"
+        );
+        assert_eq!(
+            format_clock_menu_meta(afternoon, &utc, true),
+            "Thu 12 Nov 15:28"
+        );
+        let morning: Timestamp = "2026-11-12T03:28:00Z".parse().unwrap();
+        assert_eq!(
+            format_clock_menu_meta(morning, &utc, false),
+            "Thu 12 Nov 3:28 am"
+        );
+    }
+
+    /// The column and the source insertion point (`before`) of a card.
+    fn drag_source(shell: &AppShell, card_id: &str) -> (String, Option<String>) {
+        let board = shell.board.as_ref().expect("board");
+        for column in &board.columns {
+            let cards = column.ordered_cards();
+            if let Some(index) = cards.iter().position(|card| card.id == card_id) {
+                return (
+                    column.id.clone(),
+                    cards.get(index + 1).map(|card| card.id.clone()),
+                );
+            }
+        }
+        panic!("card {card_id} not found");
+    }
+
+    fn card_order(shell: &AppShell) -> Vec<String> {
+        shell
+            .board
+            .as_ref()
+            .expect("board")
+            .columns
+            .iter()
+            .flat_map(|column| column.ordered_cards())
+            .map(|card| card.id.clone())
+            .collect()
+    }
+
+    /// Pickup leaves the flow in exactly the same shape: the card disappears
+    /// but a same-height gap takes its row, so nothing shifts.
+    #[gpui::test]
+    fn a_drag_opens_a_same_height_gap_at_the_source(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seeded_db(dir.path());
+        cx.update(gpui_kit::init);
+        let boot = path.clone();
+        let (view, cx) =
+            cx.add_window_view(move |_window, _cx| AppShell::with_store(Store::open_path(boot)));
+        cx.update(|window, cx| window.render_frame(cx));
+
+        let card_id = cx.update(|_window, app| first_card_id(view.read(app)));
+        let (column_id, before) = cx
+            .update(|_window, app| view.read_with(app, |shell, _app| drag_source(shell, &card_id)));
+
+        cx.update(|_window, app| {
+            view.update(app, |shell, cx| {
+                shell.begin_card_drag(&card_id, &column_id, before.clone(), Point::default(), cx);
+                assert_eq!(shell.dragging_card.as_deref(), Some(card_id.as_str()));
+                let target = shell.drop_target.as_ref().expect("source target");
+                assert_eq!(target.column_id, column_id);
+                assert_eq!(target.before, before);
+                assert!(
+                    shell.drag_gap_height > 0.0,
+                    "the gap must take the card's measured row height"
+                );
+            })
+        });
+    }
+
+    /// A cancelled drag keeps the card hidden and flies the ghost back to the
+    /// source slot; the card only reappears when the flight lands.
+    #[gpui::test]
+    fn a_cancelled_drag_flies_back_before_the_card_returns(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seeded_db(dir.path());
+        cx.update(gpui_kit::init);
+        let boot = path.clone();
+        let (view, cx) =
+            cx.add_window_view(move |_window, _cx| AppShell::with_store(Store::open_path(boot)));
+        cx.update(|window, cx| window.render_frame(cx));
+
+        let card_id = cx.update(|_window, app| first_card_id(view.read(app)));
+        // Give the card a meta row, so the flight has something to lose: a
+        // title-only overlay would drop the due date and dots for the length
+        // of the snap-back.
+        let title = cx.update(|_window, app| {
+            view.read_with(app, |shell, _app| {
+                shell
+                    .card_snapshot(&card_id)
+                    .expect("card on the board")
+                    .title
+            })
+        });
+        cx.update(|_window, app| {
+            view.update(app, |shell, cx| {
+                let body = CreateCardBody {
+                    title,
+                    due_date: Some("2026-01-02".into()),
+                    labels: Some(vec![0]),
+                    ..Default::default()
+                };
+                shell
+                    .store
+                    .save_card(&card_id, &body, None, None)
+                    .expect("store the card's meta");
+                shell.reload_displayed_board();
+                cx.notify();
+            })
+        });
+        let (column_id, before) = cx
+            .update(|_window, app| view.read_with(app, |shell, _app| drag_source(shell, &card_id)));
+        cx.update(|_window, app| {
+            view.update(app, |shell, cx| {
+                shell.begin_card_drag(&card_id, &column_id, before.clone(), Point::default(), cx);
+            })
+        });
+        cx.update(|window, app| {
+            view.update(app, |shell, cx| shell.cancel_card_drag(window, cx));
+        });
+
+        let token = cx.update(|_window, app| {
+            view.read_with(app, |shell, _app| {
+                assert!(
+                    shell.dragging_card.is_some(),
+                    "the card stays hidden until touchdown"
+                );
+                let flight = shell.drag_flight.as_ref().expect("snap-back flight");
+                let target = shell
+                    .drop_target
+                    .as_ref()
+                    .expect("gap parked at the origin");
+                assert_eq!(target.column_id, column_id);
+                // The overlay paints the card it came from, meta row included.
+                assert_eq!(flight.card.id, card_id);
+                assert_eq!(flight.card.due_date, "2026-01-02");
+                assert_eq!(flight.card.labels, vec![0]);
+                flight.token
+            })
+        });
+        // The next frame really does paint the flying card: the real row is
+        // hidden while the flight is in the air, so this overlay is the only
+        // place the meta row can come from.
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.update(|window, _cx| {
+            assert!(
+                window.try_find("drag-flight").is_some(),
+                "the flying card stays on screen during the snap-back"
+            );
+        });
+        cx.update(|_window, app| view.update(app, |shell, cx| shell.finish_drag_flight(token, cx)));
+        cx.update(|_window, app| {
+            view.read_with(app, |shell, _app| {
+                assert!(shell.dragging_card.is_none());
+                assert!(shell.drag_flight.is_none());
+                assert_eq!(
+                    shell.settled_card.as_ref().map(|(id, _)| id.as_str()),
+                    Some(card_id.as_str()),
+                    "the landed card gets the settle fade token"
+                );
+            })
+        });
+    }
+
+    /// A drop on the card's own slot is a cancel: no write, no reorder.
+    #[gpui::test]
+    fn a_drop_on_its_own_slot_does_not_move_the_card(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seeded_db(dir.path());
+        cx.update(gpui_kit::init);
+        let boot = path.clone();
+        let (view, cx) =
+            cx.add_window_view(move |_window, _cx| AppShell::with_store(Store::open_path(boot)));
+        cx.update(|window, cx| window.render_frame(cx));
+
+        let card_id = cx.update(|_window, app| first_card_id(view.read(app)));
+        let (column_id, before) = cx
+            .update(|_window, app| view.read_with(app, |shell, _app| drag_source(shell, &card_id)));
+        let order = cx.update(|_window, app| view.read_with(app, |shell, _app| card_order(shell)));
+
+        cx.update(|_window, app| {
+            view.update(app, |shell, cx| {
+                shell.begin_card_drag(&card_id, &column_id, before.clone(), Point::default(), cx);
+            })
+        });
+        cx.update(|window, app| {
+            view.update(app, |shell, cx| {
+                shell.drop_card(&card_id, &column_id, window, cx)
+            });
+        });
+
+        let token = cx.update(|_window, app| {
+            view.read_with(app, |shell, _app| {
+                assert_eq!(card_order(shell), order, "the card must not move");
+                shell.drag_flight.as_ref().map(|flight| flight.token)
+            })
+        });
+        if let Some(token) = token {
+            cx.update(|_window, app| {
+                view.update(app, |shell, cx| shell.finish_drag_flight(token, cx))
+            });
+        }
+        cx.update(|_window, app| {
+            view.read_with(app, |shell, _app| {
+                assert!(shell.dragging_card.is_none());
+                assert!(shell.drop_target.is_none());
+            })
+        });
+    }
+
+    /// Reduced motion teleports: the drag ends at once and no flight exists.
+    #[gpui::test]
+    fn reduced_motion_cancels_without_a_flight(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = seeded_db(dir.path());
+        cx.update(gpui_kit::init);
+        let boot = path.clone();
+        let (view, cx) =
+            cx.add_window_view(move |_window, _cx| AppShell::with_store(Store::open_path(boot)));
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.update(|_window, app| app.set_reduce_motion(true));
+
+        let card_id = cx.update(|_window, app| first_card_id(view.read(app)));
+        let (column_id, before) = cx
+            .update(|_window, app| view.read_with(app, |shell, _app| drag_source(shell, &card_id)));
+        cx.update(|_window, app| {
+            view.update(app, |shell, cx| {
+                shell.begin_card_drag(&card_id, &column_id, before.clone(), Point::default(), cx);
+            })
+        });
+        cx.update(|window, app| {
+            view.update(app, |shell, cx| shell.cancel_card_drag(window, cx));
+        });
+        cx.update(|_window, app| {
+            view.read_with(app, |shell, _app| {
+                assert!(shell.dragging_card.is_none());
+                assert!(shell.drag_flight.is_none(), "reduced motion must not fly");
+                assert!(shell.drop_target.is_none());
+            })
+        });
     }
 }

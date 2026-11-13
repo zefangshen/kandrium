@@ -122,6 +122,26 @@ impl Settings {
             .insert("section".into(), section.id().to_string());
     }
 
+    /// Clock id shown in the titlebar. Missing, blank or unparsable values
+    /// fall back to the first saved city at resolve time.
+    pub fn titlebar_clock(&self) -> Option<&str> {
+        self.values
+            .get("titlebar_clock")
+            .map(String::as_str)
+            .filter(|value| !value.trim().is_empty())
+    }
+
+    pub fn set_titlebar_clock(&mut self, clock_id: Option<&str>) {
+        match clock_id {
+            Some(id) if !id.trim().is_empty() => {
+                self.values.insert("titlebar_clock".into(), id.to_string());
+            }
+            _ => {
+                self.values.remove("titlebar_clock");
+            }
+        }
+    }
+
     pub fn tree_width(&self, panel: TreePanel) -> f32 {
         let width = self
             .values
@@ -145,6 +165,17 @@ impl Settings {
 
     pub fn set_tree_open(&mut self, panel: TreePanel, open: bool) {
         self.set_bool(panel.open_key(), open);
+    }
+
+    /// Whether the Tasks section last showed the Archived page. The board
+    /// selection itself is not persisted, so this is the only Tasks view state
+    /// that survives a restart.
+    pub fn tasks_archive(&self) -> bool {
+        self.bool_at("tasks_archive", false)
+    }
+
+    pub fn set_tasks_archive(&mut self, on: bool) {
+        self.set_bool("tasks_archive", on);
     }
 
     fn bool_at(&self, key: &str, default: bool) -> bool {
@@ -228,5 +259,27 @@ mod tests {
             text, "notes_tree_open=0\nsection=notes\nvim_mode=0\n",
             "keys must be deterministic for a clean diff"
         );
+    }
+
+    #[test]
+    fn titlebar_clock_round_trips_and_clears() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.titlebar_clock(), None);
+        settings.set_titlebar_clock(Some("clock_tokyo"));
+        assert_eq!(settings.titlebar_clock(), Some("clock_tokyo"));
+        let again = Settings::parse(&settings.to_text());
+        assert_eq!(again.titlebar_clock(), Some("clock_tokyo"));
+        settings.set_titlebar_clock(None);
+        assert_eq!(settings.titlebar_clock(), None);
+        assert!(!settings.to_text().contains("titlebar_clock"));
+    }
+
+    #[test]
+    fn blank_titlebar_clock_reads_as_unset() {
+        let settings = Settings::parse("titlebar_clock=   \n");
+        assert_eq!(settings.titlebar_clock(), None);
+        let mut settings = settings;
+        settings.set_titlebar_clock(Some("  "));
+        assert!(!settings.to_text().contains("titlebar_clock"));
     }
 }

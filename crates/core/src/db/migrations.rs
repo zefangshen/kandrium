@@ -61,8 +61,13 @@ pub const SCHEMA_V10_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../migrations/0010_clock_travels.sql"
 ));
+/// Additive v11 step (multiple folders per project).
+pub const SCHEMA_V11_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../migrations/0011_project_paths.sql"
+));
 /// Latest schema version. Must match the number of entries in the migration set.
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// The ordered migration set. `rusqlite_migration` tracks the applied version
 /// in `PRAGMA user_version`, so v1 databases upgrade through only the missing
@@ -81,6 +86,7 @@ pub(crate) fn migrations() -> Migrations<'static> {
         M::up(SCHEMA_V8_SQL),
         M::up(SCHEMA_V9_SQL),
         M::up(SCHEMA_V10_SQL),
+        M::up(SCHEMA_V11_SQL),
     ])
 }
 

@@ -10,7 +10,7 @@
 
 use std::borrow::Cow;
 
-use gpui_kit::{App, DefiniteLength, FontWeight, Rgba, Styled, px, rgb};
+use gpui_kit::{App, DefiniteLength, FontWeight, Rgba, Styled, px, rgb, rgba};
 
 /// The proportional family bundled with the app (Inter).
 pub const FONT_SANS: &str = "Inter";
@@ -27,13 +27,21 @@ pub struct Tokens {
     pub panel: Rgba,
     /// Background behind columns (the "canvas").
     pub pasteboard: Rgba,
-    /// Card / dialog background (columns share it, separated by a border).
+    /// Column surface / dialog background.
     pub card: Rgba,
+    /// Raised surface inside a column: card fill, active tab.
+    pub surface_2: Rgba,
+    /// Hovered card fill.
+    pub surface_3: Rgba,
     pub border: Rgba,
+    /// Border of a hovered card.
+    pub border_hover: Rgba,
     pub divider: Rgba,
     pub text: Rgba,
     pub text_muted: Rgba,
     pub text_faint: Rgba,
+    /// Placeholder / disabled text.
+    pub text_ghost: Rgba,
     pub icon: Rgba,
     pub hover: Rgba,
     pub pressed: Rgba,
@@ -41,64 +49,85 @@ pub struct Tokens {
     pub accent: Rgba,
     pub accent_text: Rgba,
     pub accent_soft: Rgba,
+    /// Accent at ring strength: away borders, underlines.
+    pub accent_line: Rgba,
+    /// Focus colour for text fields. Translucent so the component's 1 px
+    /// border plus 3 px halo read as a quiet tint instead of a bright rim.
+    pub focus_ring: Rgba,
     /// Text-field background.
     pub field: Rgba,
     /// Destructive / error text.
     pub danger: Rgba,
     /// Corner radius for controls and cards.
     pub radius: f32,
+    /// Corner radius for large surfaces (columns, clock cards).
+    pub radius_lg: f32,
 }
 
 impl Tokens {
-    /// The shipping dark palette. Mirrors `crates/app/src/theme.rs`.
+    /// The shipping dark palette.
     pub fn dark() -> Self {
         Self {
             dark: true,
-            titlebar: rgb(0x1B1B1E),
-            panel: rgb(0x26262A),
-            pasteboard: rgb(0x19191C),
-            card: rgb(0x2E2E33),
-            border: rgb(0x3C3C43),
-            divider: rgb(0x333339),
-            text: rgb(0xECECEF),
-            text_muted: rgb(0xAEAEB6),
-            text_faint: rgb(0x97979E),
-            icon: rgb(0xD4D4DA),
-            hover: rgb(0x34343A),
-            pressed: rgb(0x3E3E45),
-            selected: rgb(0x233A63),
-            accent: rgb(0x4B8BF5),
-            accent_text: rgb(0x8CB6FA),
-            accent_soft: rgb(0x243657),
-            field: rgb(0x1E1E22),
-            danger: rgb(0xEB5A46),
+            titlebar: rgb(0x161618),
+            panel: rgb(0x1F2023),
+            pasteboard: rgb(0x131314),
+            card: rgb(0x19191B),
+            surface_2: rgb(0x1F2023),
+            surface_3: rgb(0x242528),
+            border: rgb(0x26262A),
+            border_hover: rgb(0x34353A),
+            divider: rgb(0x26262A),
+            text: rgb(0xE6E6E9),
+            text_muted: rgb(0xA0A0A8),
+            text_faint: rgb(0x6E6E77),
+            text_ghost: rgb(0x4C4C55),
+            icon: rgb(0xA0A0A8),
+            hover: rgba(0xFFFFFF0B),
+            pressed: rgba(0xFFFFFF12),
+            selected: rgba(0x4D8DF721),
+            accent: rgb(0x4D8DF7),
+            accent_text: rgb(0xA6C8FF),
+            accent_soft: rgba(0x4D8DF721),
+            accent_line: rgba(0x4D8DF78C),
+            focus_ring: rgba(0x4D8DF773),
+            field: rgb(0x101011),
+            danger: rgb(0xE5674F),
             radius: 6.0,
+            radius_lg: 8.0,
         }
     }
 
-    /// The light palette, for parity with the egui app.
+    /// The light palette.
     pub fn light() -> Self {
         Self {
             dark: false,
-            titlebar: rgb(0xE9E9EB),
+            titlebar: rgb(0xEEEEEF),
             panel: rgb(0xFFFFFF),
-            pasteboard: rgb(0xF1F1F3),
-            card: rgb(0xFFFFFF),
-            border: rgb(0xDADADE),
-            divider: rgb(0xE8E8EB),
-            text: rgb(0x222226),
-            text_muted: rgb(0x5E5E66),
-            text_faint: rgb(0x6B6B73),
-            icon: rgb(0x44444B),
-            hover: rgb(0xF0F0F3),
-            pressed: rgb(0xE4E4E9),
-            selected: rgb(0xE6EEFD),
-            accent: rgb(0x1B63E0),
-            accent_text: rgb(0x1755C4),
-            accent_soft: rgb(0xE3ECFD),
+            pasteboard: rgb(0xF3F3F4),
+            card: rgb(0xFBFBFC),
+            surface_2: rgb(0xFFFFFF),
+            surface_3: rgb(0xF4F4F6),
+            border: rgb(0xE3E3E7),
+            border_hover: rgb(0xD2D2D8),
+            divider: rgb(0xE3E3E7),
+            text: rgb(0x1C1C20),
+            text_muted: rgb(0x5B5B65),
+            text_faint: rgb(0x83838D),
+            text_ghost: rgb(0xABABB4),
+            icon: rgb(0x5B5B65),
+            hover: rgba(0x1414180B),
+            pressed: rgba(0x14141813),
+            selected: rgba(0x1F63D617),
+            accent: rgb(0x1F63D6),
+            accent_text: rgb(0x1A53B6),
+            accent_soft: rgba(0x1F63D617),
+            accent_line: rgba(0x1F63D673),
+            focus_ring: rgba(0x1F63D64D),
             field: rgb(0xFFFFFF),
-            danger: rgb(0xB42418),
+            danger: rgb(0xB3351F),
             radius: 6.0,
+            radius_lg: 8.0,
         }
     }
 }
@@ -127,22 +156,36 @@ pub fn label_color(index: i64) -> Option<Rgba> {
 /// Every text style in the app. Sizes live ONLY in [`Text::metrics`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Text {
-    /// 13 px regular: secondary labels, table body.
+    /// 12 px regular: secondary labels, tree rows.
     Small,
-    /// 16 px regular: body copy.
+    /// 13 px regular: body copy.
     Body,
-    /// 16 px medium: buttons and card titles.
+    /// 12.5 px medium: buttons.
     Button,
-    /// 20 px semibold: section headings.
+    /// 13 px medium: board card titles.
+    CardTitle,
+    /// 17 px semibold: section headings.
     Heading,
-    /// 16 px monospace: code and fixed-width values.
+    /// 22 px semibold: project overview title.
+    Display,
+    /// 13 px monospace: code and fixed-width values.
     Monospace,
-    /// 16 px semibold: column titles, active board tabs.
+    /// 12.5 px semibold: column titles, active board tabs.
     Strong,
-    /// 13 px semibold: uppercase section titles, table headers.
+    /// 12 px semibold: field labels, chips.
     SmallStrong,
-    /// 20 px monospace: clock numerals.
+    /// 30 px monospace: clock numerals.
     ClockTime,
+    /// 12.5 px medium: titlebar section control.
+    Chrome,
+    /// 10 px monospace: counts, identifiers, due dates, offsets.
+    Micro,
+    /// 10 px semibold: uppercase tree-head labels.
+    Label,
+    /// 16 px monospace: summary metrics.
+    Metric,
+    /// 14 px regular: Markdown prose and editor source.
+    Reading,
 }
 
 /// The concrete metrics for one [`Text`] slot.
@@ -159,14 +202,21 @@ impl Text {
     pub fn metrics(self) -> Metrics {
         match self {
             // size, line height, weight, monospace
-            Text::Small => metrics(13.0, 18.0, FontWeight::NORMAL, false),
-            Text::Body => metrics(16.0, 22.0, FontWeight::NORMAL, false),
-            Text::Button => metrics(16.0, 22.0, FontWeight::MEDIUM, false),
-            Text::Heading => metrics(20.0, 26.0, FontWeight::SEMIBOLD, false),
-            Text::Monospace => metrics(16.0, 22.0, FontWeight::NORMAL, true),
-            Text::Strong => metrics(16.0, 22.0, FontWeight::SEMIBOLD, false),
-            Text::SmallStrong => metrics(13.0, 18.0, FontWeight::SEMIBOLD, false),
-            Text::ClockTime => metrics(20.0, 26.0, FontWeight::NORMAL, true),
+            Text::Small => metrics(12.0, 17.0, FontWeight::NORMAL, false),
+            Text::Body => metrics(13.0, 18.0, FontWeight::NORMAL, false),
+            Text::Button => metrics(12.5, 17.0, FontWeight::MEDIUM, false),
+            Text::CardTitle => metrics(13.0, 17.0, FontWeight::MEDIUM, false),
+            Text::Heading => metrics(17.0, 22.0, FontWeight::SEMIBOLD, false),
+            Text::Display => metrics(22.0, 28.0, FontWeight::SEMIBOLD, false),
+            Text::Monospace => metrics(13.0, 18.0, FontWeight::NORMAL, true),
+            Text::Strong => metrics(12.5, 17.0, FontWeight::SEMIBOLD, false),
+            Text::SmallStrong => metrics(12.0, 16.0, FontWeight::SEMIBOLD, false),
+            Text::ClockTime => metrics(30.0, 35.0, FontWeight::NORMAL, true),
+            Text::Chrome => metrics(12.5, 17.0, FontWeight::NORMAL, false),
+            Text::Micro => metrics(10.0, 14.0, FontWeight::NORMAL, true),
+            Text::Label => metrics(10.0, 14.0, FontWeight::SEMIBOLD, false),
+            Text::Metric => metrics(16.0, 20.0, FontWeight::NORMAL, true),
+            Text::Reading => metrics(14.0, 23.0, FontWeight::NORMAL, false),
         }
     }
 
@@ -234,6 +284,105 @@ pub fn install_fonts(cx: &mut App) {
         .expect("bundled fonts must parse");
 }
 
+/// Point gpui-component's own widget theme at the dark palette.
+///
+/// The component crate carries a global theme for its inputs and text areas.
+/// Left alone it follows the system appearance, which renders white fields on
+/// our dark shell. Component widgets paint their fill from `background` and
+/// their border from `input`, so those two matter most.
+pub fn install_component_theme(cx: &mut App) {
+    use gpui_kit::component::{Theme, ThemeMode};
+
+    Theme::change(ThemeMode::Dark, None, cx);
+
+    let t = Tokens::dark();
+    Theme::update(cx, |theme| {
+        theme.background = t.field.into();
+        theme.foreground = t.text.into();
+        theme.border = t.border.into();
+        theme.input = t.border.into();
+        theme.muted = t.surface_2.into();
+        theme.muted_foreground = t.text_muted.into();
+        theme.primary = t.accent.into();
+        theme.primary_foreground = t.text.into();
+        theme.ring = t.focus_ring.into();
+        // gpui-component hard-codes its focus band at 3 px (`FOCUS_RING_WIDTH`,
+        // `pub(crate)`), so the only theme-level way to thin it is to turn the
+        // ring off. Every field keeps its 1 px border, which `focus_style` then
+        // tints with `ring` — a single hairline instead of a border plus halo.
+        theme.focus_ring = false;
+        theme.caret = t.accent.into();
+        theme.selection = t.selected.into();
+        // The component projects this colour onto the base theme as the
+        // scrollbar's *track* fill. Transparent keeps every list bar leaving
+        // nothing behind the content but the thumb.
+        theme.scrollbar = rgba(0x00000000).into();
+        // Thumb colours for the projection. `install_scrollbar_style` below
+        // refines the geometry (4 px, inset); these keep the projected colours
+        // identical so a later component-theme refresh cannot reintroduce a
+        // track-coloured thumb.
+        theme.scrollbar_thumb = t.text_ghost.into();
+        theme.scrollbar_thumb_hover = t.text_faint.into();
+        theme.title_bar = t.titlebar.into();
+        theme.title_bar_border = t.border.into();
+        // The code-editor layout (Notes, document tabs, project documents)
+        // paints its gutter, line numbers and active-line band from the
+        // highlight theme. Start from the library's dark palette, then take
+        // the chrome colours from our tokens so the editor sits in the same
+        // surface family as every field.
+        let mut highlight =
+            (*gpui_kit::component::highlighter::HighlightTheme::default_dark()).clone();
+        // The editor paints its own surface fill; matching the pane's card
+        // colour makes the input read as one uninterrupted surface (no frame,
+        // no focus edge). The editors themselves are created `bordered(false)`.
+        highlight.style.editor_background = Some(t.card.into());
+        highlight.style.editor_foreground = Some(t.text.into());
+        highlight.style.editor_gutter_background = Some(t.card.into());
+        highlight.style.editor_line_number = Some(t.text_ghost.into());
+        highlight.style.editor_active_line_number = Some(t.text_muted.into());
+        highlight.style.editor_active_line = Some(rgba(0xFFFFFF09).into());
+        theme.highlight_theme = std::sync::Arc::new(highlight);
+    });
+
+    // One scrollbar treatment for the whole app: the base theme is where every
+    // `Scrollbar` resolves its paint, so it is set once here rather than per
+    // list. No track at all, a 4 px thumb tucked into the content gutter, and
+    // the wide (16 px) track kept purely as the invisible drag target.
+    install_scrollbar_style(cx);
+}
+
+/// Thin, trackless scrollbars for every scrolled list.
+///
+/// The painted thumb is 4 px, inset 2 px from the track's edge, so inside a
+/// list with an 8 px content gutter it lands centred in that gutter: 2 px of
+/// air on both sides, clear of the card edge and the panel edge. The track
+/// stays 16 px wide — that width is the grab area, and it is never painted —
+/// so the bar remains comfortably draggable while looking like a hairline.
+fn install_scrollbar_style(cx: &mut App) {
+    use gpui_kit::base::{ScrollbarStyles, Theme};
+
+    let t = Tokens::dark();
+    let thumb = |style: gpui_kit::base::ScrollbarThumbStyle, color: Rgba| {
+        style.width(px(4.)).inset(px(2.)).radius(px(2.)).bg(color)
+    };
+    let transparent = rgba(0x00000000).into();
+    let styles = ScrollbarStyles::default()
+        .track(|style| style.bg(transparent))
+        .track_hover(|style| style.bg(transparent))
+        .track_active(|style| style.bg(transparent))
+        // With the track gone the thumb sits on the column surface, so it
+        // takes the ghost/faint text colours: a faint hairline at rest that
+        // brightens on hover, like the egui app's 3 px floating bar.
+        .thumb(|style| thumb(style, t.text_ghost))
+        .thumb_hover(|style| thumb(style, t.text_faint))
+        .thumb_active(|style| thumb(style, t.text_faint));
+
+    let base = Theme::global_mut(cx);
+    // Keep the projected mode and motion; only the paint changes.
+    let scrollbar = base.scrollbar.clone();
+    base.scrollbar = scrollbar.with_styles(styles);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,14 +390,21 @@ mod tests {
     #[test]
     fn text_sizes_match_the_design_system() {
         let expected = [
-            (Text::Small, 13.0, "Inter"),
-            (Text::Body, 16.0, "Inter"),
-            (Text::Button, 16.0, "Inter"),
-            (Text::Heading, 20.0, "Inter"),
-            (Text::Monospace, 16.0, "JetBrains Mono"),
-            (Text::Strong, 16.0, "Inter"),
-            (Text::SmallStrong, 13.0, "Inter"),
-            (Text::ClockTime, 20.0, "JetBrains Mono"),
+            (Text::Small, 12.0, "Inter"),
+            (Text::Body, 13.0, "Inter"),
+            (Text::Button, 12.5, "Inter"),
+            (Text::CardTitle, 13.0, "Inter"),
+            (Text::Heading, 17.0, "Inter"),
+            (Text::Display, 22.0, "Inter"),
+            (Text::Monospace, 13.0, "JetBrains Mono"),
+            (Text::Strong, 12.5, "Inter"),
+            (Text::SmallStrong, 12.0, "Inter"),
+            (Text::ClockTime, 30.0, "JetBrains Mono"),
+            (Text::Chrome, 12.5, "Inter"),
+            (Text::Micro, 10.0, "JetBrains Mono"),
+            (Text::Label, 10.0, "Inter"),
+            (Text::Metric, 16.0, "JetBrains Mono"),
+            (Text::Reading, 14.0, "Inter"),
         ];
         for (style, size, family) in expected {
             assert_eq!(style.size(), size, "{style:?} size");
@@ -260,5 +416,13 @@ mod tests {
     fn radius_is_six_pixels() {
         assert_eq!(Tokens::dark().radius, 6.0);
         assert_eq!(Tokens::light().radius, 6.0);
+    }
+
+    /// The focus edge must stay translucent: it is a single 1 px border, so a
+    /// solid accent would read as a hard bright line.
+    #[test]
+    fn focus_ring_stays_translucent() {
+        assert!(Tokens::dark().focus_ring.a < 0.6);
+        assert!(Tokens::light().focus_ring.a < 0.5);
     }
 }

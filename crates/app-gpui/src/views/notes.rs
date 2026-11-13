@@ -17,11 +17,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui_kit::base::text::markdown;
-use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_kit::component::input::{Editor, EditorState, InputState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     AnyElement, App, ClickEvent, Context, CursorStyle, DragMoveEvent, Entity, Render,
-    TestSupportExt, Window, div, px, rgba,
+    TestSupportExt, Window, div, px, relative, rgba,
 };
 
 use kandrium_core::notes::NoteEntry;
@@ -59,7 +59,7 @@ pub struct NameDraft {
 pub struct NoteTab {
     pub path: PathBuf,
     pub name: String,
-    pub editor: Entity<TextareaState>,
+    pub editor: Entity<EditorState>,
     pub vim: VimSession,
     pub preview: bool,
     /// Text as last written to disk; the edit observer compares against it.
@@ -135,7 +135,7 @@ impl NotesState {
 pub fn notes_view(
     state: &NotesState,
     t: &Tokens,
-    _window: &mut Window,
+    window: &mut Window,
     cx: &mut Context<AppShell>,
 ) -> AnyElement {
     let mut row = div()
@@ -159,7 +159,7 @@ pub fn notes_view(
     .on_drop::<NotesTreeDrag>(cx.listener(|this, _drag: &NotesTreeDrag, _window, cx| {
         this.finish_tree_resize(cx);
     }))
-    .child(content(state, t, cx))
+    .child(content(state, t, window, cx))
     .into_any_element()
 }
 
@@ -169,8 +169,15 @@ fn tree_splitter(t: &Tokens) -> AnyElement {
     div()
         .id("notes-tree-splitter")
         .test_support()
+        // Visually 1 px, flush on both sides: the 5 px element is centred on
+        // the rule with -2 px side margins, so its slack overlaps the two
+        // neighbours instead of leaving an empty strip, and the resize target
+        // stays comfortably wide.
         .w(px(5.))
+        .mx(px(-2.))
         .h_full()
+        .flex()
+        .justify_center()
         .flex_none()
         .cursor(CursorStyle::ResizeLeftRight)
         .hover(|style| style.bg(t.hover))
@@ -233,27 +240,20 @@ fn tree_panel(state: &NotesState, t: &Tokens, cx: &mut Context<AppShell>) -> Any
         .border_color(t.divider)
         .child(
             div()
+                .h(px(38.))
                 .flex()
                 .items_center()
                 .gap(px(6.))
-                .px(px(10.))
-                .py(px(8.))
+                .px(px(12.))
                 .border_b_1()
                 .border_color(t.divider)
-                .child(icon(Icon::StickyNote, 14., t.text_muted))
                 .child(
                     div()
                         .flex_1()
-                        .text(Text::SmallStrong)
-                        .text_color(t.text)
-                        .child("Notes"),
+                        .text(Text::Label)
+                        .text_color(t.text_muted)
+                        .child("NOTES"),
                 )
-                .child(tree_action(
-                    "notes-collapse",
-                    Icon::ChevronLeft,
-                    t,
-                    cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_notes_tree(cx)),
-                ))
                 .child(tree_action(
                     "notes-new-note",
                     Icon::FilePlus,
@@ -269,6 +269,12 @@ fn tree_panel(state: &NotesState, t: &Tokens, cx: &mut Context<AppShell>) -> Any
                     cx.listener(|this, _: &ClickEvent, window, cx| {
                         this.begin_note_draft(DraftKind::Folder, window, cx)
                     }),
+                ))
+                .child(tree_action(
+                    "notes-collapse",
+                    Icon::ChevronLeft,
+                    t,
+                    cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_notes_tree(cx)),
                 )),
         );
 
@@ -298,7 +304,7 @@ fn tree_panel(state: &NotesState, t: &Tokens, cx: &mut Context<AppShell>) -> Any
                         .text_color(t.text_muted)
                         .child(label),
                 )
-                .child(Input::new(&draft.input)),
+                .child(crate::views::field_input(&draft.input, t)),
         );
     }
 
@@ -371,16 +377,31 @@ fn tree_row(
     let mut row = div()
         .id(format!("note-row-{}", entry.path.display()))
         .test_support()
-        .w_full()
+        .mx(px(6.))
+        .relative()
         .flex()
         .items_center()
         .gap(px(6.))
-        .pl(px(10.0 + depth as f32 * 12.0))
+        .h(px(26.))
+        .rounded(px(4.))
+        .pl(px(8.0 + depth as f32 * 12.0))
         .pr(px(8.))
-        .py(px(4.))
         .cursor_pointer()
-        .when(selected, |this| this.bg(t.selected))
+        .when(selected, |this| this.bg(t.surface_2))
         .hover(|style| style.bg(t.hover));
+
+    if selected {
+        row = row.child(
+            div()
+                .absolute()
+                .left(px(0.))
+                .top(px(6.))
+                .w(px(2.))
+                .h(px(14.))
+                .rounded(px(1.))
+                .bg(t.accent),
+        );
+    }
 
     if entry.is_dir {
         let toggle = path.clone();
@@ -452,7 +473,12 @@ fn tree_row(
 }
 
 /// Tab strip plus the editor, preview or empty state.
-fn content(state: &NotesState, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
+fn content(
+    state: &NotesState,
+    t: &Tokens,
+    window: &Window,
+    cx: &mut Context<AppShell>,
+) -> AnyElement {
     let mut body = div()
         .id("notes-content")
         .test_support()
@@ -474,44 +500,28 @@ fn content(state: &NotesState, t: &Tokens, cx: &mut Context<AppShell>) -> AnyEle
             .into_any_element();
     }
 
-    let mut strip = div()
-        .id("notes-tabs")
-        .test_support()
-        .flex()
-        .items_center()
-        .gap(px(2.))
-        .px(px(8.))
-        .py(px(4.))
-        .border_b_1()
-        .border_color(t.divider);
+    let mut strip = crate::views::tab_strip(t);
     for (index, tab) in state.tabs.iter().enumerate() {
         let active = state.active == Some(index);
         let path = tab.path.clone();
         let close_path = tab.path.clone();
         strip = strip.child(
-            div()
-                .id(format!("note-tab-{}", tab.path.display()))
+            crate::views::pane_tab(format!("note-tab-{}", tab.path.display()), active, t)
                 .test_support()
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .px(px(8.))
-                .py(px(3.))
-                .rounded(px(t.radius))
-                .when(active, |this| this.bg(t.selected))
-                .hover(|style| style.bg(t.hover))
                 .cursor_pointer()
+                .hover(|style| style.bg(t.hover))
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.activate_note_tab(path.clone(), window, cx)
                 }))
+                .child(icon(Icon::FileText, 12., t.text_faint))
                 .child(
                     div()
                         .text(Text::Small)
-                        .text_color(if active { t.text } else { t.text_muted })
+                        .text_color(if active { t.text } else { t.text_faint })
                         .child(tab.name.clone()),
                 )
                 .when(tab.dirty, |this| {
-                    this.child(div().size(px(4.)).rounded(px(2.)).bg(t.accent))
+                    this.child(div().size(px(3.)).rounded(px(2.)).bg(t.accent))
                 })
                 .child(
                     div()
@@ -522,46 +532,53 @@ fn content(state: &NotesState, t: &Tokens, cx: &mut Context<AppShell>) -> AnyEle
                         .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                             this.close_note_tab_by_path(close_path.clone(), cx)
                         }))
-                        .child(icon(Icon::X, 11., t.text_faint)),
+                        .child(icon(Icon::X, 10., t.text_faint)),
                 ),
         );
     }
-    strip = strip.child(div().flex_1()).child(tab_action(
-        "notes-preview",
-        if state.active_tab().is_some_and(|tab| tab.preview) {
-            "Edit"
-        } else {
-            "Preview"
-        },
-        t,
-        cx.listener(|this, _: &ClickEvent, window, cx| this.toggle_note_preview(window, cx)),
-    ));
-    if let Some(tab) = state.active_tab() {
-        let rename_path = tab.path.clone();
-        let delete_path = tab.path.clone();
-        strip = strip
-            .child(tab_action(
-                "notes-rename",
-                "Rename",
-                t,
-                cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.begin_note_rename(rename_path.clone(), window, cx)
-                }),
-            ))
-            .child(tab_action(
-                "notes-delete",
-                "Delete",
-                t,
-                cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                    this.ask_delete_note(delete_path.clone(), cx)
-                }),
-            ));
-    }
-
+    strip = strip.child(div().flex_1());
     body = body.child(strip);
+
     let Some(tab) = state.active_tab() else {
         return body.into_any_element();
     };
+    let preview = tab.preview;
+    body = body.child(
+        div()
+            .id("notes-head")
+            .test_support()
+            .h(px(40.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .px(px(14.))
+            .border_b_1()
+            .border_color(t.divider)
+            .child(crate::views::path_label(
+                "notes-path",
+                tab.path.display().to_string(),
+                t,
+                cx,
+            ))
+            .child(div().flex_1())
+            .child(crate::views::vim_indicator("notes-vim", &tab.vim, t))
+            .child(crate::views::mode_switch(
+                "notes-preview",
+                preview,
+                t,
+                cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    if preview {
+                        this.toggle_note_preview(window, cx);
+                    }
+                }),
+                cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    if !preview {
+                        this.toggle_note_preview(window, cx);
+                    }
+                }),
+            )),
+    );
 
     if tab.preview {
         let text = tab.editor.read(cx).value().to_string();
@@ -572,25 +589,48 @@ fn content(state: &NotesState, t: &Tokens, cx: &mut Context<AppShell>) -> AnyEle
                 .flex_1()
                 .min_h_0()
                 .overflow_y_scroll()
-                .p(px(20.))
+                .px(px(30.))
+                .pt(px(20.))
+                .pb(px(30.))
                 .child(markdown(text.as_str())),
         );
     } else {
+        let lines = tab.editor.read(cx).value().lines().count();
         body = body
-            .child(mode_strip(tab, t, cx))
             .child(
                 div()
                     .id("note-editor")
                     .test_support()
                     .flex_1()
                     .min_h_0()
-                    .p(px(12.))
-                    .child(Textarea::new(&tab.editor).readonly(!tab.vim.is_insert())),
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .relative()
+                            .w_full()
+                            .flex_1()
+                            .min_h_0()
+                            .child(
+                                div().absolute().inset_0().child(
+                                    // The multi-line input auto-sizes to its content;
+                                    // this pins the editor to the pane the wrapper
+                                    // already occupies.
+                                    Editor::new(&tab.editor)
+                                        .h(relative(1.))
+                                        .bordered(false)
+                                        .readonly(!tab.vim.is_insert()),
+                                ),
+                            )
+                            .child(crate::views::gutter_rule(lines, t, window)),
+                    ),
             )
             .capture_key_down(
                 cx.listener(|this, event, window, cx| this.handle_notes_key(event, window, cx)),
             );
     }
+
+    body = body.child(status_bar(tab, t, cx));
 
     if let Some(confirm) = &state.confirm {
         body = body.child(delete_confirm(confirm, t, cx));
@@ -622,75 +662,47 @@ fn tab_action(
         .into_any_element()
 }
 
-/// Mode badge (also the vim on/off toggle), pending keys, ex line or error,
-/// and a short hint.
-fn mode_strip(tab: &NoteTab, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
-    let vim = &tab.vim;
-    let enabled = vim.is_enabled();
-    let mut row = div()
-        .id("note-mode")
-        .test_support()
-        .flex()
-        .items_center()
-        .gap(px(8.))
-        .px(px(12.))
-        .py(px(3.))
-        .border_b_1()
-        .border_color(t.divider)
-        .child(
-            div()
-                .id("note-vim-toggle")
-                .test_support()
-                .px(px(6.))
-                .py(px(1.))
-                .rounded(px(4.))
-                .bg(t.panel)
-                .text(Text::SmallStrong)
-                .text_color(if enabled { t.text_muted } else { t.text_faint })
-                .cursor_pointer()
-                .hover(|style| style.bg(t.hover))
-                .child(vim.mode_label())
-                .on_click(
-                    cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_vim_mode(cx)),
-                ),
-        );
-    if let Some(line) = vim.ex_line() {
-        row = row.child(
-            div()
-                .text(Text::Small)
-                .text_color(t.text)
-                .child(line.to_string()),
-        );
-    } else if let Some(error) = vim.ex_error() {
-        row = row.child(
-            div()
-                .text(Text::Small)
-                .text_color(t.danger)
-                .child(error.to_string()),
-        );
+/// The editor's bottom status bar: vim mode (also the toggle), pending keys,
+/// ex line or error, cursor position, word count and save state.
+fn status_bar(tab: &NoteTab, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
+    let preview = tab.preview;
+    let position = tab.editor.read(cx).cursor_position();
+    let words = tab.editor.read(cx).value().split_whitespace().count();
+    let pending = if preview {
+        None
+    } else if let Some(line) = tab.vim.ex_line() {
+        Some((line.to_string(), false))
+    } else if let Some(error) = tab.vim.ex_error() {
+        Some((error.to_string(), true))
     } else {
-        let pending = vim.pending();
-        if !pending.is_empty() {
-            row = row.child(
-                div()
-                    .text(Text::Small)
-                    .text_color(t.text_muted)
-                    .child(pending),
-            );
-        }
-    }
-    row.child(
-        div()
-            .flex_1()
-            .text(Text::Small)
-            .text_color(t.text_faint)
-            .child(if enabled {
+        let pending = tab.vim.pending();
+        (!pending.is_empty()).then_some((pending, false))
+    };
+    crate::views::editor_status_bar(
+        "note-status",
+        crate::views::EditorStatus {
+            mode: if preview {
+                "PREVIEW"
+            } else {
+                tab.vim.mode_label()
+            },
+            vim: tab.vim.is_enabled(),
+            pending,
+            line: position.line as usize + 1,
+            column: position.character as usize + 1,
+            words,
+            dirty: tab.dirty,
+            hint: if preview {
+                "660 px measure"
+            } else if tab.vim.is_enabled() {
                 "Esc normal · i insert · :w save · :q close"
             } else {
                 "click the badge for vim"
-            }),
+            },
+        },
+        t,
+        cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_vim_mode(cx)),
     )
-    .into_any_element()
 }
 
 fn delete_confirm(path: &Path, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {

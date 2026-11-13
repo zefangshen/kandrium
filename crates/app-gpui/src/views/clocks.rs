@@ -26,7 +26,7 @@
 
 use std::time::Duration;
 
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::InputState;
 use gpui_kit::prelude::*;
 use gpui_kit::{
     Animation, AnimationExt, AnyElement, ClickEvent, Context, DragMoveEvent, Entity, IntoElement,
@@ -723,16 +723,17 @@ fn toolbar(
         .test_support()
         .w_full()
         .flex_shrink_0()
-        .px(px(16.))
-        .py(px(14.))
+        .h(px(46.))
+        .px(px(20.))
         .flex()
         .items_center()
         .gap(px(10.))
-        .child(icon(Icon::Globe, 18., t.accent))
+        .border_b_1()
+        .border_color(t.border)
         .child(div().text(Text::Heading).text_color(t.text).child("Clocks"))
         .child(
             div()
-                .text(Text::Small)
+                .text(Text::Micro)
                 .text_color(t.text_faint)
                 .child(format!("{count} saved")),
         )
@@ -740,8 +741,13 @@ fn toolbar(
             div()
                 .id("clocks-search")
                 .test_support()
-                .w(px(300.))
-                .child(Input::new(search_input)),
+                .w(px(240.))
+                .ml(px(14.))
+                .child(crate::views::field_input(search_input, t).prefix(icon(
+                    Icon::Search,
+                    11.,
+                    t.text_faint,
+                ))),
         )
         .child(div().flex_1())
         .child(units_toggle(use_24h, t, cx))
@@ -751,15 +757,23 @@ fn toolbar(
                 .test_support()
                 .flex()
                 .items_center()
-                .gap(px(6.))
+                .gap(px(5.))
                 .h(px(28.))
                 .px(px(10.))
                 .rounded(px(t.radius))
-                .bg(t.accent_soft)
+                .border_1()
+                .border_color(t.border)
+                .bg(t.card)
                 .cursor_pointer()
-                .text(Text::Button)
-                .text_color(t.accent_text)
-                .child(icon(Icon::Plus, 14., t.accent_text))
+                .text(Text::Small)
+                .text_color(t.text_muted)
+                .hover(|style| {
+                    style
+                        .bg(t.surface_2)
+                        .border_color(t.border_hover)
+                        .text_color(t.text)
+                })
+                .child(icon(Icon::Plus, 11., t.text_muted))
                 .child("Add city")
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                     this.open_clock_picker(window, cx)
@@ -777,9 +791,7 @@ fn units_toggle(use_24h: bool, t: &Tokens, cx: &mut Context<AppShell>) -> AnyEle
         .gap(px(2.))
         .p(px(2.))
         .rounded(px(t.radius))
-        .bg(t.field)
-        .border_1()
-        .border_color(t.border)
+        .bg(t.hover)
         .cursor_pointer()
         .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_clock_units(cx)))
         .child(unit_chip("12h", !use_24h, t))
@@ -790,17 +802,13 @@ fn units_toggle(use_24h: bool, t: &Tokens, cx: &mut Context<AppShell>) -> AnyEle
 fn unit_chip(label: &'static str, selected: bool, t: &Tokens) -> AnyElement {
     div()
         .px(px(8.))
-        .h(px(24.))
+        .h(px(22.))
         .flex()
         .items_center()
         .rounded(px(4.))
-        .text(Text::SmallStrong)
-        .text_color(if selected {
-            t.accent_text
-        } else {
-            t.text_muted
-        })
-        .when(selected, |el| el.bg(t.accent_soft))
+        .text(Text::Micro)
+        .text_color(if selected { t.text } else { t.text_ghost })
+        .when(selected, |el| el.bg(t.surface_2))
         .child(label)
         .into_any_element()
 }
@@ -973,7 +981,9 @@ fn grid(
         .flex_1()
         .min_h_0()
         .overflow_y_scroll()
-        .p(px(16.))
+        .px(px(20.))
+        .pt(px(16.))
+        .pb(px(26.))
         .child(grid)
         .into_any_element()
 }
@@ -1033,13 +1043,21 @@ fn card(
         .size_full()
         .flex()
         .flex_col()
-        .gap(px(6.))
-        .rounded(px(t.radius))
+        .gap(px(4.))
+        .rounded(px(t.radius_lg))
         .bg(t.card)
         .border_1()
-        .border_color(if away { t.accent } else { t.border })
-        .p(px(12.))
+        .border_color(if away { t.accent_line } else { t.border })
+        .px(px(12.))
+        .pt(px(11.))
+        .pb(px(11.))
+        .overflow_hidden()
         .cursor_pointer()
+        .hover(move |style| {
+            style
+                .bg(ghost_tokens.surface_2)
+                .border_color(ghost_tokens.border_hover)
+        })
         .when(
             state
                 .drag
@@ -1063,8 +1081,8 @@ fn card(
                 )
                 .child(
                     div()
-                        .text(Text::Small)
-                        .text_color(t.text_faint)
+                        .text(Text::Micro)
+                        .text_color(t.text_ghost)
                         .child(text.offset.clone()),
                 ),
         )
@@ -1090,8 +1108,8 @@ fn card(
         )
         .child(
             div()
-                .text(Text::Small)
-                .text_color(t.text_muted)
+                .text(Text::Micro)
+                .text_color(t.text_faint)
                 .child(text.date.clone()),
         )
         .child(div().flex_1())
@@ -1102,12 +1120,12 @@ fn card(
             div()
                 .id(format!("clock-visiting-{}", entry.id))
                 .px(px(6.))
-                .h(px(18.))
+                .h(px(19.))
                 .flex()
                 .items_center()
                 .rounded(px(4.))
                 .bg(t.accent_soft)
-                .text(Text::SmallStrong)
+                .text(Text::Micro)
                 .text_color(t.accent_text)
                 .child(format!(
                     "VISITING {visiting} \u{00b7} {}",
@@ -1202,11 +1220,14 @@ fn people_row(people: &CityPeople, t: &Tokens) -> AnyElement {
         .flex()
         .items_center()
         .gap(px(4.))
+        .pt(px(7.))
+        .border_t_1()
+        .border_color(t.divider)
         .when(people.residents.is_empty(), |el| {
             el.child(
                 div()
-                    .text(Text::Small)
-                    .text_color(t.text_faint)
+                    .text(Text::Micro)
+                    .text_color(t.text_ghost)
                     .child("No residents"),
             )
         })
@@ -1225,8 +1246,8 @@ fn people_row(people: &CityPeople, t: &Tokens) -> AnyElement {
                         .justify_center()
                         .bg(t.field)
                         .border_1()
-                        .border_color(if away { t.accent } else { t.divider })
-                        .text(Text::SmallStrong)
+                        .border_color(if away { t.accent_line } else { t.divider })
+                        .text(Text::Micro)
                         .text_color(if away { t.accent_text } else { t.text_muted })
                         .child(initials(&status.person.name))
                 })
@@ -1243,7 +1264,7 @@ fn people_row(people: &CityPeople, t: &Tokens) -> AnyElement {
                     .bg(t.field)
                     .border_1()
                     .border_color(t.divider)
-                    .text(Text::SmallStrong)
+                    .text(Text::Micro)
                     .text_color(t.text_faint)
                     .child(format!("+{extra}")),
             )

@@ -172,6 +172,35 @@ fn creates_a_markdown_file_and_opens_its_tab(cx: &mut TestAppContext) {
             "the new file should open in a tab"
         );
         assert!(window.find("doc-editor").visible());
+        // The editor status bar closes the pane and keeps a fixed height.
+        let status = window.find("doc-status").bounds();
+        let pane = window.find("doc-markdown").bounds();
+        assert!(
+            (f32::from(status.size.height) - 26.0).abs() < 0.5,
+            "the status bar is a 26 px row"
+        );
+        assert!(
+            f32::from(status.origin.y) + f32::from(status.size.height)
+                - (f32::from(pane.origin.y) + f32::from(pane.size.height))
+                < 0.5,
+            "the status bar sits on the pane's bottom edge: status {:?} pane {:?}",
+            status,
+            pane
+        );
+        // The editing body fills the pane: no measure cap, no dead band.
+        let area = window.find("doc-editor").bounds();
+        assert!(
+            (f32::from(area.size.width) - f32::from(pane.size.width)).abs() < 0.5,
+            "the editor spans the pane width: area {:?} pane {:?}",
+            area,
+            pane
+        );
+        assert!(
+            (f32::from(area.size.height) - (f32::from(pane.size.height) - 26.0)).abs() < 1.0,
+            "the editor fills the height above the status bar: area {:?} pane {:?}",
+            area,
+            pane
+        );
     });
 }
 

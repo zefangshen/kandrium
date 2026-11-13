@@ -420,6 +420,90 @@ pub fn update_project(
     get_project(db, id)
 }
 
+/// One folder reference attached to a project.
+///
+/// The path is stored verbatim (a local folder or, for rows carried over from
+/// the old `projects.source` column, a URL). Removing a row never touches the
+/// folder on disk.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectPath {
+    pub id: String,
+    pub project_id: String,
+    pub path: String,
+    pub position: i64,
+}
+
+/// Every folder attached to a project, in display order.
+pub fn list_project_paths(db: &Connection, project_id: &str) -> Result<Vec<ProjectPath>> {
+    let mut stmt = db.prepare(
+        "SELECT id, project_id, path, position FROM project_paths \
+         WHERE project_id = ?1 ORDER BY position, path COLLATE NOCASE",
+    )?;
+    let rows = stmt
+        .query_map([project_id], |r| {
+            Ok(ProjectPath {
+                id: r.get(0)?,
+                project_id: r.get(1)?,
+                path: r.get(2)?,
+                position: r.get(3)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Attach a folder to a project. The path is trimmed; an empty path is
+/// rejected and an exact duplicate returns the existing row so the caller can
+/// treat it as success.
+pub fn add_project_path(db: &Connection, project_id: &str, path: &str) -> Result<ProjectPath> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err(KandriumError::new("A folder path is required"));
+    }
+    if let Some(existing) = db
+        .query_row(
+            "SELECT id, project_id, path, position FROM project_paths \
+             WHERE project_id = ?1 AND path = ?2",
+            rusqlite::params![project_id, path],
+            |r| {
+                Ok(ProjectPath {
+                    id: r.get(0)?,
+                    project_id: r.get(1)?,
+                    path: r.get(2)?,
+                    position: r.get(3)?,
+                })
+            },
+        )
+        .optional()?
+    {
+        return Ok(existing);
+    }
+    let position: i64 = db.query_row(
+        "SELECT COALESCE(MAX(position), -1) + 1 FROM project_paths WHERE project_id = ?1",
+        [project_id],
+        |r| r.get(0),
+    )?;
+    let id = uid();
+    db.execute(
+        "INSERT INTO project_paths (id, project_id, path, position, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![id, project_id, path, position, now_unix()],
+    )?;
+    Ok(ProjectPath {
+        id,
+        project_id: project_id.to_string(),
+        path: path.to_string(),
+        position,
+    })
+}
+
+/// Drop a folder reference. Nothing on disk is touched.
+pub fn remove_project_path(db: &Connection, id: &str) -> Result<()> {
+    db.execute("DELETE FROM project_paths WHERE id = ?1", [id])?;
+    Ok(())
+}
+
 /// Point a project at its source code (local folder path or URL). The value
 /// is trimmed; an empty string clears the reference.
 pub fn set_source(db: &Connection, id: &str, source: &str) -> Result<Project> {

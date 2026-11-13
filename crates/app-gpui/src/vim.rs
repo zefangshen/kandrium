@@ -30,8 +30,78 @@
 //! settings store yet, so vim is always on for the description) and `.`
 //! replay of IME-composed Insert text (only `key_char` presses are recorded).
 
-use gpui_kit::component::input::TextareaState;
+use std::ops::Range;
+
+use gpui_kit::component::input::{EditorState, TextareaState};
 use gpui_kit::{App, Entity, KeyDownEvent, Keystroke, Window};
+
+/// The buffer operations vim needs.
+///
+/// Notes, document tabs and project documents edit through the code-editor
+/// state (for the gutter and syntax colours); the description fields still use
+/// a textarea. Both are the same engine underneath, so the command layer stays
+/// one implementation and only binds these six operations twice.
+pub trait VimBuffer: 'static {
+    fn vim_text(&self, cx: &App) -> String;
+    fn vim_cursor(&self, cx: &App) -> usize;
+    fn vim_set_readonly(&self, on: bool, cx: &mut App);
+    /// Replace the differing middle of the buffer and move the caret.
+    #[allow(clippy::too_many_arguments)]
+    fn vim_write(
+        &self,
+        old: &str,
+        new: &str,
+        start: usize,
+        old_end: usize,
+        insert: &str,
+        range: Range<usize>,
+        reversed: bool,
+        window: &mut Window,
+        cx: &mut App,
+    );
+}
+
+macro_rules! impl_vim_buffer {
+    ($state:ty) => {
+        impl VimBuffer for Entity<$state> {
+            fn vim_text(&self, cx: &App) -> String {
+                self.read(cx).text().to_string()
+            }
+
+            fn vim_cursor(&self, cx: &App) -> usize {
+                self.read(cx).cursor()
+            }
+
+            fn vim_set_readonly(&self, on: bool, cx: &mut App) {
+                self.update(cx, |state, cx| state.set_readonly(on, cx));
+            }
+
+            fn vim_write(
+                &self,
+                old: &str,
+                new: &str,
+                start: usize,
+                old_end: usize,
+                insert: &str,
+                range: Range<usize>,
+                reversed: bool,
+                window: &mut Window,
+                cx: &mut App,
+            ) {
+                self.update(cx, |state, cx| {
+                    if old != new {
+                        state.set_selected_range(start..old_end, cx);
+                        state.replace(insert, window, cx);
+                    }
+                    state.set_selected_range_with_direction(range, reversed, cx);
+                });
+            }
+        }
+    };
+}
+
+impl_vim_buffer!(TextareaState);
+impl_vim_buffer!(EditorState);
 
 /// Modal state of one editor.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1691,7 +1761,7 @@ impl VimSession {
     /// Follow the shell's vim preference. Re-enabling starts in Normal mode;
     /// disabling drops the transient command state and hands the buffer back
     /// to plain typing.
-    pub fn set_enabled(&mut self, on: bool, input: &Entity<TextareaState>, cx: &mut App) {
+    pub fn set_enabled(&mut self, on: bool, input: &impl VimBuffer, cx: &mut App) {
         if self.enabled != on {
             self.enabled = on;
             self.state = VimState::default();
@@ -1740,9 +1810,9 @@ impl VimSession {
     /// Keep the textarea editable only in Insert mode. Read-only keeps focus,
     /// the caret and mouse selection, so Normal/Visual can use the same input
     /// for display and for our own caret writes.
-    pub fn sync_readonly(&self, input: &Entity<TextareaState>, cx: &mut App) {
+    pub fn sync_readonly(&self, input: &impl VimBuffer, cx: &mut App) {
         let readonly = self.readonly();
-        input.update(cx, |state, cx| state.set_readonly(readonly, cx));
+        input.vim_set_readonly(readonly, cx);
     }
 
     /// Apply one key press to the buffer and write the result back.
@@ -1752,7 +1822,7 @@ impl VimSession {
     pub fn handle_key(
         &mut self,
         event: &KeyDownEvent,
-        input: &Entity<TextareaState>,
+        input: &impl VimBuffer,
         window: &mut Window,
         cx: &mut App,
     ) -> KeyOutcome {
@@ -1767,7 +1837,7 @@ impl VimSession {
     fn apply_key(
         &mut self,
         event: &KeyDownEvent,
-        input: &Entity<TextareaState>,
+        input: &impl VimBuffer,
         window: &mut Window,
         cx: &mut App,
     ) -> KeyOutcome {
@@ -1776,8 +1846,8 @@ impl VimSession {
         if keystroke.modifiers.platform {
             return KeyOutcome::default();
         }
-        let text = input.read(cx).text().to_string();
-        let read_caret = char_index(&text, input.read(cx).cursor());
+        let text = input.vim_text(cx);
+        let read_caret = char_index(&text, input.vim_cursor(cx));
         // Visual selections report their exclusive end, so trust the stored
         // vim cursor as long as the input still shows the caret we wrote.
         let caret = if self.state.mode == VimMode::Insert {
@@ -1854,23 +1924,19 @@ impl VimSession {
         &mut self,
         b: &Buf,
         old: &str,
-        input: &Entity<TextareaState>,
+        input: &impl VimBuffer,
         window: &mut Window,
         cx: &mut App,
     ) {
         let new: String = b.chars.iter().collect();
         let (start, old_end, insert) = diff(old, &new);
         let (range, reversed) = self.selection(b);
-        input.update(cx, |state, cx| {
-            if old != new {
-                state.set_selected_range(start..old_end, cx);
-                state.replace(insert, window, cx);
-            }
-            state.set_selected_range_with_direction(range, reversed, cx);
-        });
+        input.vim_write(
+            old, &new, start, old_end, &insert, range, reversed, window, cx,
+        );
         // Remember the caret the input will report next, and keep the moving
         // end of a visual selection since the input stores it exclusively.
-        let read_back = input.read(cx).cursor();
+        let read_back = input.vim_cursor(cx);
         self.expected_caret = Some(char_index(&new, read_back));
         self.state.visual_cursor =
             matches!(self.state.mode, VimMode::Visual | VimMode::VisualLine).then_some(b.cursor);

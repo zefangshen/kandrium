@@ -38,10 +38,11 @@ pub use import::{ImportCounts, import_old_db};
 pub use models::*;
 pub use projects::{
     PROJECT_FILE_EXTS, PROJECT_STATUSES, Project, ProjectChoice, ProjectFolder, ProjectNode,
-    ProjectSummary, ProjectTemplate, TEMPLATES, archive_project, create_doc_file,
-    create_doc_folder, create_folder, create_project, delete_folder, delete_project, ensure_root,
-    find_project, get_project, list_archived_projects, list_project_choices, list_tree,
-    project_dir, project_files, project_summary, rename_folder, rename_project, reorder_project,
+    ProjectPath, ProjectSummary, ProjectTemplate, TEMPLATES, add_project_path, archive_project,
+    create_doc_file, create_doc_folder, create_folder, create_project, delete_folder,
+    delete_project, ensure_root, find_project, get_project, list_archived_projects,
+    list_project_choices, list_project_paths, list_tree, project_dir, project_files,
+    project_summary, remove_project_path, rename_folder, rename_project, reorder_project,
     resolve_projects_root, set_identifier, set_source, suggest_identifier, template,
     unarchive_project, update_project, validate_identifier,
 };
