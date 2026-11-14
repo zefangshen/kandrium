@@ -14,6 +14,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
+pub mod sources;
+
+pub use sources::{
+    SourceDelta, counts as source_counts, hash_file, kind_for_path, list_sources, refresh_sources,
+};
+
 /// Environment variable that overrides the wiki page root.
 pub const WIKI_ENV: &str = "KANDRIUM_WIKI";
 /// Retired environment variable, accepted as a read alias for one release.
