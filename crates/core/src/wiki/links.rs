@@ -64,12 +64,14 @@ pub fn parse_links(rel_path: &str, body: &str) -> Vec<WikiLink> {
         let mut index = 0;
         while index + 1 < chars.len() {
             let embedded = index > 0 && chars[index - 1] == '!';
-            if chars[index] == '[' && chars[index + 1] == '[' && !embedded {
-                if let Some((link, end)) = read_wikilink(rel_path, &chars, index) {
-                    out.push(link);
-                    index = end;
-                    continue;
-                }
+            if chars[index] == '['
+                && chars[index + 1] == '['
+                && !embedded
+                && let Some((link, end)) = read_wikilink(rel_path, &chars, index)
+            {
+                out.push(link);
+                index = end;
+                continue;
             }
             index += 1;
         }
@@ -374,8 +376,8 @@ fn mask_line(line: &str) -> Vec<char> {
         let open = if image { index + 1 } else { index };
         let mut depth = 0usize;
         let mut close = None;
-        for cursor in open..chars.len() {
-            match chars[cursor] {
+        for (cursor, ch) in chars.iter().enumerate().skip(open) {
+            match ch {
                 '[' => depth += 1,
                 ']' => {
                     depth = depth.saturating_sub(1);

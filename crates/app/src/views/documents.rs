@@ -291,6 +291,8 @@ pub struct DocumentsState {
     pub restore: Option<(bool, Option<String>, Vec<String>)>,
     /// Set while a render/text request is outstanding; the shell repaints.
     pub needs_repaint: bool,
+    /// Wiki compile state per source path, for the tree dots.
+    pub source_states: HashMap<PathBuf, kandrium_core::SourceState>,
 }
 
 impl Default for DocumentsState {
@@ -311,6 +313,7 @@ impl Default for DocumentsState {
             session_loaded: false,
             restore: None,
             needs_repaint: false,
+            source_states: HashMap::new(),
         }
     }
 }
@@ -785,6 +788,7 @@ fn tree_row(
                     .text_color(t.text)
                     .child(entry.name.clone()),
             )
+            .child(source_dot(state.source_states.get(&entry.path).copied(), t))
             .child(tree_action(
                 format!("doc-file-rename-{row_id}"),
                 Icon::Pencil,
@@ -823,6 +827,26 @@ pub(crate) fn doc_icon(path: &Path) -> Icon {
     } else {
         Icon::FileText
     }
+}
+
+/// A 6 px compile-state dot in the sources tree.
+fn source_dot(state: Option<kandrium_core::SourceState>, t: &Tokens) -> AnyElement {
+    use kandrium_core::SourceState;
+    let color = match state {
+        None => return div().w(px(6.)).flex_none().into_any_element(),
+        Some(SourceState::New) => t.text_faint,
+        Some(SourceState::Indexed) => t.text_muted,
+        Some(SourceState::Compiled) => t.accent,
+        Some(SourceState::Stale) => t.text,
+        Some(SourceState::Failed) => t.danger,
+    };
+    div()
+        .w(px(6.))
+        .h(px(6.))
+        .flex_none()
+        .rounded(px(3.))
+        .bg(color)
+        .into_any_element()
 }
 
 /// One document's head row, Markdown editor/preview or PDF viewer, and status

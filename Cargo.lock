@@ -4214,6 +4214,7 @@ dependencies = [
  "dirs 7.0.0",
  "jiff",
  "log",
+ "pdf-render",
  "rand 0.10.3",
  "rusqlite",
  "rusqlite_migration",

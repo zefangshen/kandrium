@@ -13,6 +13,7 @@ use gpui_kit::{
     AnyElement, ClickEvent, Context, CursorStyle, DragMoveEvent, IntoElement, Render,
     TestSupportExt, Window, div, px,
 };
+use kandrium_core::{LintFinding, LintSeverity, WikiStatus};
 
 use crate::app::AppShell;
 use crate::assets::{Icon, icon};
@@ -26,6 +27,8 @@ use crate::views::placeholder;
 pub const MIN_HALF_H: f32 = 120.0;
 /// Half header height: the same 38 px row the tree panels use.
 pub const HEADER_H: f32 = 38.0;
+/// The wiki status toolbar above both halves.
+pub const TOOLBAR_H: f32 = 34.0;
 /// Height the 5 px vertical splitter occupies in the column layout: its
 /// `-2 px` side margins overlap the two halves.
 const SPLITTER_H: f32 = 1.0;
@@ -72,6 +75,14 @@ impl TabKey {
     }
 }
 
+/// Which non-tab surface the detail column shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WikiPanel {
+    Status,
+    Lint,
+    Setup,
+}
+
 /// Wiki section state: both tree states plus the merged tab order.
 pub struct WikiState {
     pub notes: NotesState,
@@ -84,6 +95,12 @@ pub struct WikiState {
     pub split: f32,
     pub notes_collapsed: bool,
     pub docs_collapsed: bool,
+    /// Status, lint, or setup replaces the tab row until a tab is opened.
+    pub panel: Option<WikiPanel>,
+    pub status: Option<WikiStatus>,
+    pub findings: Vec<LintFinding>,
+    pub busy: bool,
+    pub panel_error: Option<String>,
 }
 
 impl Default for WikiState {
@@ -96,6 +113,11 @@ impl Default for WikiState {
             split: 0.5,
             notes_collapsed: false,
             docs_collapsed: false,
+            panel: None,
+            status: None,
+            findings: Vec::new(),
+            busy: false,
+            panel_error: None,
         }
     }
 }
@@ -157,6 +179,7 @@ impl WikiState {
 
     pub fn set_active(&mut self, key: TabKey) {
         self.active = Some(key);
+        self.panel = None;
     }
 
     /// Forget a closed tab and fall back to its right neighbour, else its left.
@@ -213,26 +236,144 @@ pub fn wiki_view(
     state.reconcile();
     state.documents.needs_repaint = false;
     let mut row = div()
-        .id("wiki-view")
+        .id("wiki-body")
         .test_support()
-        .size_full()
+        .flex_1()
+        .min_h_0()
         .flex()
         .child(tree_column(state, t, window, cx));
 
     if state.notes.tree_open {
         row = row.child(tree_splitter(t));
     }
-    row.on_drag_move::<WikiTreeDrag>(cx.listener(
-        |this, event: &DragMoveEvent<WikiTreeDrag>, _window, cx| {
-            let width = f32::from(event.event.position.x) - f32::from(event.bounds.origin.x);
-            this.set_notes_tree_width(width, cx);
-        },
-    ))
-    .on_drop::<WikiTreeDrag>(cx.listener(|this, _drag: &WikiTreeDrag, _window, cx| {
-        this.finish_tree_resize(cx);
-    }))
-    .child(detail_column(state, t, window, cx))
-    .into_any_element()
+    row = row
+        .on_drag_move::<WikiTreeDrag>(cx.listener(
+            |this, event: &DragMoveEvent<WikiTreeDrag>, _window, cx| {
+                let width = f32::from(event.event.position.x) - f32::from(event.bounds.origin.x);
+                this.set_notes_tree_width(width, cx);
+            },
+        ))
+        .on_drop::<WikiTreeDrag>(cx.listener(|this, _drag: &WikiTreeDrag, _window, cx| {
+            this.finish_tree_resize(cx);
+        }))
+        .child(detail_column(state, t, window, cx));
+
+    div()
+        .id("wiki-view")
+        .test_support()
+        .size_full()
+        .flex()
+        .flex_col()
+        .child(toolbar(state, t, cx))
+        .child(row)
+        .into_any_element()
+}
+
+/// Status toolbar: counts on the left, Refresh / Lint / Setup on the right.
+fn toolbar(state: &WikiState, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
+    let summary = match &state.status {
+        Some(status) => {
+            let sources = status.sources.new
+                + status.sources.indexed
+                + status.sources.compiled
+                + status.sources.stale
+                + status.sources.failed;
+            let pages = status.pages.source
+                + status.pages.entity
+                + status.pages.concept
+                + status.pages.page;
+            format!(
+                "{sources} sources · {} compiled · {pages} pages",
+                status.sources.compiled
+            )
+        }
+        None => "Index unavailable".to_string(),
+    };
+    let refresh_label = if state.busy {
+        "Refreshing…"
+    } else {
+        "Refresh"
+    };
+
+    div()
+        .id("wiki-toolbar")
+        .test_support()
+        .h(px(TOOLBAR_H))
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .px(px(12.))
+        .border_b_1()
+        .border_color(t.divider)
+        .child(
+            div()
+                .flex_1()
+                .truncate()
+                .text(Text::Micro)
+                .text_color(t.text_muted)
+                .child(summary),
+        )
+        .child(toolbar_button(
+            "wiki-refresh",
+            refresh_label,
+            false,
+            t,
+            cx.listener(|this, _: &ClickEvent, _window, cx| this.refresh_wiki(cx)),
+        ))
+        .child(toolbar_button(
+            "wiki-lint",
+            "Lint",
+            state.panel == Some(WikiPanel::Lint),
+            t,
+            cx.listener(|this, _: &ClickEvent, _window, cx| {
+                this.open_wiki_panel(WikiPanel::Lint, cx)
+            }),
+        ))
+        .child(toolbar_button(
+            "wiki-setup",
+            "Setup",
+            state.panel == Some(WikiPanel::Setup),
+            t,
+            cx.listener(|this, _: &ClickEvent, _window, cx| {
+                this.open_wiki_panel(WikiPanel::Setup, cx)
+            }),
+        ))
+        .child(toolbar_button(
+            "wiki-status",
+            "Status",
+            state.panel == Some(WikiPanel::Status),
+            t,
+            cx.listener(|this, _: &ClickEvent, _window, cx| {
+                this.open_wiki_panel(WikiPanel::Status, cx)
+            }),
+        ))
+        .into_any_element()
+}
+
+fn toolbar_button(
+    id: &'static str,
+    label: &'static str,
+    active: bool,
+    t: &Tokens,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .test_support()
+        .h(px(22.))
+        .px(px(8.))
+        .flex()
+        .items_center()
+        .rounded(px(4.))
+        .when(active, |this| this.bg(t.selected))
+        .cursor_pointer()
+        .hover(|style| style.bg(t.hover))
+        .on_click(on_click)
+        .text(Text::Small)
+        .text_color(if active { t.text } else { t.text_muted })
+        .child(label)
+        .into_any_element()
 }
 
 /// A 5 px grab lane drawing the same 1 px rule as the plain divider.
@@ -278,7 +419,7 @@ fn tree_column(
         return tree_rail(t, cx);
     }
 
-    let total = (f32::from(window.bounds().size.height) - TITLEBAR_H).max(0.0);
+    let total = (f32::from(window.bounds().size.height) - TITLEBAR_H - TOOLBAR_H).max(0.0);
     let both = !state.notes_collapsed && !state.docs_collapsed;
     let available = (total - if both { SPLITTER_H } else { 0.0 }).max(0.0);
     let notes_h = state.notes_height(available);
@@ -476,6 +617,10 @@ fn detail_column(
         .flex()
         .flex_col();
 
+    if let Some(panel) = state.panel {
+        return column.child(panel_body(state, panel, t)).into_any_element();
+    }
+
     if state.order.is_empty() {
         return column
             .child(placeholder::message(
@@ -575,6 +720,197 @@ fn tab_row(state: &WikiState, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElem
         );
     }
     strip.child(div().flex_1()).into_any_element()
+}
+
+fn panel_body(state: &WikiState, panel: WikiPanel, t: &Tokens) -> AnyElement {
+    let (title, id) = match panel {
+        WikiPanel::Status => ("Wiki status", "wiki-panel-status"),
+        WikiPanel::Lint => ("Lint findings", "wiki-panel-lint"),
+        WikiPanel::Setup => ("Compile setup", "wiki-panel-setup"),
+    };
+    let mut body = div().flex().flex_col().gap(px(6.));
+    if let Some(error) = &state.panel_error {
+        body = body.child(
+            div()
+                .text(Text::Small)
+                .text_color(t.danger)
+                .child(error.clone()),
+        );
+    }
+
+    match panel {
+        WikiPanel::Status => {
+            if let Some(status) = &state.status {
+                body = body
+                    .child(section_label("Sources", t))
+                    .child(kv_row("New", &status.sources.new.to_string(), t))
+                    .child(kv_row("Indexed", &status.sources.indexed.to_string(), t))
+                    .child(kv_row("Compiled", &status.sources.compiled.to_string(), t))
+                    .child(kv_row("Stale", &status.sources.stale.to_string(), t))
+                    .child(kv_row("Failed", &status.sources.failed.to_string(), t))
+                    .child(section_label("Pages", t))
+                    .child(kv_row("Source pages", &status.pages.source.to_string(), t))
+                    .child(kv_row("Entities", &status.pages.entity.to_string(), t))
+                    .child(kv_row("Concepts", &status.pages.concept.to_string(), t))
+                    .child(kv_row("Hand-written", &status.pages.page.to_string(), t))
+                    .child(kv_row("Index", &status.pages.index.to_string(), t));
+                if let Some(root) = &state.notes.root {
+                    body = body.child(kv_row("Wiki root", &root.display().to_string(), t));
+                }
+                if let Some(root) = &state.documents.root {
+                    body = body.child(kv_row("Sources root", &root.display().to_string(), t));
+                }
+                body = body.child(kv_row(
+                    "Instructions",
+                    &format!("v{}", kandrium_core::WIKI_INSTRUCTIONS_VERSION),
+                    t,
+                ));
+            } else {
+                body = body.child(body_text(
+                    "No index yet. Press Refresh to scan sources and rebuild the page index.",
+                    t,
+                ));
+            }
+        }
+        WikiPanel::Lint => {
+            if state.busy {
+                body = body.child(body_text("Linting…", t));
+            } else if state.findings.is_empty() {
+                body = body.child(body_text("No findings.", t));
+            } else {
+                for finding in &state.findings {
+                    let color = match finding.severity {
+                        LintSeverity::Error => t.danger,
+                        LintSeverity::Warn => t.accent,
+                        LintSeverity::Info => t.text_muted,
+                    };
+                    body = body.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .py(px(4.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .child(
+                                        div()
+                                            .text(Text::Micro)
+                                            .text_color(color)
+                                            .child(finding.code.as_str()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .truncate()
+                                            .text(Text::Micro)
+                                            .text_color(t.text_faint)
+                                            .child(finding.path.clone()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text(Text::Small)
+                                    .text_color(t.text_muted)
+                                    .child(finding.message.clone()),
+                            ),
+                    );
+                }
+            }
+        }
+        WikiPanel::Setup => {
+            body = body
+                .child(body_text(
+                    "Kandrium ships no model client. Point an MCP client (Codex, Claude, …) at the kandrium-mcp server and call get_wiki_instructions before writing pages.",
+                    t,
+                ))
+                .child(kv_row("MCP command", "kandrium-mcp", t))
+                .child(kv_row(
+                    "Instructions version",
+                    &format!("v{}", kandrium_core::WIKI_INSTRUCTIONS_VERSION),
+                    t,
+                ))
+                .child(kv_row(
+                    "Instructions hash",
+                    &kandrium_core::instructions_hash(),
+                    t,
+                ))
+                .child(section_label("Tag vocabulary", t))
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(6.))
+                        .children(kandrium_core::TAG_VOCABULARY.iter().map(|tag| {
+                            div()
+                                .px(px(6.))
+                                .py(px(2.))
+                                .rounded(px(4.))
+                                .bg(t.surface_2)
+                                .text(Text::Micro)
+                                .text_color(t.text_muted)
+                                .child(*tag)
+                        })),
+                );
+        }
+    }
+
+    div()
+        .id(id)
+        .test_support()
+        .flex_1()
+        .min_h_0()
+        .flex()
+        .flex_col()
+        .gap(px(10.))
+        .p(px(20.))
+        .child(div().text(Text::Heading).text_color(t.text).child(title))
+        .child(body)
+        .into_any_element()
+}
+
+fn section_label(label: &str, t: &Tokens) -> AnyElement {
+    div()
+        .pt(px(8.))
+        .text(Text::Label)
+        .text_color(t.text_muted)
+        .child(label.to_string())
+        .into_any_element()
+}
+
+fn kv_row(label: &str, value: &str, t: &Tokens) -> AnyElement {
+    div()
+        .flex()
+        .items_baseline()
+        .gap(px(12.))
+        .child(
+            div()
+                .w(px(120.))
+                .flex_none()
+                .text(Text::Small)
+                .text_color(t.text_muted)
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text(Text::Small)
+                .text_color(t.text)
+                .child(value.to_string()),
+        )
+        .into_any_element()
+}
+
+fn body_text(text: &str, t: &Tokens) -> AnyElement {
+    div()
+        .max_w(px(620.))
+        .text(Text::Body)
+        .text_color(t.text_muted)
+        .child(text.to_string())
+        .into_any_element()
 }
 
 #[cfg(test)]

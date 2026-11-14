@@ -12,6 +12,7 @@
 //! All logic stays in `kandrium-core`; these are thin calls plus the
 //! `CreateCardBody` shaping a form needs.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use kandrium_core::documents::{self, AnnotationDoc, DocEntry};
@@ -20,6 +21,7 @@ use kandrium_core::notes::{self, NoteEntry};
 use kandrium_core::projects::{
     self as project_data, Project, ProjectFolder, ProjectNode, ProjectPath, ProjectSummary,
 };
+use kandrium_core::wiki::{self, LintFinding, SourceDelta, SourceState, WikiStatus};
 use kandrium_core::{
     ArchivedCard, Board, BoardWithColumns, CardStatus, Clock, CreateCardBody, Person,
     ProjectChoice, Travel, add_clock, add_person, bootstrap, delete_card, end_travel,
@@ -243,9 +245,10 @@ impl Store {
     // even when the database itself failed to open.
     // -----------------------------------------------------------------------
 
-    /// The notes root (`KANDRIUM_NOTES` honoured), created when missing.
+    /// The wiki page root (`KANDRIUM_WIKI`, with `KANDRIUM_NOTES` as a
+    /// deprecated alias), created when missing.
     pub fn notes_root(&self) -> StoreResult<PathBuf> {
-        notes::ensure_root().map_err(|e| e.to_string())
+        wiki::ensure_wiki_root().map_err(|e| e.to_string())
     }
 
     pub fn notes_tree(&self, root: &Path) -> StoreResult<Vec<NoteEntry>> {
@@ -275,6 +278,46 @@ impl Store {
 
     pub fn delete_note(&self, path: &Path, root: &Path) -> StoreResult<()> {
         notes::delete_path(path, root).map_err(|e| e.to_string())
+    }
+
+    // -----------------------------------------------------------------------
+    // Wiki index — a derived view over the page files and the documents
+    // folder. Reads use the read handle; refresh/reindex use the write one.
+    // -----------------------------------------------------------------------
+
+    pub fn wiki_status(&self) -> StoreResult<WikiStatus> {
+        wiki::wiki_status(self.conn()?).map_err(|e| e.to_string())
+    }
+
+    pub fn wiki_lint(&self) -> StoreResult<Vec<LintFinding>> {
+        let root = self.notes_root()?;
+        let documents = self.documents_root()?;
+        wiki::lint_wiki(self.conn()?, &root, &documents, None).map_err(|e| e.to_string())
+    }
+
+    /// Absolute source path → compile state, for the tree dots.
+    pub fn wiki_source_states(&self) -> StoreResult<HashMap<PathBuf, SourceState>> {
+        let documents = self.documents_root()?;
+        let sources = wiki::list_sources(self.conn()?, None).map_err(|e| e.to_string())?;
+        Ok(sources
+            .into_iter()
+            .map(|source| (documents.join(source.rel_path), source.state))
+            .collect())
+    }
+
+    /// Rescan sources and rebuild the page index plus `index.md`.
+    pub fn refresh_wiki(&self) -> StoreResult<(SourceDelta, usize)> {
+        let root = self.notes_root()?;
+        let documents = self.documents_root()?;
+        let delta = wiki::refresh_sources(self.wconn()?, &documents).map_err(|e| e.to_string())?;
+        let pages = wiki::index_all_pages(self.wconn()?, &root).map_err(|e| e.to_string())?;
+        Ok((delta, pages))
+    }
+
+    /// Reindex one page after an editor save.
+    pub fn reindex_wiki_page(&self, rel_path: &str) -> StoreResult<()> {
+        let root = self.notes_root()?;
+        wiki::reindex_page(self.wconn()?, &root, rel_path).map_err(|e| e.to_string())
     }
 
     // -----------------------------------------------------------------------

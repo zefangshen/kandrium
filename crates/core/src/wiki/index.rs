@@ -113,7 +113,7 @@ pub fn index_page(db: &Connection, _root: &Path, page: &WikiPage, body: &str) ->
 ///
 /// Pages that disappeared are dropped, `reviewed` is preserved when the file
 /// does not state it, and the generated index is never treated as an input.
-pub fn index_all_pages(db: &mut Connection, root: &Path) -> Result<usize> {
+pub fn index_all_pages(db: &Connection, root: &Path) -> Result<usize> {
     if !root.exists() {
         return Ok(0);
     }
@@ -124,7 +124,7 @@ pub fn index_all_pages(db: &mut Connection, root: &Path) -> Result<usize> {
 
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut bodies: Vec<(String, String)> = Vec::new();
-    let tx = db.transaction()?;
+    let tx = db.unchecked_transaction()?;
     for entry in files {
         let rel_path = sources::relative_path(&root, &entry.path)?;
         if rel_path == INDEX_PAGE {
@@ -334,7 +334,7 @@ pub fn get_page(db: &Connection, rel_path: &str) -> Result<Option<WikiPage>> {
 ///
 /// Used by the write pipeline so a single write never leaves the index half
 /// updated.
-pub fn reindex_page(db: &mut Connection, root: &Path, rel_path: &str) -> Result<()> {
+pub fn reindex_page(db: &Connection, root: &Path, rel_path: &str) -> Result<()> {
     let root = fsutil::canonical_root(root)?;
     let path = fsutil::guard(&root, &root.join(rel_path))?;
     let bytes = std::fs::read(&path)?;
@@ -364,7 +364,7 @@ pub fn reindex_page(db: &mut Connection, root: &Path, rel_path: &str) -> Result<
         sources,
     };
 
-    let tx = db.transaction()?;
+    let tx = db.unchecked_transaction()?;
     index_page(&tx, &root, &page, &parsed.body)?;
     links::index_links(&tx, rel_path, &parsed.body)?;
     tx.commit()?;
@@ -747,7 +747,7 @@ mod tests {
 
     #[test]
     fn index_reconciles_pages_and_generates_the_index() {
-        let mut f = fixture();
+        let f = fixture();
         f.db.execute(
             "INSERT INTO wiki_sources (rel_path, kind, hash, size, mtime, state)
              VALUES ('papers/attention.pdf', 'pdf', 'hash-attention', 10, 0, 'new')",
@@ -777,7 +777,7 @@ mod tests {
             "# Reading notes\n\nPlain page.\n",
         );
 
-        let count = index_all_pages(&mut f.db, &f.root).unwrap();
+        let count = index_all_pages(&f.db, &f.root).unwrap();
         assert_eq!(count, 3);
 
         let pages = list_pages(&f.db, None).unwrap();
@@ -838,13 +838,13 @@ mod tests {
 
     #[test]
     fn reindex_is_idempotent_and_preserves_reviewed_and_generated_hash() {
-        let mut f = fixture();
+        let f = fixture();
         write(
             &f.root,
             "concepts/attention.md",
             "---\ntype: concept\ntitle: Attention\n---\nBody.\n",
         );
-        index_all_pages(&mut f.db, &f.root).unwrap();
+        index_all_pages(&f.db, &f.root).unwrap();
         let first = list_pages(&f.db, Some(PageKind::Concept)).unwrap();
         assert_eq!(first.len(), 1);
         assert!(!first[0].reviewed);
@@ -856,7 +856,7 @@ mod tests {
         )
         .unwrap();
 
-        let count = index_all_pages(&mut f.db, &f.root).unwrap();
+        let count = index_all_pages(&f.db, &f.root).unwrap();
         assert_eq!(count, 1);
         let again = list_pages(&f.db, Some(PageKind::Concept)).unwrap();
         assert_eq!(again.len(), 1);
@@ -867,17 +867,17 @@ mod tests {
 
     #[test]
     fn removed_pages_drop_rows_and_search_hits() {
-        let mut f = fixture();
+        let f = fixture();
         write(
             &f.root,
             "concepts/attention.md",
             "---\ntype: concept\ntitle: Attention\n---\nUniqueToken body.\n",
         );
-        index_all_pages(&mut f.db, &f.root).unwrap();
+        index_all_pages(&f.db, &f.root).unwrap();
         assert_eq!(search(&f.db, "UniqueToken", 10).unwrap().len(), 1);
 
         std::fs::remove_file(f.root.join("concepts/attention.md")).unwrap();
-        index_all_pages(&mut f.db, &f.root).unwrap();
+        index_all_pages(&f.db, &f.root).unwrap();
         assert!(
             list_pages(&f.db, Some(PageKind::Concept))
                 .unwrap()
@@ -897,14 +897,14 @@ mod tests {
 
     #[test]
     fn search_matches_body_and_survives_fts_syntax() {
-        let mut f = fixture();
+        let f = fixture();
         write(
             &f.root,
             "entities/vaswani.md",
             "---\ntype: entity\ntitle: Ashish Vaswani\naliases: [vaswani]\n---\n\
              Lead author of the transformer paper.\n",
         );
-        index_all_pages(&mut f.db, &f.root).unwrap();
+        index_all_pages(&f.db, &f.root).unwrap();
 
         let hits = search(&f.db, "transformer", 5).unwrap();
         assert_eq!(hits.len(), 1);
@@ -927,13 +927,13 @@ mod tests {
 
     #[test]
     fn rebuild_fts_repopulates_from_files() {
-        let mut f = fixture();
+        let f = fixture();
         write(
             &f.root,
             "concepts/attention.md",
             "---\ntype: concept\ntitle: Attention\n---\nRebuildToken.\n",
         );
-        index_all_pages(&mut f.db, &f.root).unwrap();
+        index_all_pages(&f.db, &f.root).unwrap();
         f.db.execute("DELETE FROM wiki_fts", []).unwrap();
         assert!(search(&f.db, "RebuildToken", 10).unwrap().is_empty());
 
@@ -945,21 +945,21 @@ mod tests {
 
     #[test]
     fn missing_root_indexes_nothing() {
-        let mut f = fixture();
+        let f = fixture();
         let missing = f.root.join("does-not-exist");
-        assert_eq!(index_all_pages(&mut f.db, &missing).unwrap(), 0);
+        assert_eq!(index_all_pages(&f.db, &missing).unwrap(), 0);
         assert!(list_pages(&f.db, None).unwrap().is_empty());
     }
 
     #[test]
     fn malformed_frontmatter_is_still_indexed() {
-        let mut f = fixture();
+        let f = fixture();
         write(
             &f.root,
             "concepts/broken.md",
             "---\ntitle: Open\nBody without closing.\n",
         );
-        index_all_pages(&mut f.db, &f.root).unwrap();
+        index_all_pages(&f.db, &f.root).unwrap();
         let pages = list_pages(&f.db, Some(PageKind::Concept)).unwrap();
         assert_eq!(pages.len(), 1);
         assert_eq!(pages[0].rel_path, "concepts/broken.md");
@@ -969,7 +969,7 @@ mod tests {
 
     #[test]
     fn index_builds_the_link_graph_and_backlinks() {
-        let mut f = fixture();
+        let f = fixture();
         write(
             &f.root,
             "concepts/attention.md",
@@ -980,14 +980,14 @@ mod tests {
             "entities/vaswani.md",
             "---\ntype: entity\ntitle: Ashish Vaswani\n---\nAuthor.\n",
         );
-        index_all_pages(&mut f.db, &f.root).unwrap();
+        index_all_pages(&f.db, &f.root).unwrap();
 
         let inbound = super::links::backlinks(&f.db, "entities/vaswani.md").unwrap();
         assert_eq!(inbound.len(), 1);
         assert_eq!(inbound[0].from, "concepts/attention.md");
 
         std::fs::remove_file(f.root.join("concepts/attention.md")).unwrap();
-        index_all_pages(&mut f.db, &f.root).unwrap();
+        index_all_pages(&f.db, &f.root).unwrap();
         assert!(
             super::links::backlinks(&f.db, "entities/vaswani.md")
                 .unwrap()

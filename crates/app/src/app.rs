@@ -54,7 +54,7 @@ use crate::views::tasks::{
 use crate::views::{
     notes::{DraftKind, NameDraft, NoteTab},
     placeholder, tasks,
-    wiki::{self, TabKey, TabKind, WikiState},
+    wiki::{self, TabKey, TabKind, WikiPanel, WikiState},
 };
 use crate::vim;
 
@@ -394,6 +394,7 @@ impl AppShell {
             Section::Wiki => {
                 shell.load_notes();
                 shell.load_documents();
+                shell.reload_wiki_status();
             }
             Section::Projects => shell.load_projects(),
             _ => {}
@@ -513,6 +514,64 @@ impl AppShell {
         cx.notify();
     }
 
+    /// Toggle a non-tab panel in the detail column.
+    pub(crate) fn open_wiki_panel(&mut self, panel: WikiPanel, cx: &mut Context<Self>) {
+        if self.wiki.panel == Some(panel) {
+            self.wiki.panel = None;
+            cx.notify();
+            return;
+        }
+        self.wiki.panel = Some(panel);
+        self.wiki.panel_error = None;
+        match panel {
+            WikiPanel::Status => self.reload_wiki_status(),
+            WikiPanel::Lint => self.run_wiki_lint(),
+            WikiPanel::Setup => {}
+        }
+        cx.notify();
+    }
+
+    /// Scan sources, rebuild the page index, and reload both trees.
+    pub(crate) fn refresh_wiki(&mut self, cx: &mut Context<Self>) {
+        self.wiki.busy = true;
+        self.wiki.panel_error = None;
+        if let Err(error) = self.store.refresh_wiki() {
+            self.wiki.panel_error = Some(error.to_string());
+        }
+        self.wiki.busy = false;
+        self.load_notes();
+        self.load_documents();
+        self.reload_wiki_status();
+        if self.wiki.panel == Some(WikiPanel::Lint) {
+            self.run_wiki_lint();
+        }
+        cx.notify();
+    }
+
+    fn reload_wiki_status(&mut self) {
+        match self.store.wiki_status() {
+            Ok(status) => self.wiki.status = Some(status),
+            Err(error) => {
+                self.wiki.status = None;
+                if self.wiki.panel == Some(WikiPanel::Status) {
+                    self.wiki.panel_error = Some(error.to_string());
+                }
+            }
+        }
+    }
+
+    fn run_wiki_lint(&mut self) {
+        self.wiki.busy = true;
+        match self.store.wiki_lint() {
+            Ok(findings) => {
+                self.wiki.findings = findings;
+                self.wiki.panel_error = None;
+            }
+            Err(error) => self.wiki.panel_error = Some(error.to_string()),
+        }
+        self.wiki.busy = false;
+    }
+
     /// Show a tab picked in the merged row.
     pub(crate) fn activate_wiki_tab(
         &mut self,
@@ -592,6 +651,7 @@ impl AppShell {
             Section::Wiki => {
                 self.load_notes();
                 self.load_documents();
+                self.reload_wiki_status();
             }
             Section::Projects => self.load_projects(),
         }
@@ -3334,7 +3394,7 @@ impl AppShell {
     fn wants_watcher(&self) -> bool {
         matches!(
             self.section,
-            Section::Tasks | Section::Clocks | Section::Projects
+            Section::Tasks | Section::Clocks | Section::Projects | Section::Wiki
         )
     }
 
@@ -3422,7 +3482,14 @@ impl AppShell {
                     self.reload_displayed_board();
                 }
             }
-            Section::Wiki => return,
+            Section::Wiki => {
+                // An agent can write pages and sources out of process. The
+                // trees are file-backed, so rescanning is the reload; the
+                // status panel only re-reads the derived index.
+                self.load_notes();
+                self.load_documents();
+                self.reload_wiki_status();
+            }
         }
         cx.notify();
     }
@@ -4345,6 +4412,7 @@ impl AppShell {
 
     /// Open a note in a tab, reusing the tab when the path is already open.
     pub(crate) fn open_note(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.wiki.panel = None;
         self.wiki.notes.selected = Some(path.clone());
         if let Some(index) = self.wiki.notes.tab_index(&path) {
             self.wiki.notes.active = Some(index);
@@ -4501,6 +4569,13 @@ impl AppShell {
                 let tab = &mut self.wiki.notes.tabs[index];
                 tab.draft.mark_saved(value);
                 self.wiki.notes.error = None;
+                if let Some(relative) = documents::rel_path(&root, path)
+                    && let Err(error) = self.store.reindex_wiki_page(&relative)
+                {
+                    kandrium_core::logging::warn!(
+                        "wiki reindex after save failed for {relative}: {error}"
+                    );
+                }
             }
             Err(error) => self.wiki.notes.error = Some(error.to_string()),
         }
@@ -4810,6 +4885,7 @@ impl AppShell {
                 self.wiki.documents.error = Some(error);
             }
         }
+        self.wiki.documents.source_states = self.store.wiki_source_states().unwrap_or_default();
         if !self.wiki.documents.session_loaded {
             self.wiki.documents.session_loaded = true;
             if let Ok(text) = std::fs::read_to_string(self.documents_session_path()) {
@@ -4888,6 +4964,7 @@ impl AppShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.wiki.panel = None;
         self.wiki.documents.selected = Some(path.clone());
         if let Some(index) = self.wiki.documents.tab_index(&path) {
             self.wiki.documents.active = Some(index);

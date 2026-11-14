@@ -635,7 +635,7 @@ mod tests {
     fn write_creates_the_file_row_and_index_entry() {
         let mut f = fixture();
         std::fs::write(f.documents.join("reading.md"), "one\ntwo\n").unwrap();
-        sources::refresh_sources(&mut f.db, &f.documents).unwrap();
+        sources::refresh_sources(&f.db, &f.documents).unwrap();
 
         let content = "---\ntype: concept\ntitle: Attention\nsummary: Shared idea.\n\
                        aliases: [attention]\nsources: [reading.md]\n---\n\
@@ -851,7 +851,7 @@ mod tests {
     fn runs_are_recorded_and_sources_marked_compiled() {
         let mut f = fixture();
         std::fs::write(f.documents.join("reading.md"), "one\n").unwrap();
-        sources::refresh_sources(&mut f.db, &f.documents).unwrap();
+        sources::refresh_sources(&f.db, &f.documents).unwrap();
 
         let run = record_run(
             &mut f.db,

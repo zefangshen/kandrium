@@ -210,15 +210,14 @@ pub fn lint(
         if matches!(
             kind,
             PageKind::Source | PageKind::Entity | PageKind::Concept
-        ) {
-            if parsed.aliases().is_empty() {
-                findings.push(LintFinding::new(
-                    LintCode::MissingAlias,
-                    rel_path,
-                    0,
-                    "compiled page has no aliases",
-                ));
-            }
+        ) && parsed.aliases().is_empty()
+        {
+            findings.push(LintFinding::new(
+                LintCode::MissingAlias,
+                rel_path,
+                0,
+                "compiled page has no aliases",
+            ));
         }
         if body_is_empty(&parsed.body) {
             findings.push(LintFinding::new(
@@ -397,24 +396,23 @@ fn check_provenance(
     }
 
     for source in pages::page_sources(parsed) {
-        if source.start_line > 0 {
-            if let Some(entry) = source_map.get(source.source_path.as_str())
-                && entry.kind == SourceKind::Markdown
+        if source.start_line > 0
+            && let Some(entry) = source_map.get(source.source_path.as_str())
+            && entry.kind == SourceKind::Markdown
+        {
+            let line_count = source_line_count(documents_root, &source.source_path);
+            if let Some(line_count) = line_count
+                && source.end_line as usize > line_count
             {
-                let line_count = source_line_count(documents_root, &source.source_path);
-                if let Some(line_count) = line_count
-                    && source.end_line as usize > line_count
-                {
-                    findings.push(LintFinding::new(
-                        LintCode::BadCitation,
-                        rel_path,
-                        0,
-                        format!(
-                            "citation range ends at line {} but {} has {} lines",
-                            source.end_line, source.source_path, line_count
-                        ),
-                    ));
-                }
+                findings.push(LintFinding::new(
+                    LintCode::BadCitation,
+                    rel_path,
+                    0,
+                    format!(
+                        "citation range ends at line {} but {} has {} lines",
+                        source.end_line, source.source_path, line_count
+                    ),
+                ));
             }
         }
     }
@@ -684,8 +682,8 @@ mod tests {
     }
 
     fn reindex(f: &mut Fixture) {
-        crate::wiki::refresh_sources(&mut f.db, &f.documents).unwrap();
-        crate::wiki::index_all_pages(&mut f.db, &f.root).unwrap();
+        crate::wiki::refresh_sources(&f.db, &f.documents).unwrap();
+        crate::wiki::index_all_pages(&f.db, &f.root).unwrap();
     }
 
     fn clean_wiki(f: &mut Fixture) {
@@ -797,7 +795,7 @@ mod tests {
         // Change the source after the page was written, then refresh the
         // source index: the page now records an old hash.
         write(&f.documents, "short.md", "one\ntwo\nthree\nfour\n");
-        crate::wiki::refresh_sources(&mut f.db, &f.documents).unwrap();
+        crate::wiki::refresh_sources(&f.db, &f.documents).unwrap();
         let findings = lint(&f.db, &f.root, &f.documents, None).unwrap();
         assert!(codes(&findings).contains(&"stale-page"), "{findings:?}");
     }
@@ -815,7 +813,7 @@ mod tests {
         );
         reindex(&mut f);
         std::fs::remove_file(f.documents.join("only.md")).unwrap();
-        crate::wiki::refresh_sources(&mut f.db, &f.documents).unwrap();
+        crate::wiki::refresh_sources(&f.db, &f.documents).unwrap();
 
         let findings = lint(&f.db, &f.root, &f.documents, None).unwrap();
         let found = codes(&findings);

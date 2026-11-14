@@ -49,13 +49,13 @@ struct ScannedSource {
 /// New files become `new`, changed files become `stale`, unchanged files keep
 /// their state, and missing files lose their row. Pages that cited a removed
 /// source are intentionally left alone; lint reports them later.
-pub fn refresh_sources(db: &mut Connection, documents_root: &Path) -> Result<SourceDelta> {
+pub fn refresh_sources(db: &Connection, documents_root: &Path) -> Result<SourceDelta> {
     let scanned = scan_documents(documents_root)?;
     let existing = load_existing_hashes(db)?;
     let seen: HashSet<&str> = scanned.iter().map(|s| s.rel_path.as_str()).collect();
 
     let mut delta = SourceDelta::default();
-    let tx = db.transaction()?;
+    let tx = db.unchecked_transaction()?;
     for source in &scanned {
         match existing.get(&source.rel_path) {
             None => {
@@ -509,8 +509,8 @@ mod tests {
         std::fs::write(root.join("nested/a.md"), "one").unwrap();
         std::fs::write(root.join("b.PDF"), b"%PDF-1.4\n").unwrap();
 
-        let mut db = test_db(dir.path());
-        let delta = refresh_sources(&mut db, &root).unwrap();
+        let db = test_db(dir.path());
+        let delta = refresh_sources(&db, &root).unwrap();
         assert_eq!(
             delta.added,
             vec!["b.PDF".to_string(), "nested/a.md".to_string()]
@@ -539,12 +539,12 @@ mod tests {
         std::fs::write(root.join("a.md"), "one").unwrap();
         std::fs::write(root.join("b.md"), "two").unwrap();
 
-        let mut db = test_db(dir.path());
-        refresh_sources(&mut db, &root).unwrap();
+        let db = test_db(dir.path());
+        refresh_sources(&db, &root).unwrap();
 
         std::fs::write(root.join("a.md"), "one changed").unwrap();
         std::fs::remove_file(root.join("b.md")).unwrap();
-        let delta = refresh_sources(&mut db, &root).unwrap();
+        let delta = refresh_sources(&db, &root).unwrap();
         assert_eq!(delta.changed, vec!["a.md".to_string()]);
         assert_eq!(delta.removed, vec!["b.md".to_string()]);
 
@@ -563,9 +563,9 @@ mod tests {
         let root = docs(dir.path());
         std::fs::write(root.join("a.md"), "one").unwrap();
 
-        let mut db = test_db(dir.path());
-        refresh_sources(&mut db, &root).unwrap();
-        let delta = refresh_sources(&mut db, &root).unwrap();
+        let db = test_db(dir.path());
+        refresh_sources(&db, &root).unwrap();
+        let delta = refresh_sources(&db, &root).unwrap();
         assert!(delta.is_empty());
         assert_eq!(delta.unchanged, 1);
     }

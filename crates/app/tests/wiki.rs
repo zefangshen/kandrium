@@ -220,6 +220,49 @@ fn tabs_from_both_halves_share_one_row_in_open_order(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn toolbar_opens_status_lint_and_setup_panels(cx: &mut TestAppContext) {
+    let notes_root = shared_root("KANDRIUM_NOTES");
+    let note = notes_root.join("wiki-panel-note.md");
+    fs::write(&note, "# panel note\n").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = seeded_db(dir.path());
+    let (_view, cx) = boot(cx, db);
+    open_wiki(cx);
+
+    cx.update(|window, _cx| {
+        assert!(window.find("wiki-toolbar").visible());
+    });
+
+    click(cx, "wiki-status");
+    cx.update(|window, _cx| {
+        assert!(window.find("wiki-panel-status").visible());
+    });
+
+    click(cx, "wiki-refresh");
+    cx.update(|window, _cx| {
+        assert!(window.find("wiki-panel-status").visible());
+    });
+
+    click(cx, "wiki-lint");
+    cx.update(|window, _cx| {
+        assert!(window.find("wiki-panel-lint").visible());
+    });
+
+    click(cx, "wiki-setup");
+    cx.update(|window, _cx| {
+        assert!(window.find("wiki-panel-setup").visible());
+    });
+
+    // Opening a tab leaves the panel and shows the editor again.
+    click(cx, note_row(&note));
+    cx.update(|window, _cx| {
+        assert!(window.find_all("wiki-panel-setup").is_empty());
+        assert!(window.find("notes-head").visible());
+    });
+}
+
+#[gpui::test]
 fn closing_a_merged_tab_keeps_the_other_kind_intact(cx: &mut TestAppContext) {
     let notes_root = shared_root("KANDRIUM_NOTES");
     let docs_root = shared_root("KANDRIUM_DOCS");
