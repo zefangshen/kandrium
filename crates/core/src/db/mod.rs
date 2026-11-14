@@ -15,10 +15,10 @@ pub mod migrations;
 
 pub use backup::backups_dir;
 pub use connection::{
-    bootstrap, has_boards, migrate_legacy_db, open_db, open_db_readonly, resolve_db_path,
+    bootstrap, has_boards, migrate_legacy_db, open_db, open_db_readonly, prepare, resolve_db_path,
     resolve_old_db_path,
 };
-pub use migrations::{SCHEMA_VERSION, run_schema};
+pub use migrations::SCHEMA_VERSION;
 
 use rand::Rng;
 

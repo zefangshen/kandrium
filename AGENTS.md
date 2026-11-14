@@ -37,7 +37,7 @@ Workspace, edition 2024. All comments, identifiers, and docs are in English.
 - The SQL schema lives as numbered files at the workspace root
   (`migrations/0001_initial_schema.sql` … `migrations/0011_project_paths.sql`)
   and is embedded into `crates/core/src/db/migrations.rs` at compile time.
-  `db::run_schema` applies them through `rusqlite_migration` via
+  `db::run_schema` (crate-private) applies them through `rusqlite_migration` via
   `PRAGMA user_version`. v1 (`0001_initial_schema.sql`) is identical in shape
   to the legacy Drizzle schema so the row-copy importer works. Keep both
   compatible; new schema steps must be idempotent `CREATE TABLE IF NOT EXISTS`
@@ -54,13 +54,15 @@ Workspace, edition 2024. All comments, identifiers, and docs are in English.
   a project. The `db` module is split into `db/connection.rs` (open/path/legacy
   migration/bootstrap), `db/migrations.rs` (schema + runner), and
   `db/backup.rs` (snapshots + integrity). `db::bootstrap(&mut Connection,
-  &Path)` is the single boot path for both front-ends: it runs
+  &Path)` is the single boot path for both front-ends: it runs `db::prepare`
+  and then seeds. `db::prepare` is the integrity check + snapshot + schema
+  without the seed, and the legacy importer calls it directly — it runs
   `backup::check_integrity` (quarantine raw DB + `-wal`/`-shm` as
   `<stem>-corrupt-<stamp>.db` on failure), snapshots before a pending migration
   (`VACUUM INTO`, newest 5 kept) or once per local day (newest 7 kept), then
-  `run_schema` and `seed`. Snapshots live in `<db parent>/backups/`; every new
-  boot path must call `bootstrap` with the real path, never `run_schema`
-  directly.
+  `run_schema`. Snapshots live in `<db parent>/backups/`; every new boot path
+  must call `bootstrap` (or `prepare` when it must not seed) with the real
+  path, never `run_schema` directly.
 - Projects (`crates/core/src/projects.rs`) own a board each. Those boards are
   hidden from the Tasks tabs (`list_boards`) with
   `NOT IN (SELECT board_id FROM projects)`; the Projects view re-adds the

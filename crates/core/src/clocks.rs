@@ -1048,7 +1048,7 @@ mod tests {
     fn mem_db() -> (tempfile::TempDir, Connection) {
         let dir = tempfile::tempdir().unwrap();
         let mut db = open_db(&dir.path().join("clocks.db")).unwrap();
-        crate::db::run_schema(&mut db).unwrap();
+        crate::db::migrations::run_schema(&mut db).unwrap();
         (dir, db)
     }
 
@@ -1176,7 +1176,7 @@ mod tests {
     #[test]
     fn fresh_install_seeds_the_reference_trio() {
         let (_dir, mut db) = mem_db();
-        crate::db::run_schema(&mut db).unwrap();
+        crate::db::migrations::run_schema(&mut db).unwrap();
         seed(&db).unwrap();
         let clocks = list_clocks(&db).unwrap();
         assert_eq!(clocks.len(), 3);
@@ -1188,7 +1188,7 @@ mod tests {
     #[test]
     fn existing_database_with_boards_is_not_seeded() {
         let (_dir, mut db) = mem_db();
-        crate::db::run_schema(&mut db).unwrap();
+        crate::db::migrations::run_schema(&mut db).unwrap();
         db.execute(
             "INSERT INTO boards (id, title, position) VALUES ('board_custom', 'Custom', 0)",
             [],
@@ -1202,7 +1202,7 @@ mod tests {
     #[test]
     fn seed_defaults_is_idempotent() {
         let (_dir, mut db) = mem_db();
-        crate::db::run_schema(&mut db).unwrap();
+        crate::db::migrations::run_schema(&mut db).unwrap();
         seed_defaults(&db).unwrap();
         seed_defaults(&db).unwrap();
         assert_eq!(list_clocks(&db).unwrap().len(), 3);
@@ -1293,7 +1293,7 @@ mod tests {
     #[test]
     fn seeding_clocks_never_seeds_people() {
         let (_dir, mut db) = mem_db();
-        crate::db::run_schema(&mut db).unwrap();
+        crate::db::migrations::run_schema(&mut db).unwrap();
         seed(&db).unwrap();
         assert_eq!(list_clocks(&db).unwrap().len(), 3);
         assert!(list_all_people(&db).unwrap().is_empty());

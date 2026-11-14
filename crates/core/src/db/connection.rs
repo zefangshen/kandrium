@@ -128,15 +128,21 @@ pub fn has_boards(db: &Connection) -> Result<bool> {
     Ok(count > 0)
 }
 
-/// Convenience: integrity check + snapshot + schema + (conditionally) seed,
-/// the standard bootstrap shared by the app and MCP binaries.
+/// Integrity check + snapshot + schema. Every boot path goes through this,
+/// including callers that must not seed (the legacy-DB importer).
 ///
 /// The snapshot runs before `run_schema`, while the old schema is still
 /// readable, and `db_path` is required to name it.
-pub fn bootstrap(db: &mut Connection, db_path: &std::path::Path) -> Result<()> {
+pub fn prepare(db: &mut Connection, db_path: &std::path::Path) -> Result<()> {
     super::backup::check_integrity(db, db_path)?;
     let pending = super::migrations::pending_migrations(db)?;
     super::backup::snapshot_if_due(db, db_path, pending)?;
-    super::migrations::run_schema(db)?;
+    super::migrations::run_schema(db)
+}
+
+/// Standard bootstrap shared by the app and MCP binaries: [`prepare`], then
+/// seed a brand-new database.
+pub fn bootstrap(db: &mut Connection, db_path: &std::path::Path) -> Result<()> {
+    prepare(db, db_path)?;
     crate::seed::seed(db)
 }

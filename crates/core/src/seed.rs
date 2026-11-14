@@ -172,7 +172,8 @@ fn seed_card(
 
 #[cfg(test)]
 mod tests {
-    use crate::db::{has_boards, open_db, run_schema};
+    use crate::db::migrations::run_schema;
+    use crate::db::{has_boards, open_db};
     use crate::seed::seed;
     use crate::services::board::list_boards;
 

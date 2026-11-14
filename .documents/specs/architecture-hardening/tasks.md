@@ -6,34 +6,34 @@ Each task is one stage's smallest verifiable unit. A stage is committed only whe
 
 ## Stage A — subtract
 
-- [ ] A1 Delete `crates/app/src/{board,drag_probe,input_probe,pdf_probe,harness_test}.rs`.
-- [ ] A1 Rewrite `crates/app/src/main.rs` to the product path only, keeping an
+- [x] A1 Delete `crates/app/src/{board,drag_probe,input_probe,pdf_probe,harness_test}.rs`.
+- [x] A1 Rewrite `crates/app/src/main.rs` to the product path only, keeping an
       unknown-argument error.
-- [ ] A1 Remove the probe section and the `harness_test` bullet from
+- [x] A1 Remove the probe section and the `harness_test` bullet from
       `crates/app/README.md`.
-- [ ] A2 Fix the stale present-tense docs listed in `spec.md` §A2
+- [x] A2 Fix the stale present-tense docs listed in `spec.md` §A2
       (`core/lib.rs`, `pdf-render/lib.rs`, `vim.rs`, `app/src/lib.rs`,
       `views/notes.rs`, `views/documents.rs`, `app.rs`, `AGENTS.md`, `plan.md`).
-- [ ] A3 Make `pub mod services` private in `crates/core/src/lib.rs`.
-- [ ] A3 Use `fsutil::write_atomic` for the three empty-file creation sites
+- [x] A3 Make `pub mod services` private in `crates/core/src/lib.rs`.
+- [x] A3 Use `fsutil::write_atomic` for the three empty-file creation sites
       (`notes.rs:68`, `documents.rs:158`, `projects.rs:912`).
-- [ ] A4 Switch the MCP `get_board` tool to `core::get_board_readonly`; comment
+- [x] A4 Switch the MCP `get_board` tool to `core::get_board_readonly`; comment
       `get_all_board` as intentionally writing.
-- [ ] A Verify: `cargo fmt --all`, `cargo clippy --workspace --all-targets`,
+- [x] A Verify: `cargo fmt --all`, `cargo clippy --workspace --all-targets`,
       `cargo test --workspace`.
-- [ ] A Commit with the committer override and report.
+- [x] A Commit with the committer override and report.
 
 ## Stage B — enforce the boundaries
 
-- [ ] B1 Add `db::prepare`; make `bootstrap` call it, then seed.
-- [ ] B1 Point `import.rs` at `prepare`.
-- [ ] B1 Make `run_schema` `pub(crate)`; drop it from the `db` and `lib` re-exports;
+- [x] B1 Add `db::prepare`; make `bootstrap` call it, then seed.
+- [x] B1 Point `import.rs` at `prepare`.
+- [x] B1 Make `run_schema` `pub(crate)`; drop it from the `db` and `lib` re-exports;
       add `prepare` to both.
-- [ ] B2 Add the schema-version count test and the migration-file coverage test.
-- [ ] B3 Add `.github/workflows/ci.yml` (fmt check, clippy `-D warnings`, tests).
-- [ ] B3 Add `[lints.clippy] print_stdout = "deny"` to `crates/mcp/Cargo.toml`.
-- [ ] B4 Add the MCP payload key-set test.
-- [ ] B Verify and commit; report `unsafe_code = "forbid"` as deliberately omitted.
+- [x] B2 Add the schema-version count test and the migration-file coverage test.
+- [x] B3 Add `.github/workflows/ci.yml` (fmt check, clippy `-D warnings`, tests).
+- [x] B3 Add `[lints.clippy] print_stdout = "deny"` to `crates/mcp/Cargo.toml`.
+- [x] B4 Add the MCP payload key-set test.
+- [x] B Verify and commit; report `unsafe_code = "forbid"` as deliberately omitted.
 
 ## Stage C — de-duplicate
 

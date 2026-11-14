@@ -11,7 +11,7 @@ use std::path::Path;
 use rusqlite::types::{Value, ValueRef};
 use rusqlite::{Connection, OpenFlags};
 
-use crate::db::{has_boards, open_db, run_schema, uid};
+use crate::db::{has_boards, open_db, prepare, uid};
 use crate::error::{KandriumError, Result};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -61,7 +61,7 @@ pub fn import_old_db(old_path: &Path, new_path: &Path) -> Result<ImportCounts> {
         }
 
         let mut new = open_db(new_path)?;
-        run_schema(&mut new)?;
+        prepare(&mut new, new_path)?;
         if has_boards(&new)? {
             return Err(KandriumError(
                 "Target database already contains boards; refusing to import".to_string(),

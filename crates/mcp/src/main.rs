@@ -404,4 +404,85 @@ mod tests {
         let expected: Vec<String> = expected.iter().map(|name| name.to_string()).collect();
         assert_eq!(names, expected);
     }
+
+    /// Pins the field names of the JSON an MCP client receives. `camelCase`
+    /// protects spelling; this test protects presence, so adding, renaming or
+    /// dropping a field is a visible failure rather than a silent contract
+    /// change.
+    #[test]
+    fn board_payload_key_sets_are_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kandrium.db");
+        let mut db = core::db::open_db(&path).unwrap();
+        core::db::bootstrap(&mut db, &path).unwrap();
+
+        let board = core::get_board_readonly(&db, "board_career").unwrap();
+        let payload = serde_json::to_value(&board).unwrap();
+        assert_eq!(keys(&payload), ["columns", "id", "title"]);
+
+        let column = &payload["columns"][0];
+        assert_eq!(keys(column), ["cards", "id", "title"]);
+
+        let card = &column["cards"][0];
+        assert_eq!(
+            keys(card),
+            [
+                "boardId",
+                "columnId",
+                "description",
+                "dueDate",
+                "id",
+                "labels",
+                "title"
+            ]
+        );
+
+        // Optional card fields and an empty `mirrored` are skipped only when
+        // unset. A fully populated card and column pin their wire names.
+        let full = core::Card {
+            id: "card".into(),
+            column_id: "col".into(),
+            board_id: "board".into(),
+            title: "Title".into(),
+            description: "Body".into(),
+            due_date: "2026-01-01".into(),
+            labels: vec![1],
+            project_id: Some("proj".into()),
+            area_board_id: Some("area".into()),
+            project_identifier: Some("proj".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            keys(&serde_json::to_value(&full).unwrap()),
+            [
+                "areaBoardId",
+                "boardId",
+                "columnId",
+                "description",
+                "dueDate",
+                "id",
+                "labels",
+                "projectId",
+                "projectIdentifier",
+                "title"
+            ]
+        );
+
+        let column = core::Column {
+            id: "col".into(),
+            title: "To Do".into(),
+            cards: vec![],
+            mirrored: vec![full],
+        };
+        assert_eq!(
+            keys(&serde_json::to_value(&column).unwrap()),
+            ["cards", "id", "mirrored", "title"]
+        );
+    }
+
+    fn keys(value: &serde_json::Value) -> Vec<String> {
+        let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    }
 }

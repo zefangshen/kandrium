@@ -69,25 +69,33 @@ pub const SCHEMA_V11_SQL: &str = include_str!(concat!(
 /// Latest schema version. Must match the number of entries in the migration set.
 pub const SCHEMA_VERSION: i64 = 11;
 
+/// The SQL of every migration, in application order. `SCHEMA_VERSION` must
+/// equal its length; `every_sql_file_is_registered` proves the list still
+/// covers every file under `migrations/`.
+const MIGRATION_SQL: [&str; 11] = [
+    SCHEMA_SQL,
+    SCHEMA_V2_SQL,
+    SCHEMA_V3_SQL,
+    SCHEMA_V4_SQL,
+    SCHEMA_V5_SQL,
+    SCHEMA_V6_SQL,
+    SCHEMA_V7_SQL,
+    SCHEMA_V8_SQL,
+    SCHEMA_V9_SQL,
+    SCHEMA_V10_SQL,
+    SCHEMA_V11_SQL,
+];
+
 /// The ordered migration set. `rusqlite_migration` tracks the applied version
 /// in `PRAGMA user_version`, so v1 databases upgrade through only the missing
 /// steps and a database from a future schema is rejected.
 pub(crate) fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![
-        M::up(SCHEMA_SQL),
-        M::up(SCHEMA_V2_SQL),
-        M::up_with_hook(SCHEMA_V3_SQL, |tx| {
-            backfill_v3(tx).map_err(|e| HookError::Hook(e.0))
-        }),
-        M::up(SCHEMA_V4_SQL),
-        M::up(SCHEMA_V5_SQL),
-        M::up(SCHEMA_V6_SQL),
-        M::up(SCHEMA_V7_SQL),
-        M::up(SCHEMA_V8_SQL),
-        M::up(SCHEMA_V9_SQL),
-        M::up(SCHEMA_V10_SQL),
-        M::up(SCHEMA_V11_SQL),
-    ])
+    let mut steps: Vec<M<'static>> = MIGRATION_SQL.iter().copied().map(M::up).collect();
+    // v3 also needs the Rust-side identifier backfill, so it carries a hook.
+    steps[2] = M::up_with_hook(SCHEMA_V3_SQL, |tx| {
+        backfill_v3(tx).map_err(|e| HookError::Hook(e.0))
+    });
+    Migrations::new(steps)
 }
 
 /// Schema version currently recorded in the database.
@@ -106,7 +114,7 @@ pub(crate) fn pending_migrations(db: &Connection) -> Result<bool> {
 /// migration hook after its SQL. `rusqlite_migration` bumps `user_version`
 /// once the whole run commits; a database already at the latest version is a
 /// no-op, and a database ahead of this binary returns an error.
-pub fn run_schema(db: &mut Connection) -> Result<()> {
+pub(crate) fn run_schema(db: &mut Connection) -> Result<()> {
     match migrations().to_latest(db) {
         Ok(()) => Ok(()),
         Err(first) => {
@@ -165,6 +173,43 @@ mod tests {
     #[test]
     fn migrations_validate() {
         migrations().validate().unwrap();
+    }
+
+    #[test]
+    fn schema_version_matches_the_migration_set() {
+        assert_eq!(MIGRATION_SQL.len() as i64, SCHEMA_VERSION);
+        let db = Connection::open_in_memory().unwrap();
+        assert_eq!(
+            migrations().pending_migrations(&db).unwrap(),
+            SCHEMA_VERSION as i32
+        );
+    }
+
+    #[test]
+    fn every_sql_file_is_registered() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sql"))
+            .collect();
+        files.sort();
+
+        assert_eq!(files.len(), MIGRATION_SQL.len());
+        for (index, (file, embedded)) in files.iter().zip(MIGRATION_SQL).enumerate() {
+            let name = file.file_name().unwrap().to_string_lossy();
+            assert!(
+                name.starts_with(&format!("{:04}_", index + 1)),
+                "{} is out of order",
+                file.display()
+            );
+            assert_eq!(
+                std::fs::read_to_string(file).unwrap(),
+                embedded,
+                "{} is not embedded in migrations.rs",
+                file.display()
+            );
+        }
     }
 
     #[test]
