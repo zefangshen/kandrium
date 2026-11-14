@@ -62,10 +62,11 @@ pub use services::column::{
     archive_all_cards, create_column, delete_column, move_column, rename_column,
 };
 pub use wiki::{
-    Backlink, Citation, FmField, FmValue, Frontmatter, PageCounts, PageKind, PageSource, PageText,
-    SearchHit, SourceCounts, SourceDelta, SourceKind, SourceState, WikiLink, WikiPage, WikiSource,
-    WikiStatus, backlinks, compiled_dir, ensure_wiki_root, hash_bytes, hash_file, index_all_pages,
-    index_links, index_page, is_compiled_path, list_sources, list_wiki_pages, page_kind_for_path,
+    Backlink, Citation, FmField, FmValue, Frontmatter, LintCode, LintFinding, LintSeverity,
+    PageCounts, PageKind, PageSource, PageText, SearchHit, SourceCounts, SourceDelta, SourceKind,
+    SourceState, WikiLink, WikiPage, WikiSource, WikiStatus, backlinks, compiled_dir,
+    ensure_wiki_root, hash_bytes, hash_file, index_all_pages, index_links, index_page,
+    is_compiled_path, lint_wiki, list_sources, list_wiki_pages, page_kind_for_path,
     parse_citations, parse_frontmatter, parse_links, parse_page, read_page, rebuild_fts,
     rebuild_links, refresh_sources, render_page, resolve_links, resolve_wiki_root, search_wiki,
     source_counts, validate_page_path, wiki_status, write_index_md,

@@ -12,7 +12,7 @@ use std::path::Path;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
-use crate::error::{KandriumError, Result};
+use crate::error::Result;
 
 use super::WikiPage;
 

@@ -16,6 +16,7 @@ use crate::error::Result;
 
 pub mod index;
 pub mod links;
+pub mod lint;
 pub mod pages;
 pub mod sources;
 
@@ -26,6 +27,7 @@ pub use index::{
 pub use links::{
     Backlink, WikiLink, backlinks, index_links, parse_links, rebuild_links, resolve_links,
 };
+pub use lint::{LintCode, LintFinding, LintSeverity, lint as lint_wiki};
 pub use pages::{
     Citation, FmField, FmValue, Frontmatter, PAGE_EXTENSIONS, PageText, page_kind_for_path,
     page_sources, parse_citations, parse_frontmatter, parse_page, read_page, render_page,
