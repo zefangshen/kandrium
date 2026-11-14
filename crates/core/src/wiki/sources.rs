@@ -169,6 +169,13 @@ pub fn counts(db: &Connection) -> Result<SourceCounts> {
     Ok(counts)
 }
 
+/// SHA-256 of a byte slice, lowercase hex.
+pub fn hash_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    to_hex(&hasher.finalize())
+}
+
 /// SHA-256 of a file, lowercase hex.
 pub fn hash_file(path: &Path) -> Result<String> {
     let mut file = File::open(path)?;
@@ -181,13 +188,16 @@ pub fn hash_file(path: &Path) -> Result<String> {
         }
         hasher.update(&buf[..read]);
     }
-    let digest = hasher.finalize();
+    Ok(to_hex(&hasher.finalize()))
+}
+
+fn to_hex(digest: &[u8]) -> String {
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {
         use std::fmt::Write as _;
         write!(&mut out, "{byte:02x}").expect("writing to a String cannot fail");
     }
-    Ok(out)
+    out
 }
 
 /// Source kind from a file extension.

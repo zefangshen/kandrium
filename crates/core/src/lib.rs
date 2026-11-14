@@ -62,7 +62,10 @@ pub use services::column::{
     archive_all_cards, create_column, delete_column, move_column, rename_column,
 };
 pub use wiki::{
-    PageCounts, PageKind, PageSource, SourceCounts, SourceDelta, SourceKind, SourceState, WikiPage,
-    WikiSource, WikiStatus, compiled_dir, ensure_wiki_root, hash_file, is_compiled_path,
-    list_sources, refresh_sources, resolve_wiki_root, source_counts,
+    Citation, FmField, FmValue, Frontmatter, PageCounts, PageKind, PageSource, PageText, SearchHit,
+    SourceCounts, SourceDelta, SourceKind, SourceState, WikiPage, WikiSource, WikiStatus,
+    compiled_dir, ensure_wiki_root, hash_bytes, hash_file, index_all_pages, index_page,
+    is_compiled_path, list_sources, list_wiki_pages, page_kind_for_path, parse_citations,
+    parse_frontmatter, parse_page, read_page, rebuild_fts, refresh_sources, render_page,
+    resolve_wiki_root, search_wiki, source_counts, validate_page_path, wiki_status, write_index_md,
 };

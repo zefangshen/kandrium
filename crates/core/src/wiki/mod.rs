@@ -14,10 +14,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
+pub mod index;
+pub mod pages;
 pub mod sources;
 
+pub use index::{
+    INDEX_PAGE, SearchHit, index_all_pages, index_page, list_pages as list_wiki_pages, rebuild_fts,
+    search as search_wiki, status as wiki_status, write_index_md,
+};
+pub use pages::{
+    Citation, FmField, FmValue, Frontmatter, PAGE_EXTENSIONS, PageText, page_kind_for_path,
+    page_sources, parse_citations, parse_frontmatter, parse_page, read_page, render_page,
+    validate_page_path,
+};
 pub use sources::{
-    SourceDelta, counts as source_counts, hash_file, kind_for_path, list_sources, refresh_sources,
+    SourceDelta, counts as source_counts, hash_bytes, hash_file, kind_for_path, list_sources,
+    refresh_sources,
 };
 
 /// Environment variable that overrides the wiki page root.
