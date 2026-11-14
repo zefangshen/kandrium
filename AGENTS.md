@@ -24,7 +24,7 @@ Workspace, edition 2024. All comments, identifiers, and docs are in English.
   expose it from `lib.rs`.
 - The DB is SQLite WAL + `foreign_keys=ON` + 5 s busy timeout, so the app and
   MCP server processes share one file. The app detects external commits with a
-  background watcher (`crates/app/src/watcher.rs`).
+  background watcher (`crates/core/src/db/watcher.rs`).
 - Database work runs on the shell's worker path and reaches the UI through
   gpui entities/tasks; never mutate UI state from another thread. The shell
   re-reads the affected section after a watcher generation bump.

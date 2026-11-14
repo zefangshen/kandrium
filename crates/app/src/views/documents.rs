@@ -30,6 +30,7 @@ use pdf_render::{Event, PageText, PdfWorker};
 
 use crate::app::AppShell;
 use crate::assets::{Icon, icon};
+use crate::draft::Draft;
 use crate::theme::{Text, TextStyled, Tokens};
 use crate::vim::VimSession;
 
@@ -62,8 +63,6 @@ pub const HIGHLIGHT_ALPHA: u8 = 90;
 /// Halo colours for notes and highlights, in the same order as egui.
 pub const NOTE_COLORS: [&str; 4] = ["#f6d448", "#a5d6a7", "#8ab4f8", "#f6a6c1"];
 
-/// Debounce before a dirty Markdown tab is written.
-pub const AUTOSAVE: Duration = Duration::from_millis(400);
 /// Debounce before changed annotations hit the sidecar.
 pub const ANNOTATION_AUTOSAVE: Duration = Duration::from_millis(500);
 
@@ -131,12 +130,8 @@ pub struct DocTab {
     pub editor: Option<Entity<EditorState>>,
     pub vim: Option<VimSession>,
     pub preview: bool,
-    pub saved: String,
-    /// Buffer text seen by the last edit notification, used to tell a real
-    /// change from a caret/selection notification.
-    pub last_value: String,
-    pub dirty: bool,
-    pub generation: u64,
+    /// Markdown text as last written to disk, plus the debounce generation.
+    pub draft: Draft,
     // PDF
     pub worker: Option<PdfWorker>,
     pub events: Option<Receiver<Event>>,
@@ -152,8 +147,8 @@ pub struct DocTab {
     pub page_texts: HashMap<usize, PageText>,
     pub text_requested: HashSet<usize>,
     pub annotations: Vec<DocAnnotation>,
-    pub ann_dirty: bool,
-    pub ann_generation: u64,
+    /// Annotation sidecar as last written, plus the debounce generation.
+    pub ann: Draft<Vec<DocAnnotation>>,
     pub selection: Option<Selection>,
     pub popover: Option<String>,
     pub popover_editor: Option<Entity<TextareaState>>,
@@ -184,10 +179,7 @@ impl DocTab {
             editor: Some(editor),
             vim: Some(VimSession::new()),
             preview: false,
-            saved: text.clone(),
-            last_value: text,
-            dirty: false,
-            generation: 0,
+            draft: Draft::new(text),
             worker: None,
             events: None,
             page_count: 0,
@@ -200,8 +192,7 @@ impl DocTab {
             page_texts: HashMap::new(),
             text_requested: HashSet::new(),
             annotations: Vec::new(),
-            ann_dirty: false,
-            ann_generation: 0,
+            ann: Draft::new(Vec::new()),
             selection: None,
             popover: None,
             popover_editor: None,
@@ -229,10 +220,7 @@ impl DocTab {
             editor: None,
             vim: None,
             preview: false,
-            saved: String::new(),
-            last_value: String::new(),
-            dirty: false,
-            generation: 0,
+            draft: Draft::new(String::new()),
             worker: Some(worker),
             events: Some(events),
             page_count: 0,
@@ -244,9 +232,8 @@ impl DocTab {
             pending: HashSet::new(),
             page_texts: HashMap::new(),
             text_requested: HashSet::new(),
-            annotations,
-            ann_dirty: false,
-            ann_generation: 0,
+            annotations: annotations.clone(),
+            ann: Draft::new(annotations),
             selection: None,
             popover: None,
             popover_editor: None,
@@ -262,7 +249,7 @@ impl DocTab {
 
     /// Dirty marker in the tab strip: Markdown edits or unsaved annotations.
     pub fn has_unsaved(&self) -> bool {
-        self.dirty || self.ann_dirty
+        self.draft.is_dirty() || self.ann.is_dirty()
     }
 }
 

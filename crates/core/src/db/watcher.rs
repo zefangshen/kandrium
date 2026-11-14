@@ -1,4 +1,4 @@
-//! External-change watcher — the gpui port of `crates/app/src/watcher.rs`.
+//! External-change watcher.
 //!
 //! Polls `PRAGMA data_version` on its own connection. Only commits from
 //! *other* processes bump the value (our own writes don't), so there is no
@@ -6,7 +6,8 @@
 //! reported as one unit over a channel.
 //!
 //! Nothing here touches UI state: the thread owns a connection and a sender,
-//! the shell drains the receiver on the UI thread.
+//! the caller drains the receiver on its own thread. This lives in `core`
+//! because the database is shared infrastructure, not a UI concern.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -93,7 +94,7 @@ fn watch(path: PathBuf, tx: Sender<()>, stop: Arc<AtomicBool>) {
             last = value;
         }
         if tx.send(()).is_err() {
-            return; // the shell dropped its receiver
+            return; // the caller dropped its receiver
         }
     }
 }
@@ -111,12 +112,13 @@ fn data_version(db: &Connection) -> rusqlite::Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{bootstrap, open_db};
     use std::time::Instant;
 
     fn seeded(dir: &Path) -> PathBuf {
         let path = dir.join("kandrium.db");
-        let mut db = kandrium_core::open_db(&path).expect("open temp db");
-        kandrium_core::bootstrap(&mut db, &path).expect("bootstrap temp db");
+        let mut db = open_db(&path).expect("open temp db");
+        bootstrap(&mut db, &path).expect("bootstrap temp db");
         path
     }
 

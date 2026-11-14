@@ -525,7 +525,7 @@ fn tab_row(state: &WikiState, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElem
                 let tab = state.notes.tabs.iter().find(|tab| tab.path == key.path);
                 (
                     tab.map(|tab| tab.name.clone()).unwrap_or_default(),
-                    tab.is_some_and(|tab| tab.dirty),
+                    tab.is_some_and(|tab| tab.draft.is_dirty()),
                     Icon::StickyNote,
                 )
             }

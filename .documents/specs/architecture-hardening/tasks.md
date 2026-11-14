@@ -37,12 +37,12 @@ Each task is one stage's smallest verifiable unit. A stage is committed only whe
 
 ## Stage C — de-duplicate
 
-- [ ] C1 Add `crates/app/src/draft.rs` and `AppShell::debounce`.
-- [ ] C1 Embed `Draft` in `NoteTab`, `DocTab`, `ProjectDocTab`, `TitleEdit`,
+- [x] C1 Add `crates/app/src/draft.rs` and `AppShell::debounce`.
+- [x] C1 Embed `Draft` in `NoteTab`, `DocTab`, `ProjectDocTab`, `TitleEdit`,
       `DetailEditor`, and the annotation state; collapse the duplicate timers and
       `AUTOSAVE` constants. Stop and report if one family cannot keep behaviour.
-- [ ] C2 Add `projects::identifier_owner`, use it in `set_identifier`, delete
+- [x] C2 Add `projects::identifier_owner`, use it in `set_identifier`, delete
       `AppShell::identifier_owner`, add the core test.
-- [ ] C3 Move `watcher.rs` into `crates/core/src/db/`, update exports/imports and
+- [x] C3 Move `watcher.rs` into `crates/core/src/db/`, update exports/imports and
       the two docs that name its path.
-- [ ] C Verify, commit, and give the final report.
+- [x] C Verify, commit, and give the final report.

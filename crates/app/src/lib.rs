@@ -8,12 +8,12 @@
 pub mod anim;
 pub mod app;
 pub mod assets;
+pub mod draft;
 pub mod settings;
 pub mod store;
 pub mod theme;
 pub mod views;
 pub mod vim;
-pub mod watcher;
 
 use gpui_kit::{AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size};
 

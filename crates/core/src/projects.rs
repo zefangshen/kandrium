@@ -523,6 +523,11 @@ pub fn set_source(db: &Connection, id: &str, source: &str) -> Result<Project> {
 /// `identifier_locked` so later renames leave it alone.
 pub fn set_identifier(db: &Connection, id: &str, identifier: &str) -> Result<Project> {
     let identifier = validate_identifier(identifier)?;
+    if let Some(owner) = identifier_owner(db, &identifier, Some(id))? {
+        return Err(KandriumError::new(format!(
+            "Identifier \"{identifier}\" is already used by \"{owner}\""
+        )));
+    }
     let now = now_unix();
     let changed = db
         .execute(
@@ -542,6 +547,31 @@ pub fn set_identifier(db: &Connection, id: &str, identifier: &str) -> Result<Pro
         return Err(KandriumError::new("Project not found"));
     }
     get_project(db, id)
+}
+
+/// Name of the project that already owns `identifier`, compared
+/// case-insensitively and ignoring `exclude_id` (the project being renamed).
+///
+/// This is the single owner of the uniqueness policy: the create and rename
+/// paths use it for their error message, and the database's `NOCASE` unique
+/// index remains the race-proof backstop.
+pub fn identifier_owner(
+    db: &Connection,
+    identifier: &str,
+    exclude_id: Option<&str>,
+) -> Result<Option<String>> {
+    let owner = db.query_row(
+        "SELECT name FROM projects \
+         WHERE identifier COLLATE NOCASE = ?1 AND (?2 IS NULL OR id <> ?2) \
+         LIMIT 1",
+        rusqlite::params![identifier, exclude_id],
+        |r| r.get(0),
+    );
+    match owner {
+        Ok(name) => Ok(Some(name)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(other) => Err(other.into()),
+    }
 }
 
 /// Flat project list for the card modal's project picker.
@@ -1439,7 +1469,23 @@ mod tests {
 
         let duplicate = set_identifier(&f.db, &a.id, "BET");
         assert!(duplicate.is_err());
-        assert!(duplicate.unwrap_err().0.contains("already in use"));
+        assert!(
+            duplicate
+                .unwrap_err()
+                .0
+                .contains("already used by \"Beta\"")
+        );
+
+        // `exclude_id` lets a project keep (or re-case) its own identifier.
+        assert_eq!(
+            set_identifier(&f.db, &a.id, "AB-1").unwrap().identifier,
+            "ab-1"
+        );
+        assert_eq!(
+            identifier_owner(&f.db, "ab-1", None).unwrap(),
+            Some("Alpha".into())
+        );
+        assert_eq!(identifier_owner(&f.db, "AB-1", Some(&a.id)).unwrap(), None);
     }
 
     #[test]

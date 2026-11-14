@@ -19,6 +19,9 @@ pub use connection::{
     resolve_old_db_path,
 };
 pub use migrations::SCHEMA_VERSION;
+pub use watcher::Watcher;
+
+pub mod watcher;
 
 use rand::Rng;
 

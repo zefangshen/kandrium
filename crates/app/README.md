@@ -66,7 +66,8 @@ cargo test -p kandrium-app
   draw, and settings round-trip.
 - `tests/{clocks,documents,notes,projects,wiki}.rs` — section flows.
 - `src/settings.rs` — defaults, the egui import, and unknown-key preservation.
-- `src/watcher.rs` — another connection's commit is reported.
+- `src/draft.rs` — the debounced-save protocol every editor shares.
+- `../../core/src/db/watcher.rs` — another connection's commit is reported.
 - `src/vim.rs` — the modal engine (motions, operators, text objects, ex).
 - `src/store.rs` — core round trips, including the mirrored-area drop order.
 
@@ -101,7 +102,7 @@ cargo update -p taffy --precise 0.15.0
 | `src/lib.rs` | `run()`: install fonts, open the window |
 | `src/app.rs` | `AppShell`, `Section`, the segmented control, the watcher pump |
 | `src/settings.rs` | `gpui-settings.conf` and the one-time egui import |
-| `src/watcher.rs` | `data_version` polling thread, events over an mpsc channel |
+| `kandrium_core::db::watcher` | `data_version` polling thread, events over an mpsc channel |
 | `src/theme.rs` | palette, typography tokens, font install |
 | `src/assets.rs` | Lucide SVGs compiled from `assets/icons/` |
 | `src/store.rs` | `kandrium-core` calls (reads and writes) |

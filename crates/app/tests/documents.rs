@@ -14,6 +14,7 @@ use gpui::{Entity, TestAppContext, VisualTestContext};
 use gpui_kit::test::TestWindowExt;
 
 use kandrium_app::app::AppShell;
+use kandrium_app::draft::AUTOSAVE;
 use kandrium_app::store::Store;
 use kandrium_app::views::documents as docs_view;
 use kandrium_core::documents::{AnnotationDoc, AnnotationKind, new_annotation};
@@ -357,7 +358,7 @@ fn markdown_autosave_debounces_and_writes_once(cx: &mut TestAppContext) {
     assert_eq!(fs::read_to_string(&md).unwrap(), "");
 
     cx.background_executor
-        .advance_clock(docs_view::AUTOSAVE + Duration::from_millis(50));
+        .advance_clock(AUTOSAVE + Duration::from_millis(50));
     cx.run_until_parked();
     assert_eq!(fs::read_to_string(&md).unwrap(), "autosaved");
     cx.update(|window, cx| window.render_frame(cx));

@@ -16,7 +16,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use gpui_kit::base::text::markdown;
 use gpui_kit::component::ActiveTheme as _;
@@ -35,6 +34,7 @@ use kandrium_core::projects::{
 
 use crate::app::AppShell;
 use crate::assets::{Icon, icon};
+use crate::draft::Draft;
 use crate::theme::{Text, TextStyled, Tokens};
 use crate::views::{placeholder, tasks};
 use crate::vim::VimSession;
@@ -48,8 +48,6 @@ pub const RAIL_W: f32 = 30.0;
 const TREE_BASE_INSET: f32 = 4.0;
 /// Horizontal step per nesting level. The base moves; this does not.
 const TREE_INDENT: f32 = 12.0;
-/// Debounce before a dirty document tab is written.
-pub const AUTOSAVE: Duration = Duration::from_millis(400);
 
 // ---------------------------------------------------------------------------
 // State
@@ -89,10 +87,8 @@ pub struct TitleEdit {
     pub input: Entity<InputState>,
     /// Name when the editor opened, restored by Esc.
     pub original: String,
-    /// Name last written through core, so autosave never renames twice.
-    pub saved: String,
-    /// Bumped on every keystroke so a stale autosave can bow out.
-    pub generation: u64,
+    /// Name last written through core, plus the debounce generation.
+    pub draft: Draft,
 }
 
 /// Overview inputs: identifier, source, description. Rebuilt only when the
@@ -101,12 +97,10 @@ pub struct DetailEditor {
     pub project_id: String,
     pub identifier: Entity<InputState>,
     pub description: Entity<TextareaState>,
-    /// Description as persisted; autosave diffs against it.
-    pub saved_description: String,
+    /// Description as persisted, plus the debounce generation.
+    pub description_draft: Draft,
     /// Whether the description renders the Markdown preview instead.
     pub preview: bool,
-    /// Bumped on every keystroke so a stale autosave can bow out.
-    pub description_generation: u64,
     /// Identifier as persisted; Esc restores it and Save diffs against it.
     pub saved_identifier: String,
     /// Whether the identifier field differs from `saved_identifier`.
@@ -138,11 +132,8 @@ pub struct ProjectDocTab {
     pub editor: Entity<EditorState>,
     pub vim: VimSession,
     pub preview: bool,
-    /// Text as last written to disk.
-    pub saved: String,
-    pub dirty: bool,
-    /// Bumped on every real edit so a stale debounce can bow out.
-    pub generation: u64,
+    /// Text as last written to disk, plus the debounce generation.
+    pub draft: Draft,
 }
 
 // The document variant owns an editor and a vim session; the data-free
@@ -1617,7 +1608,7 @@ fn detail_pane(
                 .child(label),
         );
         if let ProjectTab::Doc(doc) = tab {
-            if doc.dirty {
+            if doc.draft.is_dirty() {
                 item = item.child(div().size(px(3.)).rounded(px(2.)).bg(t.accent));
             }
             if closable {
@@ -2611,7 +2602,7 @@ fn doc_status_bar(tab: &ProjectDocTab, t: &Tokens, cx: &mut Context<AppShell>) -
             line: position.line as usize + 1,
             column: position.character as usize + 1,
             words,
-            dirty: tab.dirty,
+            dirty: tab.draft.is_dirty(),
             hint: if preview {
                 "660 px measure"
             } else if tab.vim.is_enabled() {

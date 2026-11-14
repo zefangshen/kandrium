@@ -31,6 +31,7 @@ use smallvec::smallvec;
 
 use crate::anim::{SNAP_BACK, ease_snap, eased};
 use crate::assets::{Icon, icon};
+use crate::draft::Draft;
 use crate::settings::{self, TreePanel};
 use crate::store::Store;
 use crate::theme::{Text, TextStyled, Tokens};
@@ -51,7 +52,7 @@ use crate::views::tasks::{
     COLUMN_W, CardMetrics, DropTarget, GAP_FALLBACK, SLOT_H, card_body, title_row,
 };
 use crate::views::{
-    notes::{self, DraftKind, NameDraft, NoteTab},
+    notes::{DraftKind, NameDraft, NoteTab},
     placeholder, tasks,
     wiki::{self, TabKey, TabKind, WikiState},
 };
@@ -249,7 +250,7 @@ pub struct AppShell {
     vim_mode: bool,
     /// External-change watcher; present only while a database-backed section
     /// is foregrounded.
-    watcher: Option<crate::watcher::Watcher>,
+    watcher: Option<kandrium_core::db::watcher::Watcher>,
     watcher_generation: u64,
     watcher_running: Option<u64>,
     /// An external change arrived mid-drag and is applied on a later frame.
@@ -2131,9 +2132,8 @@ impl AppShell {
             project_id: project.id.clone(),
             identifier,
             description,
-            saved_description: project.description,
+            description_draft: Draft::new(project.description),
             preview: false,
-            description_generation: 0,
             saved_identifier,
             identifier_dirty: false,
             identifier_error: None,
@@ -2429,10 +2429,24 @@ impl AppShell {
             project_id: id.to_string(),
             input,
             original: name.clone(),
-            saved: name,
-            generation: 0,
+            draft: Draft::new(name),
         });
         cx.notify();
+    }
+
+    /// Run `write` after `duration`. The write must bow out through
+    /// [`Draft::is_current`] when a newer edit has bumped the generation.
+    fn debounce(
+        &mut self,
+        duration: Duration,
+        write: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(duration).await;
+            this.update(cx, |this, cx| write(this, cx)).ok();
+        })
+        .detach();
     }
 
     /// Debounce the title's autosave: every keystroke bumps the generation and
@@ -2441,20 +2455,14 @@ impl AppShell {
         let Some(edit) = self.projects.title_edit.as_mut() else {
             return;
         };
-        edit.generation = edit.generation.wrapping_add(1);
-        let generation = edit.generation;
+        let generation = edit.draft.touch();
         let project_id = edit.project_id.clone();
         cx.notify();
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(600))
-                .await;
-            this.update(cx, |this, cx| {
-                this.autosave_project_title(&project_id, generation, cx)
-            })
-            .ok();
-        })
-        .detach();
+        self.debounce(
+            Duration::from_millis(600),
+            move |this, cx| this.autosave_project_title(&project_id, generation, cx),
+            cx,
+        );
     }
 
     /// Write the title in place without closing the field. Whitespace-only
@@ -2468,17 +2476,17 @@ impl AppShell {
         let Some(edit) = self.projects.title_edit.as_ref() else {
             return;
         };
-        if edit.project_id != project_id || edit.generation != generation {
+        if edit.project_id != project_id || !edit.draft.is_current(generation) {
             return;
         }
         let name = edit.input.read(cx).value().trim().to_string();
-        if name.is_empty() || name == edit.saved {
+        if name.is_empty() || name == *edit.draft.saved() {
             return;
         }
         match self.store.rename_project(project_id, &name) {
             Ok(_) => {
                 if let Some(edit) = self.projects.title_edit.as_mut() {
-                    edit.saved = name;
+                    edit.draft.mark_saved(name);
                 }
                 self.projects.error = None;
                 // The rename may regenerate the identifier, and the board
@@ -2545,7 +2553,7 @@ impl AppShell {
             return;
         }
         let project_id = edit.project_id.clone();
-        if name == edit.saved {
+        if name == *edit.draft.saved() {
             self.projects.title_edit = None;
             cx.notify();
             return;
@@ -2571,7 +2579,7 @@ impl AppShell {
         let Some(edit) = self.projects.title_edit.take() else {
             return;
         };
-        if edit.saved != edit.original
+        if *edit.draft.saved() != edit.original
             && self
                 .store
                 .rename_project(&edit.project_id, &edit.original)
@@ -2638,11 +2646,6 @@ impl AppShell {
             }
             return Ok(());
         }
-        if let Some(taken) = self.identifier_owner(&identifier, &project_id) {
-            return Err(format!(
-                "Identifier \"{identifier}\" is already used by \"{taken}\""
-            ));
-        }
         self.store
             .set_project_identifier(&project_id, &identifier)
             .map_err(|e| e.to_string())?;
@@ -2659,26 +2662,6 @@ impl AppShell {
         self.load_projects();
         cx.notify();
         Ok(())
-    }
-
-    /// Name of a different project that already owns this identifier,
-    /// compared case-insensitively across the tree and the archive.
-    fn identifier_owner(&self, identifier: &str, project_id: &str) -> Option<String> {
-        let taken = |project: &&kandrium_core::Project| {
-            project.id != project_id && project.identifier.eq_ignore_ascii_case(identifier)
-        };
-        crate::views::projects::flat_projects(&self.projects.tree)
-            .into_iter()
-            .map(|(project, _)| project)
-            .find(taken)
-            .map(|project| project.name.clone())
-            .or_else(|| {
-                self.projects
-                    .archived
-                    .iter()
-                    .find(taken)
-                    .map(|project| project.name.clone())
-            })
     }
 
     /// Persist a valid identifier edit; used when the project is about to
@@ -2718,14 +2701,14 @@ impl AppShell {
             return;
         };
         let description = editor.description.read(cx).value().to_string();
-        if description == editor.saved_description {
+        if description == *editor.description_draft.saved() {
             return;
         }
         let id = project.id.clone();
         match self.store.update_project(&id, Some(&description), None) {
             Ok(_) => {
                 if let Some(editor) = self.projects.detail_editor.as_mut() {
-                    editor.saved_description = description;
+                    editor.description_draft.mark_saved(description);
                 }
                 self.projects.error = None;
             }
@@ -2896,9 +2879,7 @@ impl AppShell {
                     editor: editor.clone(),
                     vim: session,
                     preview: false,
-                    saved: text,
-                    dirty: false,
-                    generation: 0,
+                    draft: Draft::new(text),
                 }));
                 self.projects.active = self.projects.tabs.len() - 1;
                 self.projects.error = None;
@@ -2938,31 +2919,28 @@ impl AppShell {
         let ProjectTab::Doc(tab) = &mut self.projects.tabs[index] else {
             return;
         };
-        if value == tab.saved {
-            if tab.dirty {
-                tab.dirty = false;
+        if value == *tab.draft.saved() {
+            if tab.draft.is_dirty() {
+                tab.draft.observe(value);
                 cx.notify();
             }
             return;
         }
-        tab.dirty = true;
-        tab.generation = tab.generation.wrapping_add(1);
-        let generation = tab.generation;
+        let Some(generation) = tab.draft.observe(value) else {
+            return;
+        };
         let rel = tab.rel.clone();
         cx.notify();
         let selected = self.projects.selected.clone();
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(crate::views::projects::AUTOSAVE)
-                .await;
-            this.update(cx, |this, cx| {
+        self.debounce(
+            crate::draft::AUTOSAVE,
+            move |this, cx| {
                 if this.projects.selected == selected {
                     this.autosave_project_doc(&rel, generation, cx);
                 }
-            })
-            .ok();
-        })
-        .detach();
+            },
+            cx,
+        );
     }
 
     fn autosave_project_doc(&mut self, rel: &Path, generation: u64, cx: &mut Context<Self>) {
@@ -2970,7 +2948,7 @@ impl AppShell {
             return;
         };
         if let Some(ProjectTab::Doc(tab)) = self.projects.tabs.get(index)
-            && tab.generation != generation
+            && !tab.draft.is_current(generation)
         {
             return;
         }
@@ -2981,7 +2959,7 @@ impl AppShell {
         let Some(ProjectTab::Doc(tab)) = self.projects.tabs.get(index) else {
             return;
         };
-        if !tab.dirty {
+        if !tab.draft.is_dirty() {
             return;
         }
         let (Some(root), Some(id)) = (self.projects.root.clone(), self.projects.selected.clone())
@@ -2993,8 +2971,7 @@ impl AppShell {
         match self.store.write_project_doc(&root, &id, &rel, &value) {
             Ok(()) => {
                 if let Some(ProjectTab::Doc(tab)) = self.projects.tabs.get_mut(index) {
-                    tab.saved = value;
-                    tab.dirty = false;
+                    tab.draft.mark_saved(value);
                 }
                 self.projects.error = None;
             }
@@ -3071,19 +3048,13 @@ impl AppShell {
         let Some(editor) = self.projects.detail_editor.as_mut() else {
             return;
         };
-        editor.description_generation = editor.description_generation.wrapping_add(1);
-        let generation = editor.description_generation;
+        let generation = editor.description_draft.touch();
         let project_id = editor.project_id.clone();
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(600))
-                .await;
-            this.update(cx, |this, cx| {
-                this.autosave_project_description(&project_id, generation, cx)
-            })
-            .ok();
-        })
-        .detach();
+        self.debounce(
+            Duration::from_millis(600),
+            move |this, cx| this.autosave_project_description(&project_id, generation, cx),
+            cx,
+        );
     }
 
     fn autosave_project_description(
@@ -3095,7 +3066,7 @@ impl AppShell {
         let Some(editor) = self.projects.detail_editor.as_ref() else {
             return;
         };
-        if editor.project_id != project_id || editor.description_generation != generation {
+        if editor.project_id != project_id || !editor.description_draft.is_current(generation) {
             return;
         }
         self.save_project_description(cx);
@@ -3387,7 +3358,9 @@ impl AppShell {
             return;
         }
         if self.watcher.is_none() {
-            self.watcher = Some(crate::watcher::Watcher::spawn(self.store.path.clone()));
+            self.watcher = Some(kandrium_core::db::watcher::Watcher::spawn(
+                self.store.path.clone(),
+            ));
         }
         let generation = self.watcher_generation;
         if self.watcher_running == Some(generation) {
@@ -3403,7 +3376,7 @@ impl AppShell {
                     let changed = this
                         .watcher
                         .as_ref()
-                        .is_some_and(crate::watcher::Watcher::drain);
+                        .is_some_and(kandrium_core::db::watcher::Watcher::drain);
                     if changed {
                         this.apply_external_change(cx);
                     }
@@ -3413,7 +3386,7 @@ impl AppShell {
                     break;
                 };
                 cx.background_executor()
-                    .timer(crate::watcher::POLL_INTERVAL)
+                    .timer(kandrium_core::db::watcher::POLL_INTERVAL)
                     .await;
             }
         })
@@ -4410,9 +4383,7 @@ impl AppShell {
                     editor: editor.clone(),
                     vim: session,
                     preview: false,
-                    saved: text,
-                    dirty: false,
-                    generation: 0,
+                    draft: Draft::new(text),
                 });
                 self.wiki.notes.active = Some(self.wiki.notes.tabs.len() - 1);
                 if let Some(path) = self.wiki.notes.tabs.last().map(|tab| tab.path.clone()) {
@@ -4478,24 +4449,23 @@ impl AppShell {
         };
         let value = editor.read(cx).value().to_string();
         let tab = &mut self.wiki.notes.tabs[index];
-        if value == tab.saved {
-            if tab.dirty {
-                tab.dirty = false;
+        if value == *tab.draft.saved() {
+            if tab.draft.is_dirty() {
+                tab.draft.observe(value);
                 cx.notify();
             }
             return;
         }
-        tab.dirty = true;
-        tab.generation = tab.generation.wrapping_add(1);
-        let generation = tab.generation;
+        let Some(generation) = tab.draft.observe(value) else {
+            return;
+        };
         let path = tab.path.clone();
         cx.notify();
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(notes::AUTOSAVE).await;
-            this.update(cx, |this, cx| this.autosave_note(&path, generation, cx))
-                .ok();
-        })
-        .detach();
+        self.debounce(
+            crate::draft::AUTOSAVE,
+            move |this, cx| this.autosave_note(&path, generation, cx),
+            cx,
+        );
     }
 
     /// A debounce that already lost its race (a newer edit bumped the
@@ -4504,7 +4474,7 @@ impl AppShell {
         let Some(index) = self.wiki.notes.tab_index(path) else {
             return;
         };
-        if self.wiki.notes.tabs[index].generation != generation {
+        if !self.wiki.notes.tabs[index].draft.is_current(generation) {
             return;
         }
         self.save_note(path, cx);
@@ -4515,7 +4485,7 @@ impl AppShell {
         let Some(index) = self.wiki.notes.tab_index(path) else {
             return;
         };
-        if !self.wiki.notes.tabs[index].dirty {
+        if !self.wiki.notes.tabs[index].draft.is_dirty() {
             return;
         }
         let Some(root) = self.wiki.notes.root.clone() else {
@@ -4529,8 +4499,7 @@ impl AppShell {
         match self.store.write_note(path, &root, &value) {
             Ok(()) => {
                 let tab = &mut self.wiki.notes.tabs[index];
-                tab.saved = value;
-                tab.dirty = false;
+                tab.draft.mark_saved(value);
                 self.wiki.notes.error = None;
             }
             Err(error) => self.wiki.notes.error = Some(error.to_string()),
@@ -5429,31 +5398,23 @@ impl AppShell {
         };
         let value = editor.read(cx).value().to_string();
         let tab = &mut self.wiki.documents.tabs[index];
-        if value == tab.saved {
-            if tab.dirty {
-                tab.dirty = false;
+        if value == *tab.draft.saved() {
+            if tab.draft.is_dirty() {
+                tab.draft.observe(value);
                 cx.notify();
             }
             return;
         }
-        // Textarea notifications also fire for caret and selection moves; only
-        // a changed buffer restarts the debounce, or an idle edit would never
-        // settle into a write.
-        if tab.dirty && value == tab.last_value {
+        let Some(generation) = tab.draft.observe(value) else {
             return;
-        }
-        tab.last_value = value;
-        tab.dirty = true;
-        tab.generation = tab.generation.wrapping_add(1);
-        let generation = tab.generation;
+        };
         let path = tab.path.clone();
         cx.notify();
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(documents::AUTOSAVE).await;
-            this.update(cx, |this, cx| this.autosave_document(&path, generation, cx))
-                .ok();
-        })
-        .detach();
+        self.debounce(
+            crate::draft::AUTOSAVE,
+            move |this, cx| this.autosave_document(&path, generation, cx),
+            cx,
+        );
     }
 
     /// A debounce that already lost its race (a newer edit bumped the
@@ -5462,7 +5423,7 @@ impl AppShell {
         let Some(index) = self.wiki.documents.tab_index(path) else {
             return;
         };
-        if self.wiki.documents.tabs[index].generation != generation {
+        if !self.wiki.documents.tabs[index].draft.is_current(generation) {
             return;
         }
         self.save_document_tab(path, cx);
@@ -5476,7 +5437,7 @@ impl AppShell {
         };
         match self.wiki.documents.tabs[index].kind {
             DocKind::Markdown => {
-                if !self.wiki.documents.tabs[index].dirty {
+                if !self.wiki.documents.tabs[index].draft.is_dirty() {
                     return;
                 }
                 let Some(root) = self.wiki.documents.root.clone() else {
@@ -5489,8 +5450,7 @@ impl AppShell {
                 match self.store.write_document(path, &root, &value) {
                     Ok(()) => {
                         let tab = &mut self.wiki.documents.tabs[index];
-                        tab.saved = value;
-                        tab.dirty = false;
+                        tab.draft.mark_saved(value);
                         self.wiki.documents.error = None;
                     }
                     Err(error) => self.wiki.documents.error = Some(error),
@@ -5505,7 +5465,7 @@ impl AppShell {
         let Some(index) = self.wiki.documents.tab_index(path) else {
             return;
         };
-        if !self.wiki.documents.tabs[index].ann_dirty {
+        if !self.wiki.documents.tabs[index].ann.is_dirty() {
             return;
         }
         let Some(root) = self.wiki.documents.root.clone() else {
@@ -5517,8 +5477,10 @@ impl AppShell {
         };
         match self.store.save_annotations(path, &root, &doc) {
             Ok(()) => {
-                self.wiki.documents.tabs[index].ann_dirty = false;
                 self.wiki.documents.error = None;
+                let tab = &mut self.wiki.documents.tabs[index];
+                let saved = tab.annotations.clone();
+                tab.ann.mark_saved(saved);
             }
             Err(error) => self.wiki.documents.error = Some(error),
         }
@@ -5531,28 +5493,21 @@ impl AppShell {
             return;
         };
         let tab = &mut self.wiki.documents.tabs[index];
-        tab.ann_dirty = true;
-        tab.ann_generation = tab.ann_generation.wrapping_add(1);
-        let generation = tab.ann_generation;
+        let generation = tab.ann.touch();
         let path = path.to_path_buf();
         cx.notify();
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(documents::ANNOTATION_AUTOSAVE)
-                .await;
-            this.update(cx, |this, cx| {
-                this.autosave_annotations(&path, generation, cx)
-            })
-            .ok();
-        })
-        .detach();
+        self.debounce(
+            documents::ANNOTATION_AUTOSAVE,
+            move |this, cx| this.autosave_annotations(&path, generation, cx),
+            cx,
+        );
     }
 
     fn autosave_annotations(&mut self, path: &Path, generation: u64, cx: &mut Context<Self>) {
         let Some(index) = self.wiki.documents.tab_index(path) else {
             return;
         };
-        if self.wiki.documents.tabs[index].ann_generation != generation {
+        if !self.wiki.documents.tabs[index].ann.is_current(generation) {
             return;
         }
         self.save_annotations_tab(path, cx);

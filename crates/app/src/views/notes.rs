@@ -14,7 +14,6 @@
 //! looks like an edit.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use gpui_kit::base::text::markdown;
 use gpui_kit::component::ActiveTheme as _;
@@ -28,6 +27,7 @@ use kandrium_core::notes::NoteEntry;
 
 use crate::app::AppShell;
 use crate::assets::{Icon, icon};
+use crate::draft::Draft;
 use crate::theme::{Text, TextStyled, Tokens};
 use crate::vim::VimSession;
 
@@ -35,8 +35,6 @@ use crate::vim::VimSession;
 pub const TREE_W: f32 = 240.0;
 /// Collapsed rail width.
 pub const RAIL_W: f32 = 30.0;
-/// Debounce before a dirty tab is written.
-pub const AUTOSAVE: Duration = Duration::from_millis(400);
 
 /// What the inline name field is creating.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,11 +59,8 @@ pub struct NoteTab {
     pub editor: Entity<EditorState>,
     pub vim: VimSession,
     pub preview: bool,
-    /// Text as last written to disk; the edit observer compares against it.
-    pub saved: String,
-    pub dirty: bool,
-    /// Bumped on every real edit so a stale debounce can bow out.
-    pub generation: u64,
+    /// Text as last written to disk, plus the debounce generation.
+    pub draft: Draft,
 }
 
 /// Notes section state.
@@ -573,7 +568,7 @@ fn status_bar(tab: &NoteTab, t: &Tokens, cx: &mut Context<AppShell>) -> AnyEleme
             line: position.line as usize + 1,
             column: position.character as usize + 1,
             words,
-            dirty: tab.dirty,
+            dirty: tab.draft.is_dirty(),
             hint: if preview {
                 "660 px measure"
             } else if tab.vim.is_enabled() {
