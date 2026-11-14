@@ -142,6 +142,8 @@ pub fn write_page(db: &mut Connection, root: &Path, spec: &WritePageSpec) -> Res
     validate_target(&spec.rel_path)?;
     validate_content(&spec.rel_path, &spec.content)?;
 
+    // The wiki root may not exist yet when an agent starts before the app.
+    fs::create_dir_all(root)?;
     let root = fsutil::canonical_root(root)?;
     let target = fsutil::guard(&root, &root.join(&spec.rel_path))?;
     let existing = read_if_exists(&target)?;
@@ -698,6 +700,21 @@ mod tests {
             agent: Some("test".into()),
             instructions_version: WIKI_INSTRUCTIONS_VERSION,
         }
+    }
+
+    #[test]
+    fn write_creates_a_missing_wiki_root() {
+        let mut f = fixture();
+        let fresh = f.root.join("not-created-yet");
+        assert!(!fresh.exists());
+
+        let written = write_page(
+            &mut f.db,
+            &fresh,
+            &write_spec("concepts/attention.md", page("Attention", false), None),
+        );
+        assert!(written.is_ok(), "{written:?}");
+        assert!(fresh.join("concepts/attention.md").is_file());
     }
 
     #[test]
