@@ -62,9 +62,9 @@ pub use services::column::{
     archive_all_cards, create_column, delete_column, move_column, rename_column,
 };
 pub use wiki::{
-    Backlink, Citation, DedupGroup, DeletePageSpec, FmField, FmValue, Frontmatter, LintCode,
+    Backlink, Citation, DedupCandidate, DeletePageSpec, FmField, FmValue, Frontmatter, LintCode,
     LintFinding, LintSeverity, PageCounts, PageKind, PagePatch, PageSource, PageText, PageWrite,
-    PatchPageSpec, RunRecord, RunStats, SearchHit, SourceCounts, SourceDelta, SourceKind,
+    PatchPageSpec, RunRecord, RunStats, SLUG_MAX, SearchHit, SourceCounts, SourceDelta, SourceKind,
     SourceRange, SourceState, SourceText, TAG_VOCABULARY, WIKI_INSTRUCTIONS,
     WIKI_INSTRUCTIONS_VERSION, WikiLink, WikiPage, WikiRun, WikiSource, WikiStatus, WriteAction,
     WritePageSpec, backlinks, compiled_dir, dedup_candidates, delete_page, ensure_wiki_root,
@@ -73,5 +73,6 @@ pub use wiki::{
     mark_source_failed, page_kind_for_path, parse_citations, parse_frontmatter, parse_links,
     parse_page, patch_page, read_page, read_source, rebuild_fts, rebuild_links, record_run,
     refresh_sources, reindex_page, render_page, resolve_links, resolve_wiki_root, search_wiki,
-    source_counts, validate_page_path, wiki_status, write_index_md, write_page,
+    slugify, source_counts, validate_compiled_slug, validate_page_path, validate_slug, wiki_status,
+    write_index_md, write_page,
 };

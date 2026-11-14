@@ -5,7 +5,7 @@
 //! through `fsutil::write_atomic`, and reindexes the page plus `index.md` in
 //! the same call.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -21,7 +21,7 @@ use super::index;
 use super::instructions::WIKI_INSTRUCTIONS_VERSION;
 use super::pages::{self, validate_page_path};
 use super::sources;
-use super::{PageKind, WikiPage, page_kind_for_path};
+use super::{PageKind, page_kind_for_path};
 
 /// What a write did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,12 +126,13 @@ pub struct WikiRun {
     pub error: Option<String>,
 }
 
-/// A set of pages that share a title or alias.
+/// One existing page that may already cover a source's topic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DedupGroup {
-    pub label: String,
-    pub pages: Vec<WikiPage>,
+pub struct DedupCandidate {
+    pub existing_path: String,
+    pub score: u32,
+    pub reason: String,
 }
 
 /// Write one page. Rejects a stale instruction version, a path outside the
@@ -395,42 +396,109 @@ pub fn latest_run(db: &Connection) -> Result<Option<WikiRun>> {
     }))
 }
 
-/// Pages that share a normalized title or alias, for merge decisions.
-pub fn dedup_candidates(db: &Connection) -> Result<Vec<DedupGroup>> {
+/// Rank existing pages for a merge decision before compiling `source_path`.
+///
+/// A page that already cites the source ranks first, then one whose title or
+/// alias matches the source name, then pages that duplicate another page's
+/// label. `limit == 0` means the default of 20.
+pub fn dedup_candidates(
+    db: &Connection,
+    source_path: &str,
+    limit: usize,
+) -> Result<Vec<DedupCandidate>> {
+    let source =
+        pages::normalize_source_path(source_path).unwrap_or_else(|| source_path.trim().to_string());
+    let source_tokens = source_stem_tokens(&source);
     let pages = index::list_pages(db, None)?;
-    let by_path: HashMap<&str, &WikiPage> = pages
-        .iter()
-        .map(|page| (page.rel_path.as_str(), page))
-        .collect();
 
-    let mut owners: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut labels: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for page in &pages {
         if page.kind == PageKind::Index {
             continue;
         }
-        let mut labels = vec![page.title.clone()];
-        labels.extend(page.aliases.iter().cloned());
-        for label in labels {
-            let key = normalize_label(&label);
-            if key.is_empty() {
-                continue;
+        for label in std::iter::once(&page.title).chain(page.aliases.iter()) {
+            let key = normalize_label(label);
+            if !key.is_empty() {
+                labels.entry(key).or_default().insert(page.rel_path.clone());
             }
-            owners.entry(key).or_default().insert(page.rel_path.clone());
         }
     }
 
-    let mut groups = Vec::new();
-    for (label, paths) in owners {
-        if paths.len() < 2 {
-            continue;
+    let mut candidates = Vec::new();
+    for page in pages.iter().filter(|page| page.kind != PageKind::Index) {
+        let mut score = 0u32;
+        let mut reasons: Vec<String> = Vec::new();
+
+        let cites = page.sources.iter().any(|cited| {
+            pages::normalize_source_path(&cited.source_path).as_deref() == Some(source.as_str())
+                || cited.source_path == source
+        });
+        if cites {
+            score += 100;
+            reasons.push("cites this source".into());
         }
-        let pages: Vec<WikiPage> = paths
-            .iter()
-            .filter_map(|path| by_path.get(path.as_str()).map(|page| (*page).clone()))
-            .collect();
-        groups.push(DedupGroup { label, pages });
+
+        let name_match = !source_tokens.is_empty()
+            && std::iter::once(&page.title)
+                .chain(page.aliases.iter())
+                .any(|label| {
+                    let tokens = name_tokens(label);
+                    !tokens.is_empty()
+                        && (tokens.is_subset(&source_tokens) || source_tokens.is_subset(&tokens))
+                });
+        if name_match {
+            score += 50;
+            reasons.push("title or alias matches the source name".into());
+        }
+
+        let duplicate = std::iter::once(&page.title)
+            .chain(page.aliases.iter())
+            .filter_map(|label| labels.get(&normalize_label(label)))
+            .find_map(|paths| paths.iter().find(|path| *path != &page.rel_path));
+        if let Some(other) = duplicate {
+            score += 30;
+            reasons.push(format!("shares a title or alias with {other}"));
+        }
+
+        if score > 0 {
+            candidates.push(DedupCandidate {
+                existing_path: page.rel_path.clone(),
+                score,
+                reason: reasons.join("; "),
+            });
+        }
     }
-    Ok(groups)
+
+    candidates.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.existing_path.cmp(&b.existing_path))
+    });
+    candidates.truncate(if limit == 0 { 20 } else { limit });
+    Ok(candidates)
+}
+
+/// Words that carry no meaning in a file name and would match too broadly.
+const NAME_STOPWORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "by", "for", "from", "in", "is", "of", "on", "or", "the",
+    "to", "with",
+];
+
+/// Lowercase word set of a label, ignoring punctuation and stopwords.
+fn name_tokens(label: &str) -> BTreeSet<String> {
+    label
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_lowercase)
+        .filter(|token| !NAME_STOPWORDS.contains(&token.as_str()))
+        .collect()
+}
+
+/// Word set of a source's file stem, without its folders or extension.
+fn source_stem_tokens(source: &str) -> BTreeSet<String> {
+    let name = source.rsplit('/').next().unwrap_or(source);
+    let stem = name.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(name);
+    name_tokens(stem)
 }
 
 fn ensure_version(version: u32) -> Result<()> {
@@ -449,6 +517,7 @@ fn validate_target(rel_path: &str) -> Result<()> {
             "index.md is generated and cannot be written",
         ));
     }
+    pages::validate_compiled_slug(rel_path)?;
     Ok(())
 }
 
@@ -882,36 +951,72 @@ mod tests {
     }
 
     #[test]
-    fn dedup_groups_pages_sharing_a_label() {
+    fn dedup_ranks_by_citation_name_and_duplicate_label() {
         let mut f = fixture();
+        std::fs::write(f.documents.join("attention.md"), "one\n").unwrap();
+        sources::refresh_sources(&f.db, &f.documents).unwrap();
+
+        let citing = "---\ntype: concept\ntitle: Attention\nsummary: Cites it.\n\
+                      aliases: [attention]\nsources: [attention.md]\n---\n\
+                      Body long enough to avoid the empty check.\n";
         write_page(
             &mut f.db,
             &f.root,
-            &write_spec(
-                "concepts/one.md",
-                "---\ntype: concept\ntitle: Attention\nsummary: One.\n\
-                 aliases: [attention]\n---\nBody long enough to avoid the empty check.\n"
-                    .into(),
-                None,
-            ),
+            &write_spec("concepts/attention.md", citing.into(), None),
         )
         .unwrap();
+        let named = "---\ntype: entity\ntitle: The Attention Mechanism\nsummary: Named.\n\
+                     aliases: [attention mechanism]\n---\n\
+                     Body long enough to avoid the empty check.\n";
         write_page(
             &mut f.db,
             &f.root,
-            &write_spec(
-                "concepts/two.md",
-                "---\ntype: concept\ntitle: Attention\nsummary: Two.\n---\n\
-                 Another body long enough to avoid the empty check.\n"
-                    .into(),
-                None,
-            ),
+            &write_spec("entities/attention-mechanism.md", named.into(), None),
+        )
+        .unwrap();
+        let unrelated = "---\ntype: concept\ntitle: Retrieval\nsummary: Elsewhere.\n---\n\
+                         Body long enough to avoid the empty check.\n";
+        write_page(
+            &mut f.db,
+            &f.root,
+            &write_spec("concepts/retrieval.md", unrelated.into(), None),
         )
         .unwrap();
 
-        let groups = dedup_candidates(&f.db).unwrap();
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].label, "attention");
-        assert_eq!(groups[0].pages.len(), 2);
+        let ranked = dedup_candidates(&f.db, "attention.md", 10).unwrap();
+        let paths: Vec<&str> = ranked
+            .iter()
+            .map(|candidate| candidate.existing_path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["concepts/attention.md", "entities/attention-mechanism.md"]
+        );
+        assert_eq!(ranked[0].score, 150);
+        assert!(ranked[0].reason.contains("cites this source"));
+        assert!(ranked[0].reason.contains("matches the source name"));
+        assert_eq!(ranked[1].score, 50);
+        assert!(ranked[1].reason.contains("matches the source name"));
+
+        let duplicates = dedup_candidates(&f.db, "unrelated.pdf", 10).unwrap();
+        assert!(duplicates.is_empty());
+    }
+
+    #[test]
+    fn writes_reject_non_slug_compiled_paths() {
+        let mut f = fixture();
+        let result = write_page(
+            &mut f.db,
+            &f.root,
+            &write_spec("concepts/Self_Attention.md", page("Attention", false), None),
+        );
+        assert!(result.is_err());
+
+        let hand_written = write_page(
+            &mut f.db,
+            &f.root,
+            &write_spec("Hand Written.md", page("Attention", false), None),
+        );
+        assert!(hand_written.is_ok());
     }
 }

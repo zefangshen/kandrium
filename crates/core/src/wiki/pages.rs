@@ -14,7 +14,7 @@ use crate::error::{KandriumError, Result};
 use crate::fsutil;
 
 use super::sources::hash_bytes;
-use super::{PageKind, PageSource};
+use super::{PageKind, PageSource, is_compiled_path};
 
 /// File types indexed as wiki pages.
 pub const PAGE_EXTENSIONS: &[&str] = &["md", "markdown"];
@@ -292,6 +292,61 @@ pub fn validate_page_path(rel_path: &str) -> Result<()> {
         return Err(KandriumError::new("pages must be Markdown files"));
     }
     Ok(())
+}
+
+/// Longest slug accepted for a compiled page path.
+pub const SLUG_MAX: usize = 80;
+
+/// Turn a title into a page slug: lowercase ASCII, runs of anything else
+/// collapse to one hyphen, no leading or trailing hyphen. Non-ASCII input can
+/// yield an empty slug; callers must fall back to a hand-picked name.
+pub fn slugify(title: &str) -> String {
+    let mut slug = String::with_capacity(title.len());
+    for ch in title.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_matches('-');
+    let slug = slug.get(..SLUG_MAX.min(slug.len())).unwrap_or(slug);
+    slug.trim_end_matches('-').to_string()
+}
+
+/// Check a slug: lowercase `a-z 0-9 -`, [`SLUG_MAX`] characters at most, no
+/// leading or trailing hyphen.
+pub fn validate_slug(slug: &str) -> Result<()> {
+    if slug.is_empty() || slug.len() > SLUG_MAX {
+        return Err(KandriumError::new("slug must be 1-80 characters"));
+    }
+    if slug.starts_with('-') || slug.ends_with('-') {
+        return Err(KandriumError::new(
+            "slug must not start or end with a hyphen",
+        ));
+    }
+    if !slug
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+    {
+        return Err(KandriumError::new("slug must be lowercase a-z, 0-9, or -"));
+    }
+    Ok(())
+}
+
+/// Validate the file stem of a compiled page (`sources/`, `entities/`,
+/// `concepts/`). Hand-written pages are exempt.
+pub fn validate_compiled_slug(rel_path: &str) -> Result<()> {
+    if !is_compiled_path(rel_path) {
+        return Ok(());
+    }
+    let stem = rel_path
+        .rsplit('/')
+        .next()
+        .and_then(|name| Path::new(name).file_stem())
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("");
+    validate_slug(stem)
 }
 
 /// Parse a page without failing on malformed frontmatter: the raw text
@@ -691,6 +746,31 @@ mod tests {
         assert!(validate_page_path("notes.txt").is_err());
         assert!(validate_page_path("a//b.md").is_err());
         assert!(validate_page_path(".hidden/b.md").is_err());
+    }
+
+    #[test]
+    fn slugs_are_lowercase_kebab_and_validated() {
+        assert_eq!(slugify("Self-Attention"), "self-attention");
+        assert_eq!(
+            slugify("  Attention Is All You Need!  "),
+            "attention-is-all-you-need"
+        );
+        assert_eq!(slugify("C++ / Rust"), "c-rust");
+        assert_eq!(slugify("---"), "");
+        assert_eq!(slugify("注意力"), "");
+
+        assert!(validate_slug("self-attention").is_ok());
+        assert!(validate_slug("gpt-4").is_ok());
+        assert!(validate_slug("").is_err());
+        assert!(validate_slug("-leading").is_err());
+        assert!(validate_slug("trailing-").is_err());
+        assert!(validate_slug("Upper").is_err());
+        assert!(validate_slug("under_score").is_err());
+        assert!(validate_slug(&"a".repeat(SLUG_MAX + 1)).is_err());
+
+        assert!(validate_compiled_slug("concepts/self-attention.md").is_ok());
+        assert!(validate_compiled_slug("concepts/Self_Attention.md").is_err());
+        assert!(validate_compiled_slug("Hand Written.md").is_ok());
     }
 
     #[test]

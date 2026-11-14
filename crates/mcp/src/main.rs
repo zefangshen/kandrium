@@ -341,6 +341,16 @@ struct RecordRunInput {
     started_at: Option<i64>,
 }
 
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ListWikiDedupCandidatesInput {
+    /// Document-relative source path, e.g. papers/attention.pdf
+    source: String,
+    /// Maximum candidates (default 20, capped at 50)
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
@@ -942,11 +952,16 @@ impl KandriumServer {
         })
     }
 
-    #[tool(
-        description = "Pages that share a title or alias, grouped for merge decisions before writing"
-    )]
-    fn list_wiki_dedup_candidates(&self) -> Result<CallToolResult, ErrorData> {
-        self.run_wiki(|db, _, _| Ok(serde_json::json!({ "groups": core::dedup_candidates(db)? })))
+    #[tool(description = "Existing pages ranked as merge candidates for a source before writing")]
+    fn list_wiki_dedup_candidates(
+        &self,
+        Parameters(input): Parameters<ListWikiDedupCandidatesInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let limit = input.limit.unwrap_or(20).min(50);
+        self.run_wiki(|db, _, _| {
+            let candidates = core::dedup_candidates(db, &input.source, limit)?;
+            Ok(serde_json::json!({ "candidates": candidates }))
+        })
     }
 }
 
@@ -1229,9 +1244,31 @@ mod tests {
         assert_eq!(payload["lastRun"]["agent"], "codex");
         assert_eq!(payload["pageCounts"]["concept"], 1);
 
-        let dedup = server.list_wiki_dedup_candidates().unwrap();
+        let dedup = server
+            .list_wiki_dedup_candidates(Parameters(ListWikiDedupCandidatesInput {
+                source: "reading.md".into(),
+                limit: None,
+            }))
+            .unwrap();
         let payload: serde_json::Value = serde_json::from_str(&text(&dedup)).unwrap();
-        assert_eq!(payload["groups"].as_array().unwrap().len(), 0);
+        assert_eq!(payload["candidates"].as_array().unwrap().len(), 0);
+
+        let ranked = server
+            .list_wiki_dedup_candidates(Parameters(ListWikiDedupCandidatesInput {
+                source: "papers/attention.pdf".into(),
+                limit: None,
+            }))
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&text(&ranked)).unwrap();
+        let candidates = payload["candidates"].as_array().unwrap();
+        assert_eq!(candidates[0]["existingPath"], "concepts/attention.md");
+        assert_eq!(candidates[0]["score"], 50);
+        assert!(
+            candidates[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("matches the source name")
+        );
 
         let deleted = server
             .delete_wiki_page(Parameters(DeleteWikiPageInput {

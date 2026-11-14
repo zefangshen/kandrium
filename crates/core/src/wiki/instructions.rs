@@ -63,6 +63,10 @@ mod tests {
             "list_wiki_dedup_candidates",
             "lint_wiki",
             "instructionsVersion",
+            "kebab-case",
+            "index.md",
+            "Merge",
+            "Never link a page to itself",
         ] {
             assert!(
                 WIKI_INSTRUCTIONS.contains(needle),

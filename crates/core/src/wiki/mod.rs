@@ -36,18 +36,18 @@ pub use links::{
 };
 pub use lint::{LintCode, LintFinding, LintSeverity, lint as lint_wiki};
 pub use pages::{
-    Citation, FmField, FmValue, Frontmatter, PAGE_EXTENSIONS, PageText, page_kind_for_path,
-    page_sources, parse_citations, parse_frontmatter, parse_page, read_page, render_page,
-    validate_page_path,
+    Citation, FmField, FmValue, Frontmatter, PAGE_EXTENSIONS, PageText, SLUG_MAX,
+    page_kind_for_path, page_sources, parse_citations, parse_frontmatter, parse_page, read_page,
+    render_page, slugify, validate_compiled_slug, validate_page_path, validate_slug,
 };
 pub use sources::{
     SourceDelta, SourceRange, SourceText, counts as source_counts, hash_bytes, hash_file,
     kind_for_path, list_sources, mark_failed as mark_source_failed, read_source, refresh_sources,
 };
 pub use write::{
-    DedupGroup, DeletePageSpec, PagePatch, PageWrite, PatchPageSpec, RunRecord, RunStats, WikiRun,
-    WriteAction, WritePageSpec, dedup_candidates, delete_page, latest_run, patch_page, record_run,
-    write_page,
+    DedupCandidate, DeletePageSpec, PagePatch, PageWrite, PatchPageSpec, RunRecord, RunStats,
+    WikiRun, WriteAction, WritePageSpec, dedup_candidates, delete_page, latest_run, patch_page,
+    record_run, write_page,
 };
 
 /// Environment variable that overrides the wiki page root.

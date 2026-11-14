@@ -252,6 +252,10 @@ fn toolbar_opens_status_lint_and_setup_panels(cx: &mut TestAppContext) {
     click(cx, "wiki-setup");
     cx.update(|window, _cx| {
         assert!(window.find("wiki-panel-setup").visible());
+        assert!(
+            window.find("wiki-setup-instructions").visible(),
+            "the setup panel renders the embedded instructions"
+        );
     });
 
     // Opening a tab leaves the panel and shows the editor again.

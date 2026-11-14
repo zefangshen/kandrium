@@ -728,7 +728,14 @@ fn panel_body(state: &WikiState, panel: WikiPanel, t: &Tokens) -> AnyElement {
         WikiPanel::Lint => ("Lint findings", "wiki-panel-lint"),
         WikiPanel::Setup => ("Compile setup", "wiki-panel-setup"),
     };
-    let mut body = div().flex().flex_col().gap(px(6.));
+    let mut body = div()
+        .id("wiki-panel-body")
+        .flex()
+        .flex_col()
+        .gap(px(6.))
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll();
     if let Some(error) = &state.panel_error {
         body = body.child(
             div()
@@ -852,6 +859,27 @@ fn panel_body(state: &WikiState, panel: WikiPanel, t: &Tokens) -> AnyElement {
                                 .text(Text::Micro)
                                 .text_color(t.text_muted)
                                 .child(*tag)
+                        })),
+                )
+                // The same bytes `get_wiki_instructions` serves, compiled into
+                // this build, so the panel cannot drift from the server.
+                .child(section_label("Instructions", t))
+                .child(
+                    div()
+                        .id("wiki-setup-instructions")
+                        .test_support()
+                        .flex()
+                        .flex_col()
+                        .gap(px(1.))
+                        .children(kandrium_core::WIKI_INSTRUCTIONS.lines().map(|line| {
+                            div()
+                                .text(Text::Micro)
+                                .text_color(t.text_muted)
+                                .child(if line.is_empty() {
+                                    " ".to_string()
+                                } else {
+                                    line.to_string()
+                                })
                         })),
                 );
         }
