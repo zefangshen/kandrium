@@ -1,5 +1,9 @@
 # Kandrium Plan
 
+> **Historical snapshot (2026-11-05).** This file records the roadmap as it stood
+> on that date; it is not a description of the current tree. Current plans live
+> in `.documents/specs/`, and the architecture rules in [AGENTS.md](AGENTS.md).
+
 Roadmap as of **2026-11-05**. Version `0.1.0`, schema `v7`
 (`migrations/0007_project_source.sql`). Architecture constraints live in
 [AGENTS.md](AGENTS.md); this file is forward-looking work, not a restatement of

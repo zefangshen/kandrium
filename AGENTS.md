@@ -35,7 +35,7 @@ Workspace, edition 2024. All comments, identifiers, and docs are in English.
   `archive_all_cards` remains. Preserve the names and schemas of the exposed
   tools — MCP clients may depend on them.
 - The SQL schema lives as numbered files at the workspace root
-  (`migrations/0001_initial_schema.sql` … `migrations/0010_clock_travels.sql`)
+  (`migrations/0001_initial_schema.sql` … `migrations/0011_project_paths.sql`)
   and is embedded into `crates/core/src/db/migrations.rs` at compile time.
   `db::run_schema` applies them through `rusqlite_migration` via
   `PRAGMA user_version`. v1 (`0001_initial_schema.sql`) is identical in shape
@@ -50,7 +50,8 @@ Workspace, edition 2024. All comments, identifiers, and docs are in English.
   adds the reversible `projects.archived` / `archived_at` flag; v7 adds the
   free-form `projects.source` reference (local path or URL) shown on the
   Overview; v8–v10 add the Clocks data (`clocks`, then `clock_people`, then
-  `clock_travels`). The `db` module is split into `db/connection.rs` (open/path/legacy
+  `clock_travels`); v11 adds `project_paths`, the folder references attached to
+  a project. The `db` module is split into `db/connection.rs` (open/path/legacy
   migration/bootstrap), `db/migrations.rs` (schema + runner), and
   `db/backup.rs` (snapshots + integrity). `db::bootstrap(&mut Connection,
   &Path)` is the single boot path for both front-ends: it runs

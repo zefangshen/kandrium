@@ -55,32 +55,12 @@ Kandrium.app
 Kandrium_0.1.0_aarch64.dmg
 ```
 
-## The green path (Probes A–D)
-
-The migration probes remain runnable. They are diagnostic only.
-
-```sh
-cargo run --bin kandrium-app -- board
-cargo run --bin kandrium-app -- input
-cargo run --bin kandrium-app -- pdf
-cargo run --bin kandrium-app -- drag
-```
-
-Each probe prints its evidence to stdout before and while the window runs.
-
-- **Probe C** needs a PDF: `$SPIKE_PDF`, else the first `*.pdf` under
-  `$KANDRIUM_DOCS`, else under `<database parent>/documents`.
-- **Probe A** copies the live database (plus `-wal` / `-shm`) to a temp
-  directory first, because `get_board` can reconcile `area_card_order`.
-
 ## Tests
 
 ```sh
 cargo test -p kandrium-app
 ```
 
-- `harness_test::window_draws_and_delivers_input` — `TestAppContext` can draw
-  a frame, observe layout, dispatch a click and a keystroke, and keep focus.
 - `tests/shell.rs` — boots the real `AppShell` over a freshly seeded temp
   database under `TestAppContext`: every section renders, board/clocks cards
   draw, and settings round-trip.

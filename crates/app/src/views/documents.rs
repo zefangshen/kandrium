@@ -3,7 +3,7 @@
 //!
 //! Every disk operation goes through `kandrium_core::documents`, so the root
 //! (`KANDRIUM_DOCS`), the path guards, the `-2` import names and the atomic
-//! annotation sidecars are the same ones the egui app uses. This module owns
+//! annotation sidecars are the same ones the MCP server uses. This module owns
 //! only the tree, the tab list and the small session file that stores which
 //! tabs were open, keyed by root-relative paths. PDF rendering lives next door
 //! in [`crate::views::documents_pdf`].

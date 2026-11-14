@@ -2,7 +2,7 @@
 //!
 //! Every disk operation goes through `kandrium_core::notes`, so the notes root
 //! (`KANDRIUM_NOTES`), the path guard and the atomic writes are the same ones
-//! the egui app uses. The tree is a straight render of `notes::scan_tree`
+//! the MCP server uses. The tree is a straight render of `notes::scan_tree`
 //! (directories first, then files, each tier by name) and only the expanded
 //! set is kept here.
 //!

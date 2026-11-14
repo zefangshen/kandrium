@@ -1,12 +1,12 @@
-//! PDF rendering backend for the Documents section, shared by both front-ends.
+//! PDF rendering backend for the Documents section of the desktop app.
 //!
 //! One worker thread per open document owns the parsed
 //! [`hayro::hayro_interpret::hayro_syntax::Pdf`] and its
 //! [`hayro::RenderCache`] (both carry non-`Send` interior state, so they must
 //! stay on one thread). The UI sends requests over a channel, drains [`Event`]s
 //! each frame, and passes a `wake` callback that the worker calls after every
-//! event — the only coupling to the UI toolkit (egui repaints; gpui repaints
-//! while work is outstanding).
+//! event — the only coupling to the UI toolkit, so the app repaints while work
+//! is outstanding).
 //!
 //! Page geometry uses *page view space*: points, origin at the top-left of
 //! the displayed page (rotation applied), y down — the space hayro renders

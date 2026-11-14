@@ -909,7 +909,7 @@ pub fn create_doc_file(root: &Path, id: &str, parent_rel: &Path, name: &str) -> 
     if target.exists() {
         return Err(KandriumError::new(format!("\"{name}\" already exists")));
     }
-    fs::write(&target, "")?;
+    fsutil::write_atomic(&target, "")?;
     Ok(target)
 }
 

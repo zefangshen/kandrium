@@ -65,7 +65,7 @@ pub fn create_note(root: &Path, in_dir: &Path) -> Result<PathBuf> {
         };
         let candidate = dir.join(&name);
         if !candidate.exists() {
-            fs::write(&candidate, "")?;
+            fsutil::write_atomic(&candidate, "")?;
             return Ok(candidate);
         }
     }

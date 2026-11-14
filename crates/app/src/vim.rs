@@ -28,9 +28,10 @@
 //! close; closing already saves, so `:q!` is reported as unknown).
 //! Deliberately absent, unchanged from the egui editor: `/` search, marks,
 //! named registers, `%`, `>>`/`<<`, `s`, and `.` repeat of Visual-mode
-//! operations. Also absent here: the on/off preference (the gpui shell has no
-//! settings store yet, so vim is always on for the description) and `.`
-//! replay of IME-composed Insert text (only `key_char` presses are recorded).
+//! operations. Also absent here: the on/off preference itself — the shell
+//! owns the global `vim_mode` setting and passes it in through `set_enabled`
+//! — and `.` replay of IME-composed Insert text (only `key_char` presses are
+//! recorded).
 
 use std::ops::Range;
 

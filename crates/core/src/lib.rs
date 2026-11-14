@@ -1,6 +1,6 @@
 //! Kandrium data layer — SQLite schema, services, seed, and legacy-DB import.
 //!
-//! Shared by the `kandrium-app` (egui) and `kandrium-mcp` (stdio MCP server)
+//! Shared by the `kandrium-app` (gpui) and `kandrium-mcp` (stdio MCP server)
 //! binaries. All functions take `&rusqlite::Connection` and are synchronous;
 //! the database runs in WAL mode so multiple processes can share one file.
 
@@ -16,7 +16,7 @@ pub mod models;
 pub mod notes;
 pub mod projects;
 pub mod seed;
-pub mod services;
+mod services;
 
 pub use clocks::{
     Clock, ClockText, Person, ProbeAmbiguity, ProbeError, ProbeReading, Travel, add_clock,

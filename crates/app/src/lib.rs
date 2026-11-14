@@ -3,7 +3,7 @@
 //! Contract of the migration: this crate only composes views. Every query,
 //! every derivation and every mutation lives in `kandrium-core`. Reads use a
 //! read-only handle; writes go through a handle bootstrapped exactly like the
-//! egui app and the MCP server.
+//! MCP server.
 
 pub mod anim;
 pub mod app;

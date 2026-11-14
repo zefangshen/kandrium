@@ -185,9 +185,11 @@ impl KandriumServer {
         &self,
         Parameters(BoardIdInput { board_id }): Parameters<BoardIdInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(|db| core::get_board(db, &board_id))
+        self.run(|db| core::get_board_readonly(db, &board_id))
     }
 
+    // Deliberately the writing path: the virtual All board has no read-only
+    // twin and allocates its order rows under an `IMMEDIATE` transaction.
     #[tool(
         description = "Load the virtual All board: all non-archived cards aggregated into To Do / In Progress / Done buckets across every board; each card includes its boardId/boardTitle"
     )]

@@ -155,7 +155,7 @@ pub fn create_markdown(parent: &Path, root: &Path, name: &str) -> Result<PathBuf
     if target.exists() {
         return Err(KandriumError::new(format!("\"{name}\" already exists")));
     }
-    fs::write(&target, "")?;
+    fsutil::write_atomic(&target, "")?;
     Ok(target)
 }
 

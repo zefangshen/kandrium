@@ -6424,7 +6424,7 @@ fn apply_document_event(tab: &mut DocTab, event: PdfEvent) {
     }
 }
 
-/// Unix seconds, matching the sidecar timestamps the egui app writes.
+/// Unix seconds, matching the sidecar timestamp format.
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
