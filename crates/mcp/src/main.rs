@@ -236,6 +236,111 @@ struct PageSummary {
     updated_at: i64,
 }
 
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct WriteWikiPageInput {
+    /// Root-relative Markdown path, e.g. concepts/self-attention.md
+    path: String,
+    /// Full page content, including frontmatter
+    content: String,
+    /// Hash returned by read_wiki_page; rejects the write when the file changed
+    #[serde(default)]
+    expected_hash: Option<String>,
+    /// Overwrite a reviewed page
+    #[serde(default)]
+    force: Option<bool>,
+    /// Client name recorded by the caller
+    #[serde(default)]
+    agent: Option<String>,
+    /// Value from get_wiki_instructions
+    instructions_version: u32,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PatchWikiPageInput {
+    /// Root-relative Markdown path
+    path: String,
+    /// Exact text to replace
+    old_text: String,
+    /// Replacement text
+    new_text: String,
+    #[serde(default)]
+    expected_hash: Option<String>,
+    #[serde(default)]
+    force: Option<bool>,
+    #[serde(default)]
+    agent: Option<String>,
+    /// Value from get_wiki_instructions
+    instructions_version: u32,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct DeleteWikiPageInput {
+    /// Root-relative Markdown path
+    path: String,
+    #[serde(default)]
+    expected_hash: Option<String>,
+    /// Delete a reviewed page
+    #[serde(default)]
+    force: Option<bool>,
+    /// Value from get_wiki_instructions
+    instructions_version: u32,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+struct RunStatsInput {
+    #[serde(default)]
+    pages_created: Option<u32>,
+    #[serde(default)]
+    pages_updated: Option<u32>,
+    #[serde(default)]
+    pages_skipped: Option<u32>,
+    #[serde(default)]
+    sources_compiled: Option<u32>,
+    #[serde(default)]
+    error_count: Option<u32>,
+}
+
+impl RunStatsInput {
+    fn into_core(self) -> core::RunStats {
+        core::RunStats {
+            pages_created: self.pages_created.unwrap_or(0),
+            pages_updated: self.pages_updated.unwrap_or(0),
+            pages_skipped: self.pages_skipped.unwrap_or(0),
+            sources_compiled: self.sources_compiled.unwrap_or(0),
+            error_count: self.error_count.unwrap_or(0),
+        }
+    }
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+struct RecordRunInput {
+    #[serde(default)]
+    agent: Option<String>,
+    /// Default: compile
+    #[serde(default)]
+    operation: Option<String>,
+    /// Default: the current instructions version
+    #[serde(default)]
+    instructions_version: Option<u32>,
+    #[serde(default)]
+    pages: Option<Vec<String>>,
+    #[serde(default)]
+    sources: Option<Vec<String>>,
+    #[serde(default)]
+    stats: Option<RunStatsInput>,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    started_at: Option<i64>,
+}
+
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
@@ -335,7 +440,31 @@ impl KandriumServer {
         }
     }
 
-    // -- Boards -------------------------------------------------------------
+    /// Wiki write plumbing. `KANDRIUM_MCP_WIKI=read` keeps reads available
+    /// and refuses every write.
+    fn run_wiki_write<T: serde::Serialize>(
+        &self,
+        f: impl FnOnce(&mut rusqlite::Connection, &Path, &Path) -> core::Result<T>,
+    ) -> Result<CallToolResult, ErrorData> {
+        match self.wiki_mode {
+            WikiMode::Write => {}
+            WikiMode::Off => {
+                return Ok(error_result(
+                    "wiki tools are disabled (KANDRIUM_MCP_WIKI=off)".to_string(),
+                ));
+            }
+            WikiMode::Read => {
+                return Ok(error_result(
+                    "wiki writes are disabled (KANDRIUM_MCP_WIKI=read)".to_string(),
+                ));
+            }
+        }
+        let mut db = self.db.lock().unwrap_or_else(|e| e.into_inner());
+        match f(&mut db, &self.wiki_root, &self.documents_root) {
+            Ok(value) => Ok(json_result(&value)),
+            Err(error) => Ok(error_result(error.to_string())),
+        }
+    }
 
     #[tool(description = "List all Kandrium boards (id + title, ordered by position)")]
     fn list_boards(&self) -> Result<CallToolResult, ErrorData> {
@@ -672,10 +801,11 @@ impl KandriumServer {
     fn get_wiki_status(&self) -> Result<CallToolResult, ErrorData> {
         self.run_wiki(|db, wiki, documents| {
             let status = core::wiki_status(db)?;
+            let last_run = core::latest_run(db)?;
             Ok(serde_json::json!({
                 "sourceCounts": status.sources,
                 "pageCounts": status.pages,
-                "lastRun": serde_json::Value::Null,
+                "lastRun": last_run,
                 "indexRevision": serde_json::Value::Null,
                 "wikiRoot": wiki.display().to_string(),
                 "documentsRoot": documents.display().to_string(),
@@ -715,6 +845,108 @@ impl KandriumServer {
             let findings = core::lint_wiki(db, wiki, documents, path.as_deref())?;
             Ok(serde_json::json!({ "findings": findings, "fixed": [] }))
         })
+    }
+
+    // -- Wiki (write) -------------------------------------------------------
+
+    #[tool(
+        description = "Create or replace a wiki page. Validates frontmatter, protects reviewed pages, and reindexes atomically. Read get_wiki_instructions first."
+    )]
+    fn write_wiki_page(
+        &self,
+        Parameters(input): Parameters<WriteWikiPageInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run_wiki_write(|db, wiki, _| {
+            core::write_page(
+                db,
+                wiki,
+                &core::WritePageSpec {
+                    rel_path: input.path,
+                    content: input.content,
+                    expected_hash: input.expected_hash,
+                    force: input.force.unwrap_or(false),
+                    agent: input.agent,
+                    instructions_version: input.instructions_version,
+                },
+            )
+        })
+    }
+
+    #[tool(
+        description = "Replace exact text in an existing wiki page, then revalidate and reindex it"
+    )]
+    fn patch_wiki_page(
+        &self,
+        Parameters(input): Parameters<PatchWikiPageInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run_wiki_write(|db, wiki, _| {
+            core::patch_page(
+                db,
+                wiki,
+                &core::PatchPageSpec {
+                    rel_path: input.path,
+                    old_text: input.old_text,
+                    new_text: input.new_text,
+                    expected_hash: input.expected_hash,
+                    force: input.force.unwrap_or(false),
+                    agent: input.agent,
+                    instructions_version: input.instructions_version,
+                },
+            )
+        })
+    }
+
+    #[tool(description = "Delete a wiki page and its index rows. Reviewed pages need force.")]
+    fn delete_wiki_page(
+        &self,
+        Parameters(input): Parameters<DeleteWikiPageInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run_wiki_write(|db, wiki, _| {
+            let path = input.path;
+            core::delete_page(
+                db,
+                wiki,
+                &core::DeletePageSpec {
+                    rel_path: path.clone(),
+                    expected_hash: input.expected_hash,
+                    force: input.force.unwrap_or(false),
+                    instructions_version: input.instructions_version,
+                },
+            )?;
+            Ok(serde_json::json!({ "path": path, "deleted": true }))
+        })
+    }
+
+    #[tool(
+        description = "Record a compile run and mark its sources compiled. Call once after a batch of page writes."
+    )]
+    fn record_wiki_run(
+        &self,
+        Parameters(input): Parameters<RecordRunInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run_wiki_write(|db, _, _| {
+            core::record_run(
+                db,
+                core::RunRecord {
+                    agent: input.agent,
+                    operation: input.operation,
+                    instructions_version: input.instructions_version,
+                    pages: input.pages.unwrap_or_default(),
+                    sources: input.sources.unwrap_or_default(),
+                    stats: input.stats.unwrap_or_default().into_core(),
+                    note: input.note,
+                    error: input.error,
+                    started_at: input.started_at,
+                },
+            )
+        })
+    }
+
+    #[tool(
+        description = "Pages that share a title or alias, grouped for merge decisions before writing"
+    )]
+    fn list_wiki_dedup_candidates(&self) -> Result<CallToolResult, ErrorData> {
+        self.run_wiki(|db, _, _| Ok(serde_json::json!({ "groups": core::dedup_candidates(db)? })))
     }
 }
 
@@ -802,6 +1034,7 @@ mod tests {
             "archive_card",
             "create_card",
             "delete_card",
+            "delete_wiki_page",
             "get_all_board",
             "get_board",
             "get_wiki_instructions",
@@ -809,16 +1042,20 @@ mod tests {
             "lint_wiki",
             "list_archived_cards",
             "list_boards",
+            "list_wiki_dedup_candidates",
             "list_wiki_pages",
             "list_wiki_sources",
             "move_all_card",
             "move_card",
             "move_card_to_board",
+            "patch_wiki_page",
             "read_wiki_page",
             "read_wiki_source",
+            "record_wiki_run",
             "restore_card",
             "search_wiki",
             "update_card",
+            "write_wiki_page",
         ];
         let expected: Vec<String> = expected.iter().map(|name| name.to_string()).collect();
         assert_eq!(names, expected);
@@ -901,6 +1138,112 @@ mod tests {
         );
         let denied = off.get_wiki_status().unwrap();
         assert_eq!(denied.is_error, Some(true));
+    }
+
+    #[test]
+    fn wiki_write_pipeline_is_optimistic_and_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let wiki = dir.path().join("wiki");
+        let documents = dir.path().join("documents");
+        std::fs::create_dir_all(&wiki).unwrap();
+        std::fs::create_dir_all(&documents).unwrap();
+        let db_path = dir.path().join("kandrium.db");
+        let mut db = core::db::open_db(&db_path).unwrap();
+        core::db::bootstrap(&mut db, &db_path).unwrap();
+        let server = KandriumServer::with_roots(db, wiki.clone(), documents);
+
+        let content = "---\ntype: concept\ntitle: Attention\nsummary: A shared idea.\n\
+                       aliases: [attention]\n---\n\
+                       Attention relates every token to every other token in a sequence.\n";
+
+        let created = server
+            .write_wiki_page(Parameters(WriteWikiPageInput {
+                path: "concepts/attention.md".into(),
+                content: content.into(),
+                expected_hash: None,
+                force: None,
+                agent: Some("codex".into()),
+                instructions_version: core::WIKI_INSTRUCTIONS_VERSION,
+            }))
+            .unwrap();
+        assert_ne!(created.is_error, Some(true));
+        let payload: serde_json::Value = serde_json::from_str(&text(&created)).unwrap();
+        assert_eq!(payload["action"], "created");
+        let hash = payload["contentHash"].as_str().unwrap().to_string();
+        assert!(wiki.join("concepts/attention.md").exists());
+
+        let conflict = server
+            .write_wiki_page(Parameters(WriteWikiPageInput {
+                path: "concepts/attention.md".into(),
+                content: content.into(),
+                expected_hash: Some("deadbeef".into()),
+                force: None,
+                agent: None,
+                instructions_version: core::WIKI_INSTRUCTIONS_VERSION,
+            }))
+            .unwrap();
+        assert_eq!(conflict.is_error, Some(true));
+
+        let read = server
+            .read_wiki_page(Parameters(ReadWikiPageInput {
+                path: "concepts/attention.md".into(),
+            }))
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&text(&read)).unwrap();
+        assert_eq!(payload["frontmatter"]["title"], "Attention");
+        assert_eq!(payload["contentHash"], hash);
+
+        let patched = server
+            .patch_wiki_page(Parameters(PatchWikiPageInput {
+                path: "concepts/attention.md".into(),
+                old_text: "A shared idea.".into(),
+                new_text: "A refined idea.".into(),
+                expected_hash: Some(hash),
+                force: None,
+                agent: Some("codex".into()),
+                instructions_version: core::WIKI_INSTRUCTIONS_VERSION,
+            }))
+            .unwrap();
+        assert_ne!(patched.is_error, Some(true));
+        let payload: serde_json::Value = serde_json::from_str(&text(&patched)).unwrap();
+        assert_eq!(payload["replaced"], 1);
+
+        let run = server
+            .record_wiki_run(Parameters(RecordRunInput {
+                agent: Some("codex".into()),
+                pages: Some(vec!["concepts/attention.md".into()]),
+                sources: Some(vec![]),
+                stats: Some(RunStatsInput {
+                    pages_updated: Some(1),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .unwrap();
+        assert_ne!(run.is_error, Some(true));
+        let payload: serde_json::Value = serde_json::from_str(&text(&run)).unwrap();
+        assert_eq!(payload["agent"], "codex");
+
+        let status = server.get_wiki_status().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&text(&status)).unwrap();
+        assert_eq!(payload["lastRun"]["agent"], "codex");
+        assert_eq!(payload["pageCounts"]["concept"], 1);
+
+        let dedup = server.list_wiki_dedup_candidates().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&text(&dedup)).unwrap();
+        assert_eq!(payload["groups"].as_array().unwrap().len(), 0);
+
+        let deleted = server
+            .delete_wiki_page(Parameters(DeleteWikiPageInput {
+                path: "concepts/attention.md".into(),
+                expected_hash: None,
+                force: None,
+                instructions_version: core::WIKI_INSTRUCTIONS_VERSION,
+            }))
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&text(&deleted)).unwrap();
+        assert_eq!(payload["deleted"], true);
+        assert!(!wiki.join("concepts/attention.md").exists());
     }
 
     /// Pins the field names of the JSON an MCP client receives. `camelCase`

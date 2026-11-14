@@ -21,11 +21,12 @@ pub mod lint;
 pub mod pages;
 pub mod pdf;
 pub mod sources;
+pub mod write;
 
 pub use index::{
     INDEX_PAGE, SearchHit, get_page as get_wiki_page, index_all_pages, index_page,
-    list_pages as list_wiki_pages, rebuild_fts, search as search_wiki, status as wiki_status,
-    write_index_md,
+    list_pages as list_wiki_pages, rebuild_fts, reindex_page, search as search_wiki,
+    status as wiki_status, write_index_md,
 };
 pub use instructions::{
     TAG_VOCABULARY, WIKI_INSTRUCTIONS, WIKI_INSTRUCTIONS_VERSION, instructions_hash,
@@ -42,6 +43,11 @@ pub use pages::{
 pub use sources::{
     SourceDelta, SourceRange, SourceText, counts as source_counts, hash_bytes, hash_file,
     kind_for_path, list_sources, mark_failed as mark_source_failed, read_source, refresh_sources,
+};
+pub use write::{
+    DedupGroup, DeletePageSpec, PagePatch, PageWrite, PatchPageSpec, RunRecord, RunStats, WikiRun,
+    WriteAction, WritePageSpec, dedup_candidates, delete_page, latest_run, patch_page, record_run,
+    write_page,
 };
 
 /// Environment variable that overrides the wiki page root.

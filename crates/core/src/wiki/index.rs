@@ -330,6 +330,48 @@ pub fn get_page(db: &Connection, rel_path: &str) -> Result<Option<WikiPage>> {
     }
 }
 
+/// Reindex one page from disk: row, citations, links, and `index.md`.
+///
+/// Used by the write pipeline so a single write never leaves the index half
+/// updated.
+pub fn reindex_page(db: &mut Connection, root: &Path, rel_path: &str) -> Result<()> {
+    let root = fsutil::canonical_root(root)?;
+    let path = fsutil::guard(&root, &root.join(rel_path))?;
+    let bytes = std::fs::read(&path)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut parsed = pages::parse_page(rel_path, &text);
+    parsed.content_hash = hash_bytes(&bytes);
+
+    let reviewed = match parsed.reviewed() {
+        Some(reviewed) => reviewed,
+        None => lookup_reviewed(db, rel_path)?.unwrap_or(false),
+    };
+    let mut sources = pages::page_sources(&parsed);
+    for source in &mut sources {
+        source.source_hash = lookup_source_hash(db, &source.source_path)?.unwrap_or_default();
+    }
+    let page = WikiPage {
+        rel_path: rel_path.to_string(),
+        kind: parsed.kind,
+        title: parsed.title(),
+        summary: parsed.summary(),
+        aliases: parsed.aliases(),
+        tags: parsed.tags(),
+        reviewed,
+        content_hash: parsed.content_hash.clone(),
+        generated_hash: None,
+        updated_at: modified_seconds(&path),
+        sources,
+    };
+
+    let tx = db.transaction()?;
+    index_page(&tx, &root, &page, &parsed.body)?;
+    links::index_links(&tx, rel_path, &parsed.body)?;
+    tx.commit()?;
+    write_index_md(db, &root)?;
+    Ok(())
+}
+
 /// Counts for status surfaces.
 pub fn status(db: &Connection) -> Result<WikiStatus> {
     let mut pages = PageCounts::default();
