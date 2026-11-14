@@ -66,13 +66,18 @@ pub const SCHEMA_V11_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../migrations/0011_project_paths.sql"
 ));
+/// Additive v12 step (derived index for the LLM wiki).
+pub const SCHEMA_V12_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../migrations/0012_wiki.sql"
+));
 /// Latest schema version. Must match the number of entries in the migration set.
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// The SQL of every migration, in application order. `SCHEMA_VERSION` must
 /// equal its length; `every_sql_file_is_registered` proves the list still
 /// covers every file under `migrations/`.
-const MIGRATION_SQL: [&str; 11] = [
+const MIGRATION_SQL: [&str; 12] = [
     SCHEMA_SQL,
     SCHEMA_V2_SQL,
     SCHEMA_V3_SQL,
@@ -84,6 +89,7 @@ const MIGRATION_SQL: [&str; 11] = [
     SCHEMA_V9_SQL,
     SCHEMA_V10_SQL,
     SCHEMA_V11_SQL,
+    SCHEMA_V12_SQL,
 ];
 
 /// The ordered migration set. `rusqlite_migration` tracks the applied version
@@ -586,5 +592,98 @@ mod tests {
             .unwrap();
         assert_eq!(identifier, "kan-1");
         assert_eq!(locked, 1);
+    }
+
+    /// A v11 database only gains the additive wiki tables. Existing boards,
+    /// columns, and cards stay untouched; the index starts empty and FTS5 is
+    /// queryable.
+    #[test]
+    fn v11_database_gains_the_wiki_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open_db(&dir.path().join("t.db")).unwrap();
+        Migrations::new(vec![
+            M::up(SCHEMA_SQL),
+            M::up(SCHEMA_V2_SQL),
+            M::up(SCHEMA_V3_SQL),
+            M::up(SCHEMA_V4_SQL),
+            M::up(SCHEMA_V5_SQL),
+            M::up(SCHEMA_V6_SQL),
+            M::up(SCHEMA_V7_SQL),
+            M::up(SCHEMA_V8_SQL),
+            M::up(SCHEMA_V9_SQL),
+            M::up(SCHEMA_V10_SQL),
+            M::up(SCHEMA_V11_SQL),
+        ])
+        .to_latest(&mut db)
+        .unwrap();
+        db.execute_batch(
+            "INSERT INTO boards (id, title, position) VALUES ('b1', 'Board', 0);
+             INSERT INTO columns (id, board_id, title, position)
+                 VALUES ('c1', 'b1', 'To Do', 0);
+             INSERT INTO cards (id, column_id, title, description, position)
+                 VALUES ('k1', 'c1', 'Task', '', 0);",
+        )
+        .unwrap();
+
+        run_schema(&mut db).unwrap();
+
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        for table in [
+            "wiki_meta",
+            "wiki_sources",
+            "wiki_pages",
+            "wiki_page_sources",
+            "wiki_links",
+            "wiki_runs",
+            "wiki_fts",
+        ] {
+            let count: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = ?",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "missing table {table}");
+        }
+
+        let boards: i64 = db
+            .query_row("SELECT COUNT(*) FROM boards WHERE id = 'b1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(boards, 1);
+        let cards: i64 = db
+            .query_row("SELECT COUNT(*) FROM cards WHERE id = 'k1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(cards, 1);
+
+        db.execute(
+            "INSERT INTO wiki_fts (path, title, summary, aliases, body)
+             VALUES ('concepts/self-attention.md', 'Self-Attention', '', 'attention', 'unique_token')",
+            [],
+        )
+        .unwrap();
+        let hits: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM wiki_fts WHERE wiki_fts MATCH 'unique_token'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1);
+
+        let violations: i64 = db
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
     }
 }

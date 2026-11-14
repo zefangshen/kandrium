@@ -17,6 +17,7 @@ pub mod notes;
 pub mod projects;
 pub mod seed;
 mod services;
+pub mod wiki;
 
 pub use clocks::{
     Clock, ClockText, Person, ProbeAmbiguity, ProbeError, ProbeReading, Travel, add_clock,
@@ -59,4 +60,8 @@ pub use services::card::{
 };
 pub use services::column::{
     archive_all_cards, create_column, delete_column, move_column, rename_column,
+};
+pub use wiki::{
+    PageCounts, PageKind, PageSource, SourceCounts, SourceKind, SourceState, WikiPage, WikiSource,
+    WikiStatus, compiled_dir, ensure_wiki_root, is_compiled_path, resolve_wiki_root,
 };
