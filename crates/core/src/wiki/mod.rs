@@ -15,12 +15,16 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 
 pub mod index;
+pub mod links;
 pub mod pages;
 pub mod sources;
 
 pub use index::{
     INDEX_PAGE, SearchHit, index_all_pages, index_page, list_pages as list_wiki_pages, rebuild_fts,
     search as search_wiki, status as wiki_status, write_index_md,
+};
+pub use links::{
+    Backlink, WikiLink, backlinks, index_links, parse_links, rebuild_links, resolve_links,
 };
 pub use pages::{
     Citation, FmField, FmValue, Frontmatter, PAGE_EXTENSIONS, PageText, page_kind_for_path,

@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{KandriumError, Result};
 use crate::fsutil::{self, FsEntry};
 
+use super::links;
 use super::pages::{self, PAGE_EXTENSIONS};
 use super::sources::{self, hash_bytes};
 use super::{PageCounts, PageKind, PageSource, WikiPage, WikiStatus, source_counts};
@@ -122,6 +123,7 @@ pub fn index_all_pages(db: &mut Connection, root: &Path) -> Result<usize> {
     collect_files(&tree, &mut files);
 
     let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut bodies: Vec<(String, String)> = Vec::new();
     let tx = db.transaction()?;
     for entry in files {
         let rel_path = sources::relative_path(&root, &entry.path)?;
@@ -156,8 +158,10 @@ pub fn index_all_pages(db: &mut Connection, root: &Path) -> Result<usize> {
             sources: page_sources,
         };
         index_page(&tx, &root, &page, &parsed.body)?;
+        bodies.push((rel_path.clone(), parsed.body.clone()));
         seen.insert(rel_path);
     }
+    links::rebuild_links(&tx, &bodies)?;
 
     let existing: Vec<String> = {
         let mut stmt = tx.prepare("SELECT rel_path FROM wiki_pages")?;
@@ -902,6 +906,34 @@ mod tests {
         assert_eq!(pages[0].rel_path, "concepts/broken.md");
         assert_eq!(pages[0].title, "broken");
         assert!(pages[0].summary.is_empty());
+    }
+
+    #[test]
+    fn index_builds_the_link_graph_and_backlinks() {
+        let mut f = fixture();
+        write(
+            &f.root,
+            "concepts/attention.md",
+            "---\ntype: concept\ntitle: Attention\n---\nSee [[entities/vaswani]].\n",
+        );
+        write(
+            &f.root,
+            "entities/vaswani.md",
+            "---\ntype: entity\ntitle: Ashish Vaswani\n---\nAuthor.\n",
+        );
+        index_all_pages(&mut f.db, &f.root).unwrap();
+
+        let inbound = super::links::backlinks(&f.db, "entities/vaswani.md").unwrap();
+        assert_eq!(inbound.len(), 1);
+        assert_eq!(inbound[0].from, "concepts/attention.md");
+
+        std::fs::remove_file(f.root.join("concepts/attention.md")).unwrap();
+        index_all_pages(&mut f.db, &f.root).unwrap();
+        assert!(
+            super::links::backlinks(&f.db, "entities/vaswani.md")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
