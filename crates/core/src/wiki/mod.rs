@@ -15,14 +15,20 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 
 pub mod index;
+pub mod instructions;
 pub mod links;
 pub mod lint;
 pub mod pages;
+pub mod pdf;
 pub mod sources;
 
 pub use index::{
-    INDEX_PAGE, SearchHit, index_all_pages, index_page, list_pages as list_wiki_pages, rebuild_fts,
-    search as search_wiki, status as wiki_status, write_index_md,
+    INDEX_PAGE, SearchHit, get_page as get_wiki_page, index_all_pages, index_page,
+    list_pages as list_wiki_pages, rebuild_fts, search as search_wiki, status as wiki_status,
+    write_index_md,
+};
+pub use instructions::{
+    TAG_VOCABULARY, WIKI_INSTRUCTIONS, WIKI_INSTRUCTIONS_VERSION, instructions_hash,
 };
 pub use links::{
     Backlink, WikiLink, backlinks, index_links, parse_links, rebuild_links, resolve_links,
@@ -34,8 +40,8 @@ pub use pages::{
     validate_page_path,
 };
 pub use sources::{
-    SourceDelta, counts as source_counts, hash_bytes, hash_file, kind_for_path, list_sources,
-    refresh_sources,
+    SourceDelta, SourceRange, SourceText, counts as source_counts, hash_bytes, hash_file,
+    kind_for_path, list_sources, mark_failed as mark_source_failed, read_source, refresh_sources,
 };
 
 /// Environment variable that overrides the wiki page root.

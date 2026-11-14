@@ -345,6 +345,134 @@ fn decode_source(row: SourceRow) -> Result<WikiSource> {
     })
 }
 
+/// Requested span of a source. Zero means "from the start" or "to the end".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceRange {
+    pub start_line: u32,
+    pub end_line: u32,
+    pub start_page: u32,
+    pub end_page: u32,
+}
+
+/// Text returned by [`read_source`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceText {
+    pub path: String,
+    pub kind: SourceKind,
+    pub text: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub page_count: u32,
+    pub truncated: bool,
+    pub next_page: Option<u32>,
+}
+
+/// Read a Markdown or PDF source under the documents root.
+///
+/// Markdown is read by line; PDFs are read by page and capped at
+/// `max_pages` so an agent never pulls a whole book in one call.
+pub fn read_source(
+    documents_root: &Path,
+    rel_path: &str,
+    range: SourceRange,
+    max_pages: usize,
+) -> Result<SourceText> {
+    validate_rel_path(rel_path)?;
+    let path = fsutil::guard(documents_root, &documents_root.join(rel_path))?;
+    let kind = kind_for_path(Path::new(rel_path))
+        .ok_or_else(|| KandriumError(format!("unsupported source type: {rel_path}")))?;
+
+    match kind {
+        SourceKind::Markdown => {
+            let text = std::fs::read_to_string(&path)?;
+            let lines: Vec<&str> = text.lines().collect();
+            let total = lines.len() as u32;
+            let start = range.start_line.max(1);
+            let end = if range.end_line == 0 {
+                total
+            } else {
+                range.end_line.min(total)
+            };
+            let text = if total == 0 || start > total {
+                String::new()
+            } else {
+                lines[(start - 1) as usize..end as usize].join("\n")
+            };
+            Ok(SourceText {
+                path: rel_path.to_string(),
+                kind,
+                text,
+                start_line: start,
+                end_line: end,
+                page_count: 0,
+                truncated: false,
+                next_page: None,
+            })
+        }
+        SourceKind::Pdf => {
+            let count = super::pdf::page_count(documents_root, rel_path)?;
+            let max_pages = max_pages.max(1) as u32;
+            let start = range.start_page.max(1);
+            let end = if start as usize > count {
+                start.saturating_sub(1)
+            } else {
+                let requested = if range.end_page == 0 {
+                    count as u32
+                } else {
+                    range.end_page.min(count as u32)
+                };
+                requested.min(start + max_pages - 1).min(count as u32)
+            };
+            let pages = if start as usize > count {
+                Vec::new()
+            } else {
+                super::pdf::extract(
+                    documents_root,
+                    rel_path,
+                    Some(start as usize),
+                    Some(end as usize),
+                )?
+            };
+            let truncated = (end as usize) < count;
+            Ok(SourceText {
+                path: rel_path.to_string(),
+                kind,
+                text: super::pdf::page_text(&pages),
+                start_line: 0,
+                end_line: 0,
+                page_count: count as u32,
+                truncated,
+                next_page: truncated.then_some(end + 1),
+            })
+        }
+    }
+}
+
+/// Record that a source could not be read (for example a PDF without a text
+/// layer). Status only: the document itself is never modified.
+pub fn mark_failed(db: &Connection, rel_path: &str, error: &str) -> Result<bool> {
+    let updated = db.execute(
+        "UPDATE wiki_sources SET state = 'failed', error = ?1 WHERE rel_path = ?2",
+        params![error, rel_path],
+    )?;
+    Ok(updated > 0)
+}
+
+fn validate_rel_path(rel_path: &str) -> Result<()> {
+    if rel_path.is_empty() || rel_path.starts_with('/') || rel_path.contains('\\') {
+        return Err(KandriumError("invalid source path".to_string()));
+    }
+    if rel_path
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == ".." || part.starts_with('.'))
+    {
+        return Err(KandriumError("invalid source path".to_string()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

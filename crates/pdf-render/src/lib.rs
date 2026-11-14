@@ -13,7 +13,7 @@
 //! in at scale 1. Screen mapping is a pure `× zoom + offset`.
 
 use std::panic::{self, AssertUnwindSafe};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -332,7 +332,7 @@ impl<'a> Device<'a> for GlyphCollector {
 /// Extract one page's text on the worker thread. Returns an empty
 /// [`PageText`] when the interpreter panics (hostile input must never take
 /// the app down).
-fn extract_text(page: &Page<'_>) -> PageText {
+fn extract_page_text(page: &Page<'_>) -> PageText {
     let device = panic::catch_unwind(AssertUnwindSafe(|| {
         let (w, h) = page.render_dimensions();
         let initial = page.initial_transform(true).to_kurbo();
@@ -352,6 +352,41 @@ fn extract_text(page: &Page<'_>) -> PageText {
         Ok(glyphs) => group_lines(glyphs),
         Err(_) => PageText::default(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Synchronous text extraction (external readers: wiki sources)
+// ---------------------------------------------------------------------------
+
+/// Page count of the PDF at `path`. Parses the document and drops it.
+pub fn page_count(path: &Path) -> Result<usize, String> {
+    let data = std::fs::read(path).map_err(|err| format!("cannot read PDF: {err}"))?;
+    let pdf = Pdf::new(data).map_err(|err| format!("{err:?}"))?;
+    Ok(pdf.pages().len())
+}
+
+/// Extract text for the 1-based, inclusive page range `first..=last`.
+/// `None` means the first or last page. Returns one [`PageText`] per page.
+pub fn extract_text(
+    path: &Path,
+    first: Option<usize>,
+    last: Option<usize>,
+) -> Result<Vec<PageText>, String> {
+    let data = std::fs::read(path).map_err(|err| format!("cannot read PDF: {err}"))?;
+    let pdf = Pdf::new(data).map_err(|err| format!("{err:?}"))?;
+    let count = pdf.pages().len();
+    let start = first.unwrap_or(1).max(1);
+    let end = last.unwrap_or(count).min(count);
+    if start > end {
+        return Ok(Vec::new());
+    }
+    let mut pages = Vec::with_capacity(end - start + 1);
+    for index in (start - 1)..end {
+        if let Some(page) = pdf.pages().get(index) {
+            pages.push(extract_page_text(page));
+        }
+    }
+    Ok(pages)
 }
 
 // ---------------------------------------------------------------------------
@@ -485,7 +520,7 @@ fn worker_loop(path: PathBuf, rx: Receiver<Request>, events: Sender<Event>, wake
                     wake();
                     continue;
                 };
-                let text = extract_text(page_ref);
+                let text = extract_page_text(page_ref);
                 if events.send(Event::Text { page, text }).is_err() {
                     break;
                 }
@@ -566,7 +601,7 @@ mod tests {
             Event::Failed { message, .. } => panic!("render failed: {message}"),
             other => panic!("unexpected event: {other:?}"),
         }
-        let text = extract_text(&pdf.pages()[0]);
+        let text = extract_page_text(&pdf.pages()[0]);
         assert!(!text.glyphs.is_empty(), "no glyphs extracted");
         assert!(!text.lines.is_empty(), "no lines grouped");
         // The extracted text must contain our string (glyphs in x order).

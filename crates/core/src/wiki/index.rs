@@ -313,6 +313,23 @@ pub fn list_pages(db: &Connection, kind: Option<PageKind>) -> Result<Vec<WikiPag
     Ok(out)
 }
 
+/// One page row, or `None` when the path is not indexed.
+pub fn get_page(db: &Connection, rel_path: &str) -> Result<Option<WikiPage>> {
+    let row = db
+        .query_row(
+            "SELECT rel_path, kind, title, summary, aliases_json, tags_json,
+                    reviewed, content_hash, generated_hash, updated_at
+             FROM wiki_pages WHERE rel_path = ?1",
+            [rel_path],
+            map_page_row,
+        )
+        .optional()?;
+    match row {
+        Some(row) => Ok(Some(decode_page(db, row)?)),
+        None => Ok(None),
+    }
+}
+
 /// Counts for status surfaces.
 pub fn status(db: &Connection) -> Result<WikiStatus> {
     let mut pages = PageCounts::default();

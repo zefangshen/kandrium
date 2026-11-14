@@ -1,14 +1,15 @@
 //! Kandrium MCP server — port of `src/mcp/server.ts` onto the official Rust
-//! MCP SDK (rmcp). Exposes a curated 13-tool subset: names, descriptions,
-//! schemas, and result shapes match the legacy tools for everything exposed
-//! (pretty JSON text; tool-level `isError` + message on failure). Column
-//! create/rename/delete/move are intentionally app-only; only
-//! `archive_all_cards` remains as a column mutation.
+//! MCP SDK (rmcp). Exposes a curated 13-tool Kanban subset plus the additive
+//! wiki read surface. Kanban names, schemas, and result shapes match the
+//! legacy tools (pretty JSON text; tool-level `isError` + message on
+//! failure). Column create/rename/delete/move are intentionally app-only;
+//! only `archive_all_cards` remains as a column mutation.
 //!
 //! DB path resolution matches the core crate: `KANDRIUM_DB` env override, else
 //! `<data_dir>/kandrium/kandrium.db`. Logging goes to stderr only — stdout is
 //! the MCP transport.
 
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use kandrium_core as core;
@@ -17,6 +18,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, ErrorData};
 use rmcp::schemars;
 use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
+use serde::Serialize;
 
 // ---------------------------------------------------------------------------
 // Tool input structs (mirror the zod inputSchemas, camelCase on the wire)
@@ -136,12 +138,135 @@ impl StatusKey {
 }
 
 // ---------------------------------------------------------------------------
+// Wiki inputs
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ListWikiSourcesInput {
+    /// Only sources whose path starts with this prefix
+    #[serde(default)]
+    path_prefix: Option<String>,
+    /// Filter by compile state
+    #[serde(default)]
+    state: Option<String>,
+    /// Maximum rows to return (default 200)
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ReadWikiSourceInput {
+    /// Document-relative path, e.g. papers/attention.pdf
+    path: String,
+    /// First 1-based line (Markdown)
+    #[serde(default)]
+    start_line: Option<u32>,
+    /// Last 1-based line, inclusive (Markdown)
+    #[serde(default)]
+    end_line: Option<u32>,
+    /// First 1-based page (PDF)
+    #[serde(default)]
+    start_page: Option<u32>,
+    /// Last 1-based page, inclusive (PDF)
+    #[serde(default)]
+    end_page: Option<u32>,
+    /// PDF page cap per call (default 4)
+    #[serde(default)]
+    max_pages: Option<usize>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ListWikiPagesInput {
+    /// Filter by kind: source, entity, concept, index, page
+    #[serde(default)]
+    kind: Option<String>,
+    /// Only pages that cite this document path
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ReadWikiPageInput {
+    /// Root-relative page path, e.g. concepts/self-attention.md
+    path: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct SearchWikiInput {
+    /// Full-text query
+    query: String,
+    /// pages (default). Source text is not indexed; read sources directly.
+    #[serde(default)]
+    scope: Option<String>,
+    /// Maximum hits (default 20)
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct LintWikiInput {
+    /// Limit findings to this page or folder
+    #[serde(default)]
+    path: Option<String>,
+    /// Reserved; fixes are not implemented in this release
+    #[serde(default)]
+    fix: Option<bool>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PageSummary {
+    path: String,
+    kind: core::PageKind,
+    title: String,
+    summary: String,
+    aliases: Vec<String>,
+    tags: Vec<String>,
+    reviewed: bool,
+    updated_at: i64,
+}
+
+// ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WikiMode {
+    Off,
+    Read,
+    Write,
+}
+
+impl WikiMode {
+    fn from_env() -> Self {
+        match std::env::var("KANDRIUM_MCP_WIKI").ok().as_deref() {
+            Some("off") => Self::Off,
+            Some("read") => Self::Read,
+            _ => Self::Write,
+        }
+    }
+
+    fn allows_read(self) -> bool {
+        self != Self::Off
+    }
+}
 
 #[derive(Clone)]
 struct KandriumServer {
     db: std::sync::Arc<Mutex<rusqlite::Connection>>,
+    wiki_root: PathBuf,
+    documents_root: PathBuf,
+    wiki_mode: WikiMode,
     /// Populated by the #[tool_router] macro; kept for rmcp's expected shape
     /// (the generated #[tool_handler] impl routes through the router).
     #[allow(dead_code)]
@@ -151,8 +276,30 @@ struct KandriumServer {
 #[tool_router]
 impl KandriumServer {
     fn new(db: rusqlite::Connection) -> Self {
+        Self::with_roots_and_mode(
+            db,
+            core::resolve_wiki_root(),
+            core::documents::resolve_documents_root(),
+            WikiMode::from_env(),
+        )
+    }
+
+    #[cfg(test)]
+    fn with_roots(db: rusqlite::Connection, wiki_root: PathBuf, documents_root: PathBuf) -> Self {
+        Self::with_roots_and_mode(db, wiki_root, documents_root, WikiMode::Write)
+    }
+
+    fn with_roots_and_mode(
+        db: rusqlite::Connection,
+        wiki_root: PathBuf,
+        documents_root: PathBuf,
+        wiki_mode: WikiMode,
+    ) -> Self {
         KandriumServer {
             db: std::sync::Arc::new(Mutex::new(db)),
+            wiki_root,
+            documents_root,
+            wiki_mode,
             tool_router: Self::tool_router(),
         }
     }
@@ -169,6 +316,23 @@ impl KandriumServer {
             Err(e) => return Ok(error_result(e.to_string())),
         };
         Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+    }
+
+    /// Wiki tool plumbing with both roots and the read gate.
+    fn run_wiki<T: serde::Serialize>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection, &Path, &Path) -> core::Result<T>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if !self.wiki_mode.allows_read() {
+            return Ok(error_result(
+                "wiki tools are disabled (KANDRIUM_MCP_WIKI=off)".to_string(),
+            ));
+        }
+        let db = self.db.lock().unwrap_or_else(|e| e.into_inner());
+        match f(&db, &self.wiki_root, &self.documents_root) {
+            Ok(value) => Ok(json_result(&value)),
+            Err(error) => Ok(error_result(error.to_string())),
+        }
     }
 
     // -- Boards -------------------------------------------------------------
@@ -324,6 +488,253 @@ impl KandriumServer {
     fn list_archived_cards(&self) -> Result<CallToolResult, ErrorData> {
         self.run(core::list_archived_cards)
     }
+
+    // -- Wiki (read) --------------------------------------------------------
+
+    #[tool(
+        description = "List indexed wiki sources with compile state and per-state counts. Filter by path prefix or state (new/indexed/compiled/stale/failed)."
+    )]
+    fn list_wiki_sources(
+        &self,
+        Parameters(ListWikiSourcesInput {
+            path_prefix,
+            state,
+            limit,
+        }): Parameters<ListWikiSourcesInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run_wiki(|db, _, _| {
+            let state = match state.as_deref() {
+                None => None,
+                Some(value) => Some(core::SourceState::from_db(value).ok_or_else(|| {
+                    core::KandriumError(format!("unknown source state: {value}"))
+                })?),
+            };
+            let mut sources = core::list_sources(db, state)?;
+            if let Some(prefix) = &path_prefix {
+                sources.retain(|source| source.rel_path.starts_with(prefix));
+            }
+            let counts = core::source_counts(db)?;
+            sources.truncate(limit.unwrap_or(200));
+            Ok(serde_json::json!({ "sources": sources, "counts": counts }))
+        })
+    }
+
+    #[tool(
+        description = "Read a source document. Markdown is read by line, PDFs by page (maxPages, default 4); follow nextPage while truncated. Documents are never modified."
+    )]
+    fn read_wiki_source(
+        &self,
+        Parameters(input): Parameters<ReadWikiSourceInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if !self.wiki_mode.allows_read() {
+            return Ok(error_result(
+                "wiki tools are disabled (KANDRIUM_MCP_WIKI=off)".to_string(),
+            ));
+        }
+        let range = core::SourceRange {
+            start_line: input.start_line.unwrap_or(0),
+            end_line: input.end_line.unwrap_or(0),
+            start_page: input.start_page.unwrap_or(0),
+            end_page: input.end_page.unwrap_or(0),
+        };
+        let db = self.db.lock().unwrap_or_else(|e| e.into_inner());
+        match core::read_source(
+            &self.documents_root,
+            &input.path,
+            range,
+            input.max_pages.unwrap_or(4),
+        ) {
+            Ok(source) => {
+                if source.kind == core::SourceKind::Pdf && source.text.trim().is_empty() {
+                    let _ = core::mark_source_failed(
+                        &db,
+                        &source.path,
+                        "PDF has no readable text layer",
+                    );
+                    return Ok(error_result(format!(
+                        "{} has no readable text layer",
+                        source.path
+                    )));
+                }
+                Ok(json_result(&source))
+            }
+            Err(error) => Ok(error_result(error.to_string())),
+        }
+    }
+
+    #[tool(
+        description = "List indexed wiki pages, optionally by kind or by the document they cite"
+    )]
+    fn list_wiki_pages(
+        &self,
+        Parameters(ListWikiPagesInput {
+            kind,
+            source,
+            limit,
+            offset,
+        }): Parameters<ListWikiPagesInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run_wiki(|db, _, _| {
+            let kind =
+                match kind.as_deref() {
+                    None => None,
+                    Some(value) => Some(core::PageKind::from_db(value).ok_or_else(|| {
+                        core::KandriumError(format!("unknown page kind: {value}"))
+                    })?),
+                };
+            let mut pages = core::list_wiki_pages(db, kind)?;
+            if let Some(source) = &source {
+                pages.retain(|page| {
+                    page.sources
+                        .iter()
+                        .any(|cited| &cited.source_path == source)
+                });
+            }
+            let total = pages.len();
+            let offset = offset.unwrap_or(0).min(total);
+            let limit = limit.unwrap_or(200);
+            let summaries: Vec<PageSummary> = pages
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .map(|page| PageSummary {
+                    path: page.rel_path,
+                    kind: page.kind,
+                    title: page.title,
+                    summary: page.summary,
+                    aliases: page.aliases,
+                    tags: page.tags,
+                    reviewed: page.reviewed,
+                    updated_at: page.updated_at,
+                })
+                .collect();
+            Ok(serde_json::json!({ "pages": summaries, "total": total }))
+        })
+    }
+
+    #[tool(
+        description = "Read one wiki page: raw frontmatter, Markdown body, content hash, citations, and backlinks"
+    )]
+    fn read_wiki_page(
+        &self,
+        Parameters(ReadWikiPageInput { path }): Parameters<ReadWikiPageInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run_wiki(|db, wiki, _| {
+            let page = core::read_page(wiki, &path)?;
+            let stored = core::get_wiki_page(db, &path)?;
+            let links = core::backlinks(db, &path)?;
+            let reviewed = stored.as_ref().map(|page| page.reviewed).unwrap_or(false);
+            let sources = stored.map(|page| page.sources).unwrap_or_default();
+            Ok(serde_json::json!({
+                "path": path,
+                "frontmatter": frontmatter_json(&page.frontmatter),
+                "body": page.body,
+                "contentHash": page.content_hash,
+                "reviewed": reviewed,
+                "sources": sources,
+                "backlinks": links,
+            }))
+        })
+    }
+
+    #[tool(
+        description = "Full-text search over wiki pages (BM25 with snippet). Source text is not indexed; read sources directly."
+    )]
+    fn search_wiki(
+        &self,
+        Parameters(SearchWikiInput {
+            query,
+            scope,
+            limit,
+        }): Parameters<SearchWikiInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run_wiki(|db, _, _| {
+            match scope.as_deref() {
+                None | Some("pages") => {}
+                Some("sources") => {
+                    return Err(core::KandriumError(
+                        "source text is not indexed; use list_wiki_sources and read_wiki_source"
+                            .to_string(),
+                    ));
+                }
+                Some(other) => {
+                    return Err(core::KandriumError(format!(
+                        "unknown search scope: {other}"
+                    )));
+                }
+            }
+            let hits = core::search_wiki(db, &query, limit.unwrap_or(20))?;
+            Ok(serde_json::json!({ "hits": hits }))
+        })
+    }
+
+    #[tool(description = "Wiki status: source and page counts, roots, and instruction version")]
+    fn get_wiki_status(&self) -> Result<CallToolResult, ErrorData> {
+        self.run_wiki(|db, wiki, documents| {
+            let status = core::wiki_status(db)?;
+            Ok(serde_json::json!({
+                "sourceCounts": status.sources,
+                "pageCounts": status.pages,
+                "lastRun": serde_json::Value::Null,
+                "indexRevision": serde_json::Value::Null,
+                "wikiRoot": wiki.display().to_string(),
+                "documentsRoot": documents.display().to_string(),
+                "instructionsVersion": core::WIKI_INSTRUCTIONS_VERSION,
+            }))
+        })
+    }
+
+    #[tool(
+        description = "Current authoring instructions. Call this before writing pages and pass its version to every write."
+    )]
+    fn get_wiki_instructions(&self) -> Result<CallToolResult, ErrorData> {
+        self.run_wiki(|_, _, _| {
+            Ok(serde_json::json!({
+                "version": core::WIKI_INSTRUCTIONS_VERSION,
+                "schemaVersion": core::db::SCHEMA_VERSION,
+                "instructions": core::WIKI_INSTRUCTIONS,
+                "instructionsHash": core::instructions_hash(),
+                "tagVocabulary": core::TAG_VOCABULARY,
+            }))
+        })
+    }
+
+    #[tool(
+        description = "Report wiki lint findings, optionally scoped to a page or folder. Fixes are not implemented in this release."
+    )]
+    fn lint_wiki(
+        &self,
+        Parameters(LintWikiInput { path, fix }): Parameters<LintWikiInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if fix == Some(true) {
+            return Ok(error_result(
+                "lint fixes are not implemented in this release".to_string(),
+            ));
+        }
+        self.run_wiki(|db, wiki, documents| {
+            let findings = core::lint_wiki(db, wiki, documents, path.as_deref())?;
+            Ok(serde_json::json!({ "findings": findings, "fixed": [] }))
+        })
+    }
+}
+
+fn json_result<T: Serialize>(value: &T) -> CallToolResult {
+    let text = serde_json::to_string_pretty(value).unwrap_or_else(|error| error.to_string());
+    CallToolResult::success(vec![ContentBlock::text(text)])
+}
+
+fn frontmatter_json(frontmatter: &core::Frontmatter) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for field in frontmatter.fields() {
+        let value = match &field.value {
+            core::FmValue::Scalar(value) => serde_json::Value::String(value.clone()),
+            core::FmValue::List(items) => {
+                serde_json::Value::Array(items.iter().cloned().map(Into::into).collect())
+            }
+        };
+        map.insert(field.key.clone(), value);
+    }
+    serde_json::Value::Object(map)
 }
 
 fn error_result(message: String) -> CallToolResult {
@@ -393,16 +804,103 @@ mod tests {
             "delete_card",
             "get_all_board",
             "get_board",
+            "get_wiki_instructions",
+            "get_wiki_status",
+            "lint_wiki",
             "list_archived_cards",
             "list_boards",
+            "list_wiki_pages",
+            "list_wiki_sources",
             "move_all_card",
             "move_card",
             "move_card_to_board",
+            "read_wiki_page",
+            "read_wiki_source",
             "restore_card",
+            "search_wiki",
             "update_card",
         ];
         let expected: Vec<String> = expected.iter().map(|name| name.to_string()).collect();
         assert_eq!(names, expected);
+    }
+
+    fn text(result: &CallToolResult) -> String {
+        match result.content.first() {
+            Some(ContentBlock::Text(content)) => content.text.clone(),
+            _ => panic!("expected a text result"),
+        }
+    }
+
+    #[test]
+    fn wiki_source_reads_are_scoped_to_the_documents_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let wiki = dir.path().join("wiki");
+        let documents = dir.path().join("documents");
+        std::fs::create_dir_all(&wiki).unwrap();
+        std::fs::create_dir_all(&documents).unwrap();
+        std::fs::write(documents.join("notes.md"), "one\ntwo\nthree\n").unwrap();
+
+        let server = KandriumServer::with_roots(
+            rusqlite::Connection::open_in_memory().unwrap(),
+            wiki,
+            documents,
+        );
+
+        let result = server
+            .read_wiki_source(Parameters(ReadWikiSourceInput {
+                path: "notes.md".into(),
+                start_line: Some(2),
+                end_line: Some(3),
+                start_page: None,
+                end_page: None,
+                max_pages: None,
+            }))
+            .unwrap();
+        assert_ne!(result.is_error, Some(true));
+        let payload: serde_json::Value = serde_json::from_str(&text(&result)).unwrap();
+        assert_eq!(payload["text"], "two\nthree");
+        assert_eq!(payload["startLine"], 2);
+
+        let escaped = server
+            .read_wiki_source(Parameters(ReadWikiSourceInput {
+                path: "../outside.md".into(),
+                start_line: None,
+                end_line: None,
+                start_page: None,
+                end_page: None,
+                max_pages: None,
+            }))
+            .unwrap();
+        assert_eq!(escaped.is_error, Some(true));
+    }
+
+    #[test]
+    fn wiki_instructions_and_gate_are_served() {
+        let server = KandriumServer::with_roots(
+            rusqlite::Connection::open_in_memory().unwrap(),
+            PathBuf::from("/tmp/wiki"),
+            PathBuf::from("/tmp/documents"),
+        );
+        let result = server.get_wiki_instructions().unwrap();
+        assert_ne!(result.is_error, Some(true));
+        let payload: serde_json::Value = serde_json::from_str(&text(&result)).unwrap();
+        assert_eq!(payload["version"], 1);
+        assert!(
+            payload["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("write_wiki_page")
+        );
+        assert!(!payload["tagVocabulary"].as_array().unwrap().is_empty());
+
+        let off = KandriumServer::with_roots_and_mode(
+            rusqlite::Connection::open_in_memory().unwrap(),
+            PathBuf::from("/tmp/wiki"),
+            PathBuf::from("/tmp/documents"),
+            WikiMode::Off,
+        );
+        let denied = off.get_wiki_status().unwrap();
+        assert_eq!(denied.is_error, Some(true));
     }
 
     /// Pins the field names of the JSON an MCP client receives. `camelCase`
