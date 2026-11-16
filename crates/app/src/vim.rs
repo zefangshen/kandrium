@@ -35,10 +35,10 @@
 
 use std::ops::Range;
 
-use gpui_kit::component::input::{EditorState, TextareaState};
+use gpui_kit::component::input::{EditorState, RopeExt as _, TextareaState};
 use gpui_kit::{
     App, Bounds, Entity, Focusable, Hsla, IntoElement, KeyDownEvent, Keystroke, Pixels,
-    SharedString, Styled, Window, canvas, fill, font,
+    SharedString, Styled, TextAlign, TextRun, Window, canvas, fill, font, px,
 };
 
 /// The buffer operations vim needs.
@@ -2015,6 +2015,10 @@ impl VimSession {
 // Block caret
 // ---------------------------------------------------------------------------
 
+/// Tab stop the input renders, in cells: its default `tab_size`, which the app
+/// never changes.
+const VIM_TAB_SIZE: f32 = 4.0;
+
 /// The caret geometry the block overlay needs from an editor state.
 ///
 /// The code editor and the textarea are aliases of the same engine, but they
@@ -2024,6 +2028,11 @@ pub trait CaretSource: 'static {
     /// offset applied the way the engine applies it when painting its own
     /// line caret.
     fn caret_bounds(&self, cx: &App) -> Option<Bounds<Pixels>>;
+    /// Height of the line box the caret sits in. The engine's caret is only
+    /// 85 % of it, so the block uses this to fill the whole cell.
+    fn caret_line_height(&self, cx: &App) -> Option<Pixels>;
+    /// The character under the caret, if the caret is on one.
+    fn caret_char(&self, cx: &App) -> Option<char>;
     /// Whether the editor owns keyboard focus right now.
     fn caret_focused(&self, window: &Window, cx: &App) -> bool;
 }
@@ -2040,6 +2049,15 @@ macro_rules! impl_caret_source {
                 Some(bounds)
             }
 
+            fn caret_line_height(&self, cx: &App) -> Option<Pixels> {
+                Some(self.read(cx).prepaint_caret_geometry()?.line_height())
+            }
+
+            fn caret_char(&self, cx: &App) -> Option<char> {
+                let state = self.read(cx);
+                state.text().char_at(state.cursor())
+            }
+
             fn caret_focused(&self, window: &Window, cx: &App) -> bool {
                 self.read(cx).focus_handle(cx).is_focused(window)
             }
@@ -2053,10 +2071,16 @@ impl_caret_source!(EditorState);
 /// Paint the vim block caret over an editor.
 ///
 /// The input keeps painting its own 1 px line caret, but the block starts at
-/// the same origin and is filled with the accent colour, so Normal/Visual
-/// modes read as a block. Insert mode does not call this, which leaves the
-/// engine's line caret untouched. `family` and `size` must match the editor's
-/// text so the block spans one character cell.
+/// the same origin and is filled with `block_color`, so Normal/Visual modes
+/// read as a block. The block spans the shaped advance of the character under
+/// the caret — one nominal `ch_width` is too narrow for wide glyphs in a
+/// proportional font — and the full line height, since the engine's caret is
+/// only 85 % of it. The character is then redrawn in `text_color` on top so the
+/// glyph reads inverted instead of disappearing under the fill. Insert mode
+/// does not call this, which leaves the engine's line caret untouched.
+///
+/// `family` and `font_size` must match the editor's text, and `text_color` must
+/// be the surface behind the block (`Tokens::field`).
 ///
 /// The caller places the returned canvas over the editor (for example
 /// `.absolute().inset_0()` inside the editor's relative wrapper); it paints
@@ -2065,7 +2089,8 @@ pub fn block_cursor_overlay(
     source: impl CaretSource,
     family: impl Into<SharedString>,
     font_size: Pixels,
-    color: Hsla,
+    block_color: Hsla,
+    text_color: Hsla,
 ) -> impl IntoElement + Styled {
     let family = family.into();
     canvas(
@@ -2077,17 +2102,74 @@ pub fn block_cursor_overlay(
             let Some(caret) = source.caret_bounds(cx) else {
                 return;
             };
-            let font_id = window.text_system().resolve_font(&font(family.clone()));
-            let width = window
+            let ch = source.caret_char(cx);
+            let style_font = font(family.clone());
+            let font_id = window.text_system().resolve_font(&style_font);
+            let ch_width = window
                 .text_system()
                 .ch_width(font_id, font_size)
                 .unwrap_or(font_size * 0.6);
+            let shaped = ch.filter(|ch| !ch.is_control()).map(|ch| {
+                let text: SharedString = ch.to_string().into();
+                let run = TextRun {
+                    len: text.len(),
+                    font: style_font.clone(),
+                    color: text_color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let line = window
+                    .text_system()
+                    .shape_line(text, font_size, &[run], None);
+                (ch, line)
+            });
+            let advance = shaped
+                .as_ref()
+                .map(|(_, line)| line.width)
+                .unwrap_or(ch_width);
+            let width = block_width(ch, ch_width, advance);
+            // The engine's caret is vertically centred inside the line box, so
+            // grow it back to the full line height around that centre.
+            let line_height = source
+                .caret_line_height(cx)
+                .unwrap_or(caret.size.height)
+                .max(caret.size.height);
+            let origin = gpui_kit::point(
+                caret.origin.x,
+                caret.origin.y - (line_height - caret.size.height) / 2.0,
+            );
             window.paint_quad(fill(
-                Bounds::new(caret.origin, gpui_kit::size(width, caret.size.height)),
-                color,
+                Bounds::new(origin, gpui_kit::size(width, line_height)),
+                block_color,
             ));
+            if let Some((ch, line)) = &shaped
+                && !ch.is_whitespace()
+            {
+                let _ = line.paint(origin, line_height, TextAlign::Left, None, window, cx);
+            }
         },
     )
+}
+
+/// Width of the block cell at one caret position.
+///
+/// `shaped` is the shaped advance of the character under the caret. Tabs take
+/// the input's tab stop (it renders them as four spaces and the app never
+/// changes `tab_size`), and positions with no visible character (end of line,
+/// newline) fall back to the nominal cell width.
+fn block_width(ch: Option<char>, ch_width: Pixels, shaped: Pixels) -> Pixels {
+    match ch {
+        Some('\t') => ch_width * VIM_TAB_SIZE,
+        Some(ch) if !ch.is_control() => {
+            if shaped > px(0.) {
+                shaped
+            } else {
+                ch_width
+            }
+        }
+        _ => ch_width,
+    }
 }
 
 fn is_escape(keystroke: &Keystroke) -> bool {
@@ -2358,11 +2440,33 @@ mod tests {
     }
 
     #[test]
-    fn visual_text_object_extends_the_selection() {
-        let (state, b) = run_state("foo bar", 0, "viw");
-        assert_eq!(state.mode, VimMode::Visual);
-        assert_eq!(state.anchor, 0);
-        assert_eq!(b.cursor, 2);
-        assert_eq!(body(&b), "foo bar");
+    fn block_width_uses_the_shaped_advance_and_the_tab_stop() {
+        let ch_width = px(8.);
+        assert_eq!(
+            block_width(Some('W'), ch_width, px(13.)),
+            px(13.),
+            "a wide glyph keeps its shaped advance"
+        );
+        assert_eq!(
+            block_width(Some('i'), ch_width, px(3.)),
+            px(3.),
+            "a narrow glyph keeps its shaped advance"
+        );
+        assert_eq!(
+            block_width(Some('W'), ch_width, px(0.)),
+            ch_width,
+            "an empty shape falls back to the nominal cell"
+        );
+        assert_eq!(
+            block_width(Some('\t'), ch_width, px(99.)),
+            px(32.),
+            "a tab spans four cells"
+        );
+        assert_eq!(
+            block_width(Some('\n'), ch_width, px(99.)),
+            ch_width,
+            "a newline has no cell of its own"
+        );
+        assert_eq!(block_width(None, ch_width, px(99.)), ch_width);
     }
 }

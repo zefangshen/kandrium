@@ -351,6 +351,7 @@ pub fn modal(ctx: ModalContext<'_>, cx: &mut Context<AppShell>) -> AnyElement {
                         body_family,
                         body_size,
                         t.accent.into(),
+                        t.field.into(),
                     )
                     .absolute()
                     .inset_0(),

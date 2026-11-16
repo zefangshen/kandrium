@@ -494,6 +494,7 @@ pub(crate) fn detail_body(
                                         mono_family,
                                         mono_size,
                                         t.accent.into(),
+                                        t.field.into(),
                                     )
                                     .absolute()
                                     .inset_0(),
