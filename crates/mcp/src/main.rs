@@ -1496,6 +1496,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(_) => {}
             Err(error) => core::logging::warn!("run sweep failed: {error}"),
         }
+        match core::history::gc::prune(
+            &db,
+            &store,
+            core::history::gc::DEFAULT_RETENTION,
+            core::history::run::now(),
+        ) {
+            Ok(report) if !report.pruned.is_empty() => core::logging::info!(
+                "pruned {} history run(s), freed {} bytes",
+                report.pruned.len(),
+                report.freed_bytes
+            ),
+            Ok(_) => {}
+            Err(error) => core::logging::warn!("history prune failed: {error}"),
+        }
     }
     core::logging::info!("DB: {}", db_path.display());
 

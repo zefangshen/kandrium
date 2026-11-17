@@ -51,6 +51,22 @@ pub struct Store {
     pub error: Option<String>,
 }
 
+/// Apply history retention at boot. Failures are logged, never fatal: a
+/// read-only or locked store must not stop the app from opening.
+fn prune_history(db: &rusqlite::Connection, path: &Path) {
+    use kandrium_core::history::{self, gc};
+    let store = history::HistoryStore::for_db(path);
+    match gc::prune(db, &store, gc::DEFAULT_RETENTION, history::run::now()) {
+        Ok(report) if !report.pruned.is_empty() => kandrium_core::logging::info!(
+            "pruned {} history run(s), freed {} bytes",
+            report.pruned.len(),
+            report.freed_bytes
+        ),
+        Ok(_) => {}
+        Err(error) => kandrium_core::logging::warn!("history prune failed: {error}"),
+    }
+}
+
 impl Store {
     /// Open the default database (or the `KANDRIUM_DB` override), migrating a
     /// legacy database first like the other front-ends.
@@ -92,6 +108,7 @@ impl Store {
                 error: Some(e.0),
             };
         }
+        prune_history(&write, &path);
         // The writable open above created the file, so the read-only handle
         // always has something to open.
         match open_db_readonly(&path) {

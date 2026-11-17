@@ -34,6 +34,9 @@ static MANIFEST_LOCK: Mutex<()> = Mutex::new(());
 pub struct RunContext {
     store: HistoryStore,
     run_id: String,
+    /// Remaining shared budget, overridable in tests so the ceiling can be
+    /// exercised without filling 2 GB.
+    budget: Option<u64>,
 }
 
 impl RunContext {
@@ -41,7 +44,14 @@ impl RunContext {
         Self {
             store,
             run_id: run_id.into(),
+            budget: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_budget(mut self, budget: u64) -> Self {
+        self.budget = Some(budget);
+        self
     }
 
     /// Context for a run recorded beside the connection's database file.
@@ -137,6 +147,12 @@ impl RunContext {
         let mut files = Vec::new();
         let mut links = Vec::new();
         let mut restorable = true;
+        // Room left under the shared ceiling. Entries beyond it are listed but
+        // not stored; the delete itself is never refused for budget alone.
+        let mut budget = match self.budget {
+            Some(budget) => budget,
+            None => super::gc::remaining_budget(&self.store)?,
+        };
 
         for item in walked {
             match item {
@@ -152,7 +168,19 @@ impl RunContext {
                     let (hash, ok, reason) = match kind {
                         WalkedFileKind::Regular if size <= MAX_FILE_BYTES => {
                             match fs::read(&absolute) {
-                                Ok(bytes) => (self.store.store_object(&bytes)?, true, None),
+                                Ok(bytes) => {
+                                    let shared =
+                                        self.store.has_object(&crate::wiki::hash_bytes(&bytes));
+                                    if !shared && budget < bytes.len() as u64 {
+                                        (String::new(), false, Some(UnrestorableReason::Budget))
+                                    } else {
+                                        let hash = self.store.store_object(&bytes)?;
+                                        if !shared {
+                                            budget = budget.saturating_sub(bytes.len() as u64);
+                                        }
+                                        (hash, true, None)
+                                    }
+                                }
                                 Err(error) => {
                                     crate::logging::warn!(
                                         "cannot read {} while capturing: {error}",
@@ -699,6 +727,37 @@ mod tests {
             .unwrap()
             .expect("manifest")
             .files
+    }
+
+    #[test]
+    fn a_tree_larger_than_the_budget_marks_only_the_overflow() {
+        let (_dir, ctx, root) = fixture();
+        let tree = root.join("project");
+        let small = tree.join("small.md");
+        let large = tree.join("large.bin");
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(&small, b"tiny").unwrap();
+        fs::write(&large, vec![9u8; 64]).unwrap();
+
+        // Enough for the directory entry and the small file, not the large one.
+        let ctx = ctx.with_budget(16);
+        let captured = ctx.capture_tree(RootKind::Projects, &root, &tree).unwrap();
+        assert!(!captured.restorable);
+
+        let entries = entries(&ctx);
+        let small = entries
+            .iter()
+            .find(|entry| entry.path.ends_with("small.md"))
+            .unwrap();
+        let large = entries
+            .iter()
+            .find(|entry| entry.path.ends_with("large.bin"))
+            .unwrap();
+        assert!(small.restorable, "the smaller file still captures");
+        assert!(ctx.store().has_object(&small.before.as_ref().unwrap().hash));
+        assert!(!large.restorable);
+        assert_eq!(large.reason, Some(UnrestorableReason::Budget));
+        assert!(!ctx.store().has_object(&large.before.as_ref().unwrap().hash));
     }
 
     #[test]
