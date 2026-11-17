@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use crate::db::uid;
 use crate::error::{KandriumError, Result};
 use crate::fsutil::{self, FsEntry};
+use crate::history::{RootKind, RunContext};
 
 /// Sidecar suffix appended to a PDF's file name.
 const SIDECAR_SUFFIX: &str = ".kandrium.json";
@@ -122,8 +123,25 @@ pub fn read_text(path: &Path, root: &Path) -> Result<String> {
 
 /// Write a Markdown document, guarded to the documents root.
 pub fn write_text(path: &Path, root: &Path, text: &str) -> Result<()> {
+    write_text_in_run(path, root, text, None)
+}
+
+/// Run-scoped variant of [`write_text`].
+pub fn write_text_in_run(
+    path: &Path,
+    root: &Path,
+    text: &str,
+    run: Option<&RunContext>,
+) -> Result<()> {
     let path = fsutil::guard(root, path)?;
+    let guard = match run {
+        Some(ctx) => Some(ctx.capture(RootKind::Documents, root, &path)?),
+        None => None,
+    };
     fsutil::write_atomic(&path, text)?;
+    if let Some(guard) = guard {
+        guard.commit(Some(text.as_bytes()))?;
+    }
     Ok(())
 }
 
@@ -143,6 +161,16 @@ pub fn create_folder(parent: &Path, root: &Path, name: &str) -> Result<PathBuf> 
 /// Create an empty Markdown file inside `parent`. A bare name gets `.md`;
 /// `.md` and `.markdown` are accepted. Returns the new file's absolute path.
 pub fn create_markdown(parent: &Path, root: &Path, name: &str) -> Result<PathBuf> {
+    create_markdown_in_run(parent, root, name, None)
+}
+
+/// Run-scoped variant of [`create_markdown`].
+pub fn create_markdown_in_run(
+    parent: &Path,
+    root: &Path,
+    name: &str,
+    run: Option<&RunContext>,
+) -> Result<PathBuf> {
     let parent = guarded_parent(parent, root)?;
     let mut name = validate_create_name(name)?.to_string();
     if Path::new(&name).extension().is_none() {
@@ -155,7 +183,14 @@ pub fn create_markdown(parent: &Path, root: &Path, name: &str) -> Result<PathBuf
     if target.exists() {
         return Err(KandriumError::new(format!("\"{name}\" already exists")));
     }
+    let guard = match run {
+        Some(ctx) => Some(ctx.capture(RootKind::Documents, root, &target)?),
+        None => None,
+    };
     fsutil::write_atomic(&target, "")?;
+    if let Some(guard) = guard {
+        guard.commit(Some(b""))?;
+    }
     Ok(target)
 }
 
@@ -188,6 +223,17 @@ fn validate_create_name(name: &str) -> Result<&str> {
 /// Returns the new path. Sidecars are not copied — an imported PDF starts
 /// without annotations.
 pub fn import_file(source: &Path, dest_dir: &Path, root: &Path) -> Result<PathBuf> {
+    import_file_in_run(source, dest_dir, root, None)
+}
+
+/// Run-scoped variant of [`import_file`]: the destination path is recorded as
+/// a create once the copy lands.
+pub fn import_file_in_run(
+    source: &Path,
+    dest_dir: &Path,
+    root: &Path,
+    run: Option<&RunContext>,
+) -> Result<PathBuf> {
     let dest_dir = fsutil::guard(root, dest_dir)?;
     if !dest_dir.is_dir() {
         return Err(KandriumError::new("Upload target is not a folder"));
@@ -204,7 +250,14 @@ pub fn import_file(source: &Path, dest_dir: &Path, root: &Path) -> Result<PathBu
         .file_name()
         .ok_or_else(|| KandriumError::new("Invalid file name"))?;
     let target = unique_target(&dest_dir, Path::new(name));
+    let guard = match run {
+        Some(ctx) => Some(ctx.capture(RootKind::Documents, root, &target)?),
+        None => None,
+    };
     fs::copy(source, &target)?;
+    if let Some(guard) = guard {
+        guard.commit_file()?;
+    }
     Ok(target)
 }
 
@@ -266,18 +319,43 @@ pub fn load_annotations(pdf: &Path, root: &Path) -> Result<AnnotationDoc> {
 /// Atomically persist a PDF's annotations. An empty document removes the
 /// sidecar so fully un-annotated PDFs stay clean.
 pub fn save_annotations(pdf: &Path, root: &Path, doc: &AnnotationDoc) -> Result<()> {
+    save_annotations_in_run(pdf, root, doc, None)
+}
+
+/// Run-scoped variant of [`save_annotations`]: the sidecar is captured whether
+/// it is rewritten or removed.
+pub fn save_annotations_in_run(
+    pdf: &Path,
+    root: &Path,
+    doc: &AnnotationDoc,
+    run: Option<&RunContext>,
+) -> Result<()> {
     let pdf = fsutil::guard(root, pdf)?;
     let sidecar = annotations_path(&pdf);
     if doc.annotations.is_empty() {
         if sidecar.exists() {
+            let guard = match run {
+                Some(ctx) => Some(ctx.capture(RootKind::Documents, root, &sidecar)?),
+                None => None,
+            };
             fs::remove_file(&sidecar)?;
+            if let Some(guard) = guard {
+                guard.commit(None)?;
+            }
         }
         return Ok(());
     }
     let json = serde_json::to_string_pretty(doc)
         .map_err(|e| KandriumError::new(format!("Cannot serialize annotations: {e}")))?;
+    let guard = match run {
+        Some(ctx) => Some(ctx.capture(RootKind::Documents, root, &sidecar)?),
+        None => None,
+    };
     // Atomic write: never leave a half-written sidecar behind.
-    fsutil::write_atomic(&sidecar, json)?;
+    fsutil::write_atomic(&sidecar, &json)?;
+    if let Some(guard) = guard {
+        guard.commit(Some(json.as_bytes()))?;
+    }
     Ok(())
 }
 
@@ -304,14 +382,59 @@ pub fn new_annotation(
 /// Rename a file or directory in place (same parent). When the target is a
 /// PDF, its sidecar moves with it (when one exists).
 pub fn rename_path(path: &Path, root: &Path, new_name: &str) -> Result<PathBuf> {
+    rename_path_in_run(path, root, new_name, None)
+}
+
+/// Run-scoped variant of [`rename_path`]. A PDF's sidecar is captured and
+/// moved with it; a directory rename captures both trees.
+pub fn rename_path_in_run(
+    path: &Path,
+    root: &Path,
+    new_name: &str,
+    run: Option<&RunContext>,
+) -> Result<PathBuf> {
     let path = fsutil::guard(root, path)?;
-    let sidecar = path.is_file() && is_pdf(&path);
-    let sidecar_from = sidecar.then(|| annotations_path(&path));
+    let is_dir = path.is_dir();
+    let sidecar_from = (path.is_file() && is_pdf(&path)).then(|| annotations_path(&path));
+    let mut old_guard = None;
+    let mut old_sidecar_guard = None;
+    if let Some(ctx) = run {
+        if is_dir {
+            ctx.capture_tree(RootKind::Documents, root, &path)?;
+        } else {
+            old_guard = Some(ctx.capture(RootKind::Documents, root, &path)?);
+            if let Some(from) = &sidecar_from
+                && from.exists()
+            {
+                old_sidecar_guard = Some(ctx.capture(RootKind::Documents, root, from)?);
+            }
+        }
+    }
+
     let new_path = crate::notes::rename_in_root(&path, root, new_name)?;
-    if let Some(from) = sidecar_from {
+    if let Some(from) = &sidecar_from {
         let to = annotations_path(&new_path);
         if from.exists() {
-            fs::rename(&from, &to)?;
+            fs::rename(from, &to)?;
+        }
+    }
+    if let Some(ctx) = run {
+        if is_dir {
+            ctx.record_tree(RootKind::Documents, root, &new_path)?;
+        } else {
+            if let Some(guard) = old_sidecar_guard {
+                guard.commit(None)?;
+            }
+            if let Some(guard) = old_guard {
+                guard.commit(None)?;
+            }
+            ctx.record_created(RootKind::Documents, root, &new_path)?;
+            if sidecar_from.is_some() {
+                let to = annotations_path(&new_path);
+                if to.exists() {
+                    ctx.record_created(RootKind::Documents, root, &to)?;
+                }
+            }
         }
     }
     Ok(new_path)
@@ -320,20 +443,46 @@ pub fn rename_path(path: &Path, root: &Path, new_name: &str) -> Result<PathBuf> 
 /// Delete a file or directory (recursively). The documents root itself
 /// cannot be deleted. Deleting a PDF removes its sidecar.
 pub fn delete_path(path: &Path, root: &Path) -> Result<()> {
+    delete_path_in_run(path, root, None)
+}
+
+/// Run-scoped variant of [`delete_path`]. A directory is enumerated in full
+/// before removal, including PDFs and their sidecars.
+pub fn delete_path_in_run(path: &Path, root: &Path, run: Option<&RunContext>) -> Result<()> {
     let path = fsutil::guard(root, path)?;
     if path == fsutil::canonical_root(root)? {
         return Err(KandriumError::new("Cannot delete the documents root"));
     }
-    if path.is_file() && is_pdf(&path) {
-        let sidecar = annotations_path(&path);
-        if sidecar.exists() {
-            fs::remove_file(&sidecar)?;
-        }
-    }
     if path.is_dir() {
+        if let Some(ctx) = run {
+            ctx.capture_tree(RootKind::Documents, root, &path)?;
+        }
         fs::remove_dir_all(path)?;
-    } else {
-        fs::remove_file(path)?;
+        return Ok(());
+    }
+
+    let sidecar = (path.is_file() && is_pdf(&path)).then(|| annotations_path(&path));
+    let pdf_guard = match run {
+        Some(ctx) => Some(ctx.capture(RootKind::Documents, root, &path)?),
+        None => None,
+    };
+    let sidecar_guard = match (run, &sidecar) {
+        (Some(ctx), Some(sidecar)) if sidecar.exists() => {
+            Some(ctx.capture(RootKind::Documents, root, sidecar)?)
+        }
+        _ => None,
+    };
+    if let Some(sidecar) = &sidecar
+        && sidecar.exists()
+    {
+        fs::remove_file(sidecar)?;
+    }
+    fs::remove_file(&path)?;
+    if let Some(guard) = sidecar_guard {
+        guard.commit(None)?;
+    }
+    if let Some(guard) = pdf_guard {
+        guard.commit(None)?;
     }
     Ok(())
 }
@@ -363,6 +512,111 @@ mod tests {
         let root = tmp.path().join("documents");
         fs::create_dir_all(&root).unwrap();
         Fixture { _tmp: tmp, root }
+    }
+
+    fn run_ctx(f: &Fixture) -> RunContext {
+        let store = crate::history::HistoryStore::new(f._tmp.path().join("history"));
+        RunContext::new(store, "run1")
+    }
+
+    #[test]
+    fn run_scoped_sidecars_are_captured_on_write_and_delete() {
+        let f = fixture();
+        let ctx = run_ctx(&f);
+        let pdf = f.root.join("paper.pdf");
+        fs::write(&pdf, b"%PDF-1.4 fake").unwrap();
+
+        let mut doc = AnnotationDoc::default();
+        doc.annotations.push(new_annotation(
+            AnnotationKind::Highlight,
+            1,
+            vec![[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]],
+            "#f2c94c",
+        ));
+        save_annotations_in_run(&pdf, &f.root, &doc, Some(&ctx)).unwrap();
+        save_annotations_in_run(&pdf, &f.root, &AnnotationDoc::default(), Some(&ctx)).unwrap();
+
+        let manifest = ctx.store().load(ctx.run_id()).unwrap().unwrap();
+        assert_eq!(manifest.files.len(), 2);
+        let sidecar = annotations_path(&pdf);
+        let relative = sidecar
+            .strip_prefix(&f.root)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(manifest.files[0].path, relative);
+        assert_eq!(manifest.files[0].op, crate::history::FileOp::Create);
+        assert_eq!(manifest.files[1].op, crate::history::FileOp::Delete);
+        assert!(!sidecar.exists());
+        // Deleting the sidecar stored its bytes, so undo can bring it back.
+        let before = manifest.files[1].before.as_ref().unwrap();
+        assert!(ctx.store().read_object(&before.hash).is_ok());
+    }
+
+    #[test]
+    fn run_scoped_pdf_delete_captures_pdf_and_sidecar() {
+        let f = fixture();
+        let ctx = run_ctx(&f);
+        let pdf = f.root.join("paper.pdf");
+        fs::write(&pdf, b"%PDF-1.4 fake").unwrap();
+        let mut doc = AnnotationDoc::default();
+        doc.annotations
+            .push(new_annotation(AnnotationKind::Note, 2, vec![], "#56ccf2"));
+        save_annotations(&pdf, &f.root, &doc).unwrap();
+
+        delete_path_in_run(&pdf, &f.root, Some(&ctx)).unwrap();
+        assert!(!pdf.exists());
+        assert!(!annotations_path(&pdf).exists());
+
+        let manifest = ctx.store().load(ctx.run_id()).unwrap().unwrap();
+        assert_eq!(manifest.files.len(), 2);
+        assert!(
+            manifest
+                .files
+                .iter()
+                .all(|entry| entry.op == crate::history::FileOp::Delete)
+        );
+        assert!(
+            manifest
+                .files
+                .iter()
+                .any(|entry| entry.path.ends_with("paper.pdf"))
+        );
+        assert!(
+            manifest
+                .files
+                .iter()
+                .any(|entry| entry.path.ends_with(".pdf.kandrium.json"))
+        );
+    }
+
+    #[test]
+    fn run_scoped_import_and_markdown_create_are_captured() {
+        let f = fixture();
+        let ctx = run_ctx(&f);
+        let src_dir = f._tmp.path().join("incoming");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("report.pdf"), b"%PDF-1.4 incoming").unwrap();
+
+        let imported =
+            import_file_in_run(&src_dir.join("report.pdf"), &f.root, &f.root, Some(&ctx)).unwrap();
+        let created = create_markdown_in_run(&f.root, &f.root, "notes", Some(&ctx)).unwrap();
+
+        let manifest = ctx.store().load(ctx.run_id()).unwrap().unwrap();
+        assert_eq!(manifest.files.len(), 2);
+        for entry in &manifest.files {
+            assert_eq!(entry.op, crate::history::FileOp::Create);
+            assert!(entry.before.is_none());
+            assert!(entry.after.as_ref().unwrap().hash.len() == 64);
+        }
+        assert!(
+            manifest
+                .files
+                .iter()
+                .any(|entry| entry.path == "report.pdf")
+        );
+        assert!(manifest.files.iter().any(|entry| entry.path == "notes.md"));
+        assert!(imported.exists() && created.exists());
     }
 
     #[test]

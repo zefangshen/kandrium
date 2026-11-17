@@ -15,7 +15,7 @@ pub mod capture;
 pub mod rows;
 pub mod store;
 
-pub use capture::{CaptureGuard, RunContext};
+pub use capture::{CaptureGuard, RunContext, TreeCapture};
 pub use rows::{CAPTURED_TABLES, RowEnd, RowSession, captured_tables, row_begin};
 pub use store::{HISTORY_DIR, HistoryStore};
 

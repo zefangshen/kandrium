@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{KandriumError, Result};
 use crate::fsutil::{self, FsEntry};
+use crate::history::{RootKind, RunContext};
 
 /// One node in the notes tree.
 pub type NoteEntry = FsEntry;
@@ -48,8 +49,26 @@ pub fn read_note(path: &Path, root: &Path) -> Result<String> {
 }
 
 pub fn write_note(path: &Path, root: &Path, text: &str) -> Result<()> {
+    write_note_in_run(path, root, text, None)
+}
+
+/// Run-scoped variant of [`write_note`]: captures the previous bytes before
+/// the write and records the after-image.
+pub fn write_note_in_run(
+    path: &Path,
+    root: &Path,
+    text: &str,
+    run: Option<&RunContext>,
+) -> Result<()> {
     let path = fsutil::guard(root, path)?;
+    let guard = match run {
+        Some(ctx) => Some(ctx.capture(RootKind::Notes, root, &path)?),
+        None => None,
+    };
     fsutil::write_atomic(&path, text)?;
+    if let Some(guard) = guard {
+        guard.commit(Some(text.as_bytes()))?;
+    }
     Ok(())
 }
 
@@ -94,7 +113,40 @@ pub fn create_folder(root: &Path, in_dir: &Path) -> Result<PathBuf> {
 /// Rename a file or directory in place (same parent). `new_name` must be a
 /// bare file name — separators are rejected. Returns the new path.
 pub fn rename_path(path: &Path, root: &Path, new_name: &str) -> Result<PathBuf> {
-    rename_in_root(path, root, new_name)
+    rename_path_in_run(path, root, new_name, None)
+}
+
+/// Run-scoped variant of [`rename_path`]. A rename is recorded as a delete of
+/// the old path plus a create of the new one; a directory rename captures both
+/// trees.
+pub fn rename_path_in_run(
+    path: &Path,
+    root: &Path,
+    new_name: &str,
+    run: Option<&RunContext>,
+) -> Result<PathBuf> {
+    let path = fsutil::guard(root, path)?;
+    let is_dir = path.is_dir();
+    let old_guard = match run {
+        Some(ctx) if !is_dir => Some(ctx.capture(RootKind::Notes, root, &path)?),
+        Some(ctx) => {
+            ctx.capture_tree(RootKind::Notes, root, &path)?;
+            None
+        }
+        None => None,
+    };
+    let target = rename_in_root(&path, root, new_name)?;
+    if let Some(ctx) = run {
+        if is_dir {
+            ctx.record_tree(RootKind::Notes, root, &target)?;
+        } else {
+            if let Some(guard) = old_guard {
+                guard.commit(None)?;
+            }
+            ctx.record_created(RootKind::Notes, root, &target)?;
+        }
+    }
+    Ok(target)
 }
 
 /// Create an empty note named `name` inside `in_dir`.
@@ -151,14 +203,30 @@ fn bare_name(name: &str) -> Result<&str> {
 /// Delete a file or directory (recursively). The notes root itself cannot
 /// be deleted.
 pub fn delete_path(path: &Path, root: &Path) -> Result<()> {
+    delete_path_in_run(path, root, None)
+}
+
+/// Run-scoped variant of [`delete_path`]. A directory is enumerated in full
+/// before removal; a single file captures its bytes first.
+pub fn delete_path_in_run(path: &Path, root: &Path, run: Option<&RunContext>) -> Result<()> {
     let path = fsutil::guard(root, path)?;
     if path == fsutil::canonical_root(root)? {
         return Err(KandriumError::new("Cannot delete the notes root"));
     }
     if path.is_dir() {
+        if let Some(ctx) = run {
+            ctx.capture_tree(RootKind::Notes, root, &path)?;
+        }
         fs::remove_dir_all(path)?;
     } else {
-        fs::remove_file(path)?;
+        let guard = match run {
+            Some(ctx) => Some(ctx.capture(RootKind::Notes, root, &path)?),
+            None => None,
+        };
+        fs::remove_file(&path)?;
+        if let Some(guard) = guard {
+            guard.commit(None)?;
+        }
     }
     Ok(())
 }
@@ -280,5 +348,79 @@ mod tests {
         let other = create_note(&f.root, &f.root).unwrap();
         let taken = other.file_name().unwrap().to_string_lossy().to_string();
         assert!(rename_path(&note, &f.root, &taken).is_err());
+    }
+
+    fn run_ctx(f: &Fixture) -> RunContext {
+        let store = crate::history::HistoryStore::new(f._tmp.path().join("history"));
+        RunContext::new(store, "run1")
+    }
+
+    #[test]
+    fn run_scoped_writes_renames_and_deletes_are_captured() {
+        let f = fixture();
+        let ctx = run_ctx(&f);
+        let note = f.root.join("topic.md");
+        fs::write(&note, "one").unwrap();
+
+        write_note_in_run(&note, &f.root, "two", Some(&ctx)).unwrap();
+        write_note_in_run(&note, &f.root, "two", Some(&ctx)).unwrap();
+        let renamed = rename_path_in_run(&note, &f.root, "renamed.md", Some(&ctx)).unwrap();
+        delete_path_in_run(&renamed, &f.root, Some(&ctx)).unwrap();
+
+        let manifest = ctx.store().load(ctx.run_id()).unwrap().unwrap();
+        let ops: Vec<(String, crate::history::FileOp)> = manifest
+            .files
+            .iter()
+            .map(|entry| (entry.path.clone(), entry.op))
+            .collect();
+        assert_eq!(
+            ops,
+            vec![
+                ("topic.md".to_string(), crate::history::FileOp::Modify),
+                ("topic.md".to_string(), crate::history::FileOp::Delete),
+                ("renamed.md".to_string(), crate::history::FileOp::Create),
+                ("renamed.md".to_string(), crate::history::FileOp::Delete),
+            ]
+        );
+        // A rename records the delete before the create, so reverse order
+        // removes the new path and then restores the old one.
+        let pre_image = manifest.files[1].before.as_ref().unwrap();
+        assert_eq!(ctx.store().read_object(&pre_image.hash).unwrap(), b"two");
+    }
+
+    #[test]
+    fn run_scoped_directory_delete_captures_the_whole_tree() {
+        let f = fixture();
+        let ctx = run_ctx(&f);
+        let dir = f.root.join("archive");
+        fs::create_dir_all(dir.join("nested")).unwrap();
+        fs::write(dir.join("a.md"), "a").unwrap();
+        fs::write(dir.join("nested").join("b.md"), "b").unwrap();
+
+        delete_path_in_run(&dir, &f.root, Some(&ctx)).unwrap();
+        assert!(!dir.exists());
+
+        let manifest = ctx.store().load(ctx.run_id()).unwrap().unwrap();
+        assert_eq!(manifest.files.len(), 2);
+        assert!(
+            manifest
+                .files
+                .iter()
+                .all(|entry| { entry.op == crate::history::FileOp::Delete && entry.restorable })
+        );
+        assert!(manifest.dirs.iter().any(|entry| entry.path == "archive"));
+        assert!(
+            manifest
+                .dirs
+                .iter()
+                .any(|entry| entry.path == "archive/nested")
+        );
+        for entry in &manifest.files {
+            let bytes = ctx
+                .store()
+                .read_object(&entry.before.as_ref().unwrap().hash)
+                .unwrap();
+            assert!(bytes == b"a" || bytes == b"b");
+        }
     }
 }

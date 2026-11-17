@@ -17,11 +17,12 @@ use std::sync::Mutex;
 
 use crate::error::{KandriumError, Result};
 use crate::fsutil;
-use crate::wiki::hash_bytes;
+use crate::wiki::{hash_bytes, hash_file};
 
 use super::store::HistoryStore;
 use super::{
-    BlobMeta, FileEntry, FileOp, MAX_FILE_BYTES, Manifest, RootKind, RunKind, UnrestorableReason,
+    BlobMeta, DirEntry, DirOp, FileEntry, FileOp, LinkEntry, MAX_FILE_BYTES, Manifest, RootKind,
+    RunKind, UnrestorableReason,
 };
 
 /// Manifest rewrites are serialized in-process. Cross-process exclusion comes
@@ -118,6 +119,268 @@ impl RunContext {
         })
     }
 
+    /// Enumerate a directory tree and record it as a deletion before it is
+    /// removed: a pre-image per regular file, an entry per directory (including
+    /// empty ones), and a target per symlink. The walk runs to completion
+    /// before anything is deleted, so an interrupted deletion still has a
+    /// complete manifest.
+    pub fn capture_tree(
+        &self,
+        root: RootKind,
+        root_path: &Path,
+        dir: &Path,
+    ) -> Result<TreeCapture> {
+        let canonical_root = fsutil::canonical_root(root_path)?;
+        let dir = fsutil::guard(&canonical_root, dir)?;
+        if !dir.is_dir() {
+            return Err(KandriumError(format!("not a directory: {}", dir.display())));
+        }
+        let walked = walk(&canonical_root, &dir)?;
+        let captured_at = now();
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        let mut links = Vec::new();
+        let mut restorable = true;
+
+        for item in walked {
+            match item {
+                Walked::Dir { rel, mode, empty } => dirs.push((rel, mode, empty)),
+                Walked::Link { rel, target } => links.push((rel, target)),
+                Walked::File {
+                    rel,
+                    absolute,
+                    mode,
+                    size,
+                    kind,
+                } => {
+                    let (hash, ok, reason) = match kind {
+                        WalkedFileKind::Regular if size <= MAX_FILE_BYTES => {
+                            match fs::read(&absolute) {
+                                Ok(bytes) => (self.store.store_object(&bytes)?, true, None),
+                                Err(error) => {
+                                    crate::logging::warn!(
+                                        "cannot read {} while capturing: {error}",
+                                        absolute.display()
+                                    );
+                                    (String::new(), false, Some(UnrestorableReason::Unreadable))
+                                }
+                            }
+                        }
+                        WalkedFileKind::Regular => {
+                            (String::new(), false, Some(UnrestorableReason::Oversize))
+                        }
+                        WalkedFileKind::Special => {
+                            (String::new(), false, Some(UnrestorableReason::Special))
+                        }
+                    };
+                    restorable &= ok;
+                    files.push((
+                        rel,
+                        BlobMeta { hash, mode, size },
+                        size > MAX_FILE_BYTES,
+                        ok,
+                        reason,
+                    ));
+                }
+            }
+        }
+
+        let (files_len, dirs_len, links_len) = (files.len(), dirs.len(), links.len());
+        self.update_run(|manifest| {
+            for (rel, mode, empty) in dirs {
+                let seq = next_seq(manifest);
+                manifest.dirs.push(DirEntry {
+                    seq,
+                    root,
+                    path: rel,
+                    op: DirOp::Rmdir,
+                    mode,
+                    empty,
+                    captured_at,
+                });
+            }
+            for (rel, before, oversize, ok, reason) in files {
+                let seq = next_seq(manifest);
+                manifest.files.push(FileEntry {
+                    seq,
+                    root,
+                    path: rel,
+                    op: FileOp::Delete,
+                    before: Some(before),
+                    after: None,
+                    captured_at,
+                    oversize,
+                    restorable: ok,
+                    reason,
+                    sidecar: false,
+                });
+            }
+            for (rel, target) in links {
+                let seq = next_seq(manifest);
+                manifest.links.push(LinkEntry {
+                    seq,
+                    root,
+                    path: rel,
+                    target,
+                    captured_at,
+                });
+            }
+            Ok(())
+        })?;
+
+        Ok(TreeCapture {
+            files: files_len,
+            dirs: dirs_len,
+            links: links_len,
+            restorable,
+        })
+    }
+
+    /// Record a newly created file that already exists on disk (for example
+    /// the destination of an import).
+    pub fn record_created(&self, root: RootKind, root_path: &Path, path: &Path) -> Result<()> {
+        let canonical_root = fsutil::canonical_root(root_path)?;
+        let path = fsutil::guard(&canonical_root, path)?;
+        if !path.is_file() {
+            return Err(KandriumError(format!(
+                "not a regular file: {}",
+                path.display()
+            )));
+        }
+        self.push_created_file(root, &canonical_root, &path, now())
+    }
+
+    /// Record a newly created tree (for example a renamed directory) as
+    /// `mkdir` directories plus `create` files and links.
+    pub fn record_tree(&self, root: RootKind, root_path: &Path, dir: &Path) -> Result<TreeCapture> {
+        let canonical_root = fsutil::canonical_root(root_path)?;
+        let dir = fsutil::guard(&canonical_root, dir)?;
+        if !dir.is_dir() {
+            return Err(KandriumError(format!("not a directory: {}", dir.display())));
+        }
+        let walked = walk(&canonical_root, &dir)?;
+        let captured_at = now();
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        let mut links = Vec::new();
+        let mut restorable = true;
+
+        for item in walked {
+            match item {
+                Walked::Dir { rel, mode, empty } => dirs.push((rel, mode, empty)),
+                Walked::Link { rel, target } => links.push((rel, target)),
+                Walked::File {
+                    rel,
+                    absolute,
+                    mode,
+                    size,
+                    kind,
+                } => {
+                    let (hash, ok, reason) = match kind {
+                        WalkedFileKind::Regular => match hash_file(&absolute) {
+                            Ok(hash) => (hash, true, None),
+                            Err(error) => {
+                                crate::logging::warn!(
+                                    "cannot hash {} while recording: {error}",
+                                    absolute.display()
+                                );
+                                (String::new(), false, Some(UnrestorableReason::Unreadable))
+                            }
+                        },
+                        WalkedFileKind::Special => {
+                            (String::new(), false, Some(UnrestorableReason::Special))
+                        }
+                    };
+                    restorable &= ok;
+                    files.push((rel, BlobMeta { hash, mode, size }, ok, reason));
+                }
+            }
+        }
+
+        let (files_len, dirs_len, links_len) = (files.len(), dirs.len(), links.len());
+        self.update_run(|manifest| {
+            for (rel, mode, empty) in dirs {
+                let seq = next_seq(manifest);
+                manifest.dirs.push(DirEntry {
+                    seq,
+                    root,
+                    path: rel,
+                    op: DirOp::Mkdir,
+                    mode,
+                    empty,
+                    captured_at,
+                });
+            }
+            for (rel, after, ok, reason) in files {
+                let seq = next_seq(manifest);
+                manifest.files.push(FileEntry {
+                    seq,
+                    root,
+                    path: rel,
+                    op: FileOp::Create,
+                    before: None,
+                    after: Some(after),
+                    captured_at,
+                    oversize: false,
+                    restorable: ok,
+                    reason,
+                    sidecar: false,
+                });
+            }
+            for (rel, target) in links {
+                let seq = next_seq(manifest);
+                manifest.links.push(LinkEntry {
+                    seq,
+                    root,
+                    path: rel,
+                    target,
+                    captured_at,
+                });
+            }
+            Ok(())
+        })?;
+
+        Ok(TreeCapture {
+            files: files_len,
+            dirs: dirs_len,
+            links: links_len,
+            restorable,
+        })
+    }
+
+    fn push_created_file(
+        &self,
+        root: RootKind,
+        canonical_root: &Path,
+        path: &Path,
+        captured_at: i64,
+    ) -> Result<()> {
+        let rel = relative_path(canonical_root, path)?;
+        let metadata = fs::metadata(path)?;
+        let after = BlobMeta {
+            hash: hash_file(path)?,
+            mode: mode_of(path),
+            size: metadata.len(),
+        };
+        self.update_run(|manifest| {
+            let seq = next_seq(manifest);
+            manifest.files.push(FileEntry {
+                seq,
+                root,
+                path: rel,
+                op: FileOp::Create,
+                before: None,
+                after: Some(after),
+                captured_at,
+                oversize: false,
+                restorable: true,
+                reason: None,
+                sidecar: false,
+            });
+            Ok(())
+        })
+    }
+
     /// Load-or-create the manifest and apply `change` under the in-process
     /// manifest lock, then save it atomically.
     fn update_run<T>(&self, change: impl FnOnce(&mut Manifest) -> Result<T>) -> Result<T> {
@@ -169,6 +432,27 @@ impl CaptureGuard {
     /// A byte-identical write is dropped from the manifest: it changed nothing
     /// and does not belong in history.
     pub fn commit(self, new_bytes: Option<&[u8]>) -> Result<()> {
+        let after = new_bytes.map(|bytes| BlobMeta {
+            hash: hash_bytes(bytes),
+            mode: mode_of(&self.absolute),
+            size: bytes.len() as u64,
+        });
+        self.finish(after)
+    }
+
+    /// Record the after-image of a file the run created by copying or renaming,
+    /// without loading it into memory.
+    pub fn commit_file(self) -> Result<()> {
+        let metadata = fs::metadata(&self.absolute)?;
+        let after = Some(BlobMeta {
+            hash: hash_file(&self.absolute)?,
+            mode: mode_of(&self.absolute),
+            size: metadata.len(),
+        });
+        self.finish(after)
+    }
+
+    fn finish(self, after: Option<BlobMeta>) -> Result<()> {
         let _lock = MANIFEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(mut manifest) = self.store.load(&self.run_id)? else {
             return Err(KandriumError(format!(
@@ -188,17 +472,12 @@ impl CaptureGuard {
                 ))
             })?;
 
-        match new_bytes {
-            Some(bytes) => {
-                let after_hash = hash_bytes(bytes);
-                if self.before_hash.as_deref() == Some(after_hash.as_str()) {
+        match after {
+            Some(after) => {
+                if self.before_hash.as_deref() == Some(after.hash.as_str()) {
                     manifest.files.remove(index);
                 } else {
-                    manifest.files[index].after = Some(BlobMeta {
-                        hash: after_hash,
-                        mode: mode_of(&self.absolute),
-                        size: bytes.len() as u64,
-                    });
+                    manifest.files[index].after = Some(after);
                 }
             }
             None if self.before_present => {
@@ -305,6 +584,105 @@ fn now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// What [`RunContext::capture_tree`] and [`RunContext::record_tree`] recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeCapture {
+    pub files: usize,
+    pub dirs: usize,
+    pub links: usize,
+    /// False when at least one entry is unrestorable (oversize, unreadable,
+    /// special), which is the only thing that makes the run `partial`.
+    pub restorable: bool,
+}
+
+enum Walked {
+    Dir {
+        rel: String,
+        mode: u32,
+        empty: bool,
+    },
+    File {
+        rel: String,
+        absolute: PathBuf,
+        mode: u32,
+        size: u64,
+        kind: WalkedFileKind,
+    },
+    Link {
+        rel: String,
+        target: String,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WalkedFileKind {
+    Regular,
+    /// FIFO, socket, device, or anything else that is not a regular file.
+    Special,
+}
+
+/// Enumerate a tree without following symlinks. Directories come before their
+/// children; entries within a directory are sorted by name for stable output.
+/// An unreadable directory aborts the walk so nothing gets deleted that could
+/// not be captured.
+fn walk(root: &Path, dir: &Path) -> Result<Vec<Walked>> {
+    let mut out = Vec::new();
+    walk_dir(root, dir, &mut out)?;
+    Ok(out)
+}
+
+fn walk_dir(root: &Path, dir: &Path, out: &mut Vec<Walked>) -> Result<()> {
+    let mut entries = fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    out.push(Walked::Dir {
+        rel: relative_path(root, dir)?,
+        mode: mode_of(dir),
+        empty: entries.is_empty(),
+    });
+    for entry in entries {
+        let path = entry.path();
+        let rel = relative_path(root, &path)?;
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                // A vanished or unreadable entry is recorded as unrestorable
+                // instead of aborting the whole capture.
+                crate::logging::warn!("cannot inspect {}: {error}", path.display());
+                out.push(Walked::File {
+                    rel,
+                    absolute: path,
+                    mode: 0,
+                    size: 0,
+                    kind: WalkedFileKind::Special,
+                });
+                continue;
+            }
+        };
+        if file_type.is_symlink() {
+            let target = fs::read_link(&path)?;
+            out.push(Walked::Link {
+                rel,
+                target: target.to_string_lossy().into_owned(),
+            });
+        } else if file_type.is_dir() {
+            walk_dir(root, &path, out)?;
+        } else {
+            let (size, kind) = match entry.metadata() {
+                Ok(metadata) if file_type.is_file() => (metadata.len(), WalkedFileKind::Regular),
+                _ => (0, WalkedFileKind::Special),
+            };
+            out.push(Walked::File {
+                rel,
+                absolute: path,
+                mode: mode_of(&entry.path()),
+                size,
+                kind,
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -449,5 +827,126 @@ mod tests {
         let outside = dir.path().join("outside.md");
         fs::write(&outside, "x").unwrap();
         assert!(ctx.capture(RootKind::Wiki, &root, &outside).is_err());
+    }
+
+    #[test]
+    fn capture_tree_records_files_dirs_and_links_before_removal() {
+        use std::io::Write;
+
+        let (_dir, ctx, root) = fixture();
+        let papers = root.join("papers");
+        fs::create_dir_all(papers.join("2026")).unwrap();
+        fs::create_dir_all(papers.join("empty")).unwrap();
+        fs::write(papers.join("2026").join("a.md"), "paper").unwrap();
+        let mut huge = fs::File::create(papers.join("huge.bin")).unwrap();
+        huge.set_len(MAX_FILE_BYTES + 1).unwrap();
+        huge.write_all(b"x").unwrap();
+        std::os::unix::fs::symlink("2026", papers.join("current")).unwrap();
+
+        let captured = ctx
+            .capture_tree(RootKind::Projects, &root, &papers)
+            .unwrap();
+        assert_eq!(
+            captured,
+            TreeCapture {
+                files: 2,
+                dirs: 3,
+                links: 1,
+                restorable: false,
+            }
+        );
+
+        // The manifest is complete while the tree still exists.
+        let manifest = ctx.store().load(ctx.run_id()).unwrap().unwrap();
+        let dirs: Vec<(&str, bool)> = manifest
+            .dirs
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry.empty))
+            .collect();
+        assert_eq!(
+            dirs,
+            vec![
+                ("papers", false),
+                ("papers/2026", false),
+                ("papers/empty", true)
+            ]
+        );
+        assert!(manifest.dirs.iter().all(|entry| entry.op == DirOp::Rmdir));
+
+        let file = manifest
+            .files
+            .iter()
+            .find(|entry| entry.path.ends_with("a.md"))
+            .unwrap();
+        assert_eq!(file.op, FileOp::Delete);
+        assert_eq!(
+            ctx.store()
+                .read_object(&file.before.as_ref().unwrap().hash)
+                .unwrap(),
+            b"paper"
+        );
+
+        let oversize = manifest
+            .files
+            .iter()
+            .find(|entry| entry.path.ends_with("huge.bin"))
+            .unwrap();
+        assert!(oversize.oversize);
+        assert!(!oversize.restorable);
+        assert_eq!(oversize.reason, Some(UnrestorableReason::Oversize));
+
+        let link = &manifest.links[0];
+        assert_eq!(link.path, "papers/current");
+        assert_eq!(link.target, "2026");
+
+        fs::remove_dir_all(&papers).unwrap();
+        assert!(ctx.store().load(ctx.run_id()).unwrap().is_some());
+    }
+
+    #[test]
+    fn record_tree_marks_new_directories_and_files() {
+        let (_dir, ctx, root) = fixture();
+        let renamed = root.join("renamed");
+        fs::create_dir_all(renamed.join("inner")).unwrap();
+        fs::write(renamed.join("inner").join("b.md"), "new").unwrap();
+
+        let recorded = ctx.record_tree(RootKind::Notes, &root, &renamed).unwrap();
+        assert_eq!(
+            recorded,
+            TreeCapture {
+                files: 1,
+                dirs: 2,
+                links: 0,
+                restorable: true,
+            }
+        );
+        let manifest = ctx.store().load(ctx.run_id()).unwrap().unwrap();
+        assert!(manifest.dirs.iter().all(|entry| entry.op == DirOp::Mkdir));
+        let file = &manifest.files[0];
+        assert_eq!(file.op, FileOp::Create);
+        assert!(file.before.is_none());
+        assert_eq!(file.after.as_ref().unwrap().hash, hash_bytes(b"new"));
+    }
+
+    #[test]
+    fn record_created_and_commit_file_hash_without_loading_bytes() {
+        let (_dir, ctx, root) = fixture();
+        let target = root.join("imported.pdf");
+        let guard = ctx.capture(RootKind::Documents, &root, &target).unwrap();
+        fs::write(&target, b"%PDF-1.4 fake").unwrap();
+        assert!(guard.before_hash().is_none());
+        guard.commit_file().unwrap();
+        let entry = &entries(&ctx)[0];
+        assert_eq!(entry.op, FileOp::Create);
+        assert_eq!(
+            entry.after.as_ref().unwrap().hash,
+            hash_bytes(b"%PDF-1.4 fake")
+        );
+
+        let second = root.join("renamed.pdf");
+        fs::rename(&target, &second).unwrap();
+        ctx.record_created(RootKind::Documents, &root, &second)
+            .unwrap();
+        assert_eq!(entries(&ctx).len(), 2);
     }
 }
