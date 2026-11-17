@@ -16,7 +16,7 @@ use crate::error::{KandriumError, Result};
 use super::restore::{FileUndoReport, Roots, restore_files};
 use super::rows::{self, CAPTURED_TABLES, TableSpec};
 use super::store::HistoryStore;
-use super::{ChangeOp, ClosedBy, Manifest, RowDiff, RowsMeta, RunState};
+use super::{ChangeOp, Manifest, RowDiff, RowsMeta, RunState};
 
 /// One row key the restore refused because it changed after the run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +112,14 @@ pub fn undo_run(
         RunState::Committed | RunState::FilesRestored => {}
     }
 
+    // A fresh run may still write the same rows; undo would race its owner.
+    if let Some(open) = super::run::open_run(db, store)? {
+        return Err(KandriumError(format!(
+            "close the open run first: {}",
+            open.label
+        )));
+    }
+
     // Row preflight runs first: a row conflict must abort before files change.
     let mut rows_report = RowUndoReport::default();
     if let Some(meta) = &manifest.rows {
@@ -199,35 +207,6 @@ pub fn undo_run(
         rows: rows_report,
         conflicts,
     })
-}
-
-/// Close a run that no live `run_undo` row owns.
-///
-/// A client-supplied run id (and an implicit run once the task-boundary tools
-/// land) has no live opener, so it is committed when the call that used it
-/// finishes. A run with an `open` row is left alone: its closer owns it.
-pub fn close_unmanaged_run(
-    db: &Connection,
-    store: &HistoryStore,
-    run_id: &str,
-    by: ClosedBy,
-) -> Result<()> {
-    let live: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM run_undo WHERE run_id = ?1 AND state = 'open')",
-        [run_id],
-        |row| row.get(0),
-    )?;
-    if live {
-        return Ok(());
-    }
-    if let Some(mut manifest) = store.load(run_id)?
-        && manifest.state == RunState::Open
-    {
-        manifest.state = RunState::Committed;
-        manifest.closed_by = Some(by);
-        store.save(&manifest)?;
-    }
-    Ok(())
 }
 
 /// Schema drift: a different `user_version`, a missing allowlisted table, or a

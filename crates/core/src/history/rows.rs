@@ -727,6 +727,25 @@ mod tests {
     }
 
     #[test]
+    fn another_connection_during_the_window_sets_contended() {
+        let f = fixture();
+        let path = Path::new(f.db.path().unwrap()).to_path_buf();
+        let session = row_begin(&f.db, &f.run_id).unwrap();
+
+        let other = open_db(&path).unwrap();
+        other
+            .execute(
+                "UPDATE cards SET title = 'From the app' WHERE id = 'k1'",
+                [],
+            )
+            .unwrap();
+
+        let ended = session.end(&f.db).unwrap();
+        assert!(ended.contended);
+        assert_eq!(ended.counts.updated, 1);
+    }
+
+    #[test]
     fn a_board_delete_reports_cascaded_children() {
         let f = fixture();
         let session = row_begin(&f.db, &f.run_id).unwrap();

@@ -150,12 +150,19 @@ pub fn restore_files(
         report.dirs_recreated += 1;
     }
 
-    // Step 5: files and links in reverse capture order.
-    let mut items: Vec<Item<'_>> = manifest
-        .files
+    // Step 5: files and links in reverse capture order. Both collapse to one
+    // item per path: undo must reproduce the run's net effect, and replaying
+    // every intermediate operation would delete a file the run only edited.
+    let files = net_file_entries(&manifest.files);
+    let links = last_per_path(
+        &manifest.links,
+        |entry| (entry.root, entry.path.clone()),
+        |entry| entry.seq,
+    );
+    let mut items: Vec<Item<'_>> = files
         .iter()
         .map(Item::File)
-        .chain(manifest.links.iter().map(Item::Link))
+        .chain(links.into_iter().map(Item::Link))
         .collect();
     items.sort_by_key(|item| std::cmp::Reverse(item.seq()));
     for item in items {
@@ -203,6 +210,45 @@ pub fn restore_files(
 enum Item<'a> {
     File(&'a FileEntry),
     Link(&'a LinkEntry),
+}
+
+/// One entry per path with the run's net effect: the earliest entry supplies
+/// the pre-image and the latest supplies the after-image. A path the run both
+/// created and removed disappears.
+fn net_file_entries(files: &[FileEntry]) -> Vec<FileEntry> {
+    let mut grouped: std::collections::HashMap<(RootKind, String), (FileEntry, FileEntry)> =
+        std::collections::HashMap::new();
+    for entry in files {
+        let key = (entry.root, entry.path.clone());
+        match grouped.get_mut(&key) {
+            Some((first, last)) => {
+                if entry.seq < first.seq {
+                    *first = entry.clone();
+                }
+                if entry.seq > last.seq {
+                    *last = entry.clone();
+                }
+            }
+            None => {
+                grouped.insert(key, (entry.clone(), entry.clone()));
+            }
+        }
+    }
+    let mut out: Vec<FileEntry> = grouped
+        .into_values()
+        .filter_map(|(mut first, last)| {
+            first.after = last.after;
+            first.op = match (&first.before, &first.after) {
+                (Some(_), Some(_)) => FileOp::Modify,
+                (Some(_), None) => FileOp::Delete,
+                (None, Some(_)) => FileOp::Create,
+                (None, None) => return None,
+            };
+            Some(first)
+        })
+        .collect();
+    out.sort_by_key(|entry| std::cmp::Reverse(entry.seq));
+    out
 }
 
 impl Item<'_> {

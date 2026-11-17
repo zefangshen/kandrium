@@ -378,6 +378,28 @@ struct UndoRunInput {
     force: Option<bool>,
 }
 
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct BeginWikiRunInput {
+    /// Short task name shown in History, e.g. "ingest the attention papers"
+    label: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+struct EndWikiRunInput {
+    /// Optional note stored with the run
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct HeartbeatWikiRunInput {
+    /// Run id returned by begin_wiki_run
+    run_id: String,
+}
+
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
@@ -409,10 +431,21 @@ struct KandriumServer {
     wiki_root: PathBuf,
     documents_root: PathBuf,
     wiki_mode: WikiMode,
+    /// The explicit run this process opened with `begin_wiki_run`, including its
+    /// lazily started row snapshot. Shared with `main` so shutdown can close it.
+    run: std::sync::Arc<Mutex<Option<ActiveRun>>>,
     /// Populated by the #[tool_router] macro; kept for rmcp's expected shape
     /// (the generated #[tool_handler] impl routes through the router).
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
+}
+
+/// One explicit run owned by this server process.
+struct ActiveRun {
+    run_id: String,
+    label: String,
+    /// Taken at the run's first row mutation, not at `begin`.
+    rows: Option<core::history::RowSession>,
 }
 
 #[tool_router]
@@ -442,6 +475,7 @@ impl KandriumServer {
             wiki_root,
             documents_root,
             wiki_mode,
+            run: std::sync::Arc::new(Mutex::new(None)),
             tool_router: Self::tool_router(),
         }
     }
@@ -477,9 +511,10 @@ impl KandriumServer {
         }
     }
 
-    /// Wiki write plumbing. `KANDRIUM_MCP_WIKI=read` keeps reads available
-    /// and refuses every write.
-    fn run_wiki_write<T: serde::Serialize>(
+    /// Wiki write plumbing without a history run: the explicit-run boundary
+    /// tools and `undo_run` use it. `KANDRIUM_MCP_WIKI=read` keeps reads
+    /// available and refuses every write.
+    fn with_db_write<T: serde::Serialize>(
         &self,
         f: impl FnOnce(&mut rusqlite::Connection, &Path, &Path) -> core::Result<T>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -501,6 +536,122 @@ impl KandriumServer {
             Ok(value) => Ok(json_result(&value)),
             Err(error) => Ok(error_result(error.to_string())),
         }
+    }
+
+    /// A mutating wiki tool call: gated like a write, and history-scoped like
+    /// every other mutating tool.
+    fn run_wiki_mutating<T: serde::Serialize>(
+        &self,
+        label: String,
+        requested: Option<String>,
+        f: impl FnOnce(&mut rusqlite::Connection, &Path, Option<String>) -> core::Result<T>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if self.wiki_mode != WikiMode::Write {
+            let message = if self.wiki_mode == WikiMode::Read {
+                "wiki writes are disabled (KANDRIUM_MCP_WIKI=read)"
+            } else {
+                "wiki tools are disabled (KANDRIUM_MCP_WIKI=off)"
+            };
+            return Ok(error_result(message.to_string()));
+        }
+        self.run_mutating(label, requested, |db, wiki, _, run_id| f(db, wiki, run_id))
+    }
+
+    /// Run one mutating call inside a history run.
+    ///
+    /// - An explicit run this process opened with `begin_wiki_run` is joined and
+    ///   heartbeated; its row snapshot starts at the first mutation and lasts
+    ///   until `end_wiki_run`.
+    /// - Otherwise an `open` row owned by another client refuses the call.
+    /// - Otherwise the call is its own run: implicit when the client passes no
+    ///   `runId`, or the client's grouping id when it does.
+    fn run_mutating<T: serde::Serialize>(
+        &self,
+        label: String,
+        requested: Option<String>,
+        f: impl FnOnce(&mut rusqlite::Connection, &Path, &Path, Option<String>) -> core::Result<T>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let mut db = self.db.lock().unwrap_or_else(|e| e.into_inner());
+        match self.inside_run(&mut db, &label, requested, f) {
+            Ok(value) => Ok(json_result(&value)),
+            Err(error) => Ok(error_result(error.to_string())),
+        }
+    }
+
+    fn inside_run<T>(
+        &self,
+        db: &mut rusqlite::Connection,
+        label: &str,
+        requested: Option<String>,
+        f: impl FnOnce(&mut rusqlite::Connection, &Path, &Path, Option<String>) -> core::Result<T>,
+    ) -> core::Result<T> {
+        use core::history;
+        let Some(store) = history::HistoryStore::for_connection(db) else {
+            // In-memory database: nothing to restore, so skip history entirely.
+            return f(db, &self.wiki_root, &self.documents_root, requested);
+        };
+        let mut state = self.run.lock().unwrap_or_else(|e| e.into_inner());
+
+        if let Some(active) = state.as_mut() {
+            if let Some(requested) = &requested
+                && requested != &active.run_id
+            {
+                return Err(core::KandriumError(format!(
+                    "a run is open: {}",
+                    active.label
+                )));
+            }
+            if active.rows.is_none() {
+                active.rows = Some(history::row_begin(db, &active.run_id)?);
+            }
+            history::heartbeat_run(db, &store, &active.run_id)?;
+            let run_id = Some(active.run_id.clone());
+            return f(db, &self.wiki_root, &self.documents_root, run_id);
+        }
+
+        // The slot belongs to another client, or to a previous process whose
+        // heartbeat has not expired yet.
+        if let Some(open) = history::open_run(db, &store)? {
+            return Err(core::KandriumError(format!(
+                "a run is open: {}",
+                open.label
+            )));
+        }
+
+        let grouped = requested.is_some();
+        let run_id = requested.unwrap_or_else(core::db::uid);
+        let label = if label.is_empty() {
+            run_id.clone()
+        } else {
+            label.to_string()
+        };
+        history::ensure_manifest(&store, &run_id, core::history::RunKind::Implicit, &label)?;
+        let session = if grouped {
+            None
+        } else {
+            Some(history::row_begin(db, &run_id)?)
+        };
+
+        let outcome = f(
+            db,
+            &self.wiki_root,
+            &self.documents_root,
+            Some(run_id.clone()),
+        );
+        if let Some(session) = session
+            && let Err(error) = session.end(db)
+        {
+            core::logging::warn!("row phase failed for implicit run {run_id}: {error}");
+        }
+        if outcome.is_err() && history::discard_empty_run(db, &store, &run_id).unwrap_or(false) {
+            return outcome;
+        }
+        if let Err(error) =
+            history::commit_run(db, &store, &run_id, core::history::ClosedBy::Action)
+        {
+            core::logging::warn!("cannot close run {run_id}: {error}");
+        }
+        outcome
     }
 
     #[tool(description = "List all Kandrium boards (id + title, ordered by position)")]
@@ -536,7 +687,11 @@ impl KandriumServer {
         &self,
         Parameters(ColIdInput { col_id }): Parameters<ColIdInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(|db| core::archive_all_cards(db, &col_id))
+        self.run_mutating(
+            run_label("archive_all_cards", Some(&col_id)),
+            None,
+            |db, _, _, _| core::archive_all_cards(db, &col_id),
+        )
     }
 
     // -- Cards --------------------------------------------------------------
@@ -548,7 +703,7 @@ impl KandriumServer {
         &self,
         Parameters(CreateCardInput { col_id, card }): Parameters<CreateCardInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(|db| {
+        self.run_mutating(run_label("create_card", None), None, |db, _, _, _| {
             core::create_card(
                 db,
                 &col_id,
@@ -569,7 +724,7 @@ impl KandriumServer {
         &self,
         Parameters(UpdateCardInput { id, card }): Parameters<UpdateCardInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(|db| {
+        self.run_mutating(run_label("update_card", Some(&id)), None, |db, _, _, _| {
             core::update_card(
                 db,
                 &id,
@@ -594,7 +749,9 @@ impl KandriumServer {
             before_card_id,
         }): Parameters<MoveCardInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(|db| core::move_card(db, &id, &to_col_id, before_card_id.as_deref()))
+        self.run_mutating(run_label("move_card", Some(&id)), None, |db, _, _, _| {
+            core::move_card(db, &id, &to_col_id, before_card_id.as_deref())
+        })
     }
 
     #[tool(
@@ -608,7 +765,13 @@ impl KandriumServer {
             before_card_id,
         }): Parameters<MoveAllCardInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(|db| core::move_all_card(db, &id, status.into_core(), before_card_id.as_deref()))
+        self.run_mutating(
+            run_label("move_all_card", Some(&id)),
+            None,
+            |db, _, _, _| {
+                core::move_all_card(db, &id, status.into_core(), before_card_id.as_deref())
+            },
+        )
     }
 
     #[tool(
@@ -621,7 +784,11 @@ impl KandriumServer {
             target_board_id,
         }): Parameters<MoveCardToBoardInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(|db| core::move_card_to_board(db, &id, &target_board_id))
+        self.run_mutating(
+            run_label("move_card_to_board", Some(&id)),
+            None,
+            |db, _, _, _| core::move_card_to_board(db, &id, &target_board_id),
+        )
     }
 
     #[tool(description = "Delete a card permanently")]
@@ -629,7 +796,9 @@ impl KandriumServer {
         &self,
         Parameters(CardIdInput { id }): Parameters<CardIdInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(|db| core::delete_card(db, &id))
+        self.run_mutating(run_label("delete_card", Some(&id)), None, |db, _, _, _| {
+            core::delete_card(db, &id)
+        })
     }
 
     #[tool(description = "Archive or unarchive a card (archived cards are hidden from the board)")]
@@ -637,7 +806,9 @@ impl KandriumServer {
         &self,
         Parameters(SetCardArchivedInput { id, archived }): Parameters<SetCardArchivedInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(|db| core::set_card_archived(db, &id, archived))
+        self.run_mutating(run_label("archive_card", Some(&id)), None, |db, _, _, _| {
+            core::set_card_archived(db, &id, archived)
+        })
     }
 
     #[tool(description = "Restore an archived card back to its column")]
@@ -645,7 +816,9 @@ impl KandriumServer {
         &self,
         Parameters(CardIdInput { id }): Parameters<CardIdInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run(|db| core::set_card_archived(db, &id, false))
+        self.run_mutating(run_label("restore_card", Some(&id)), None, |db, _, _, _| {
+            core::set_card_archived(db, &id, false)
+        })
     }
 
     #[tool(
@@ -893,9 +1066,9 @@ impl KandriumServer {
         &self,
         Parameters(input): Parameters<WriteWikiPageInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run_wiki_write(|db, wiki, _| {
-            let run_id = input.run_id.clone();
-            let result = core::write_page(
+        let label = run_label("write_wiki_page", Some(&input.path));
+        self.run_wiki_mutating(label, input.run_id.clone(), |db, wiki, run_id| {
+            core::write_page(
                 db,
                 wiki,
                 &core::WritePageSpec {
@@ -905,11 +1078,9 @@ impl KandriumServer {
                     force: input.force.unwrap_or(false),
                     agent: input.agent,
                     instructions_version: input.instructions_version,
-                    run_id: run_id.clone(),
+                    run_id,
                 },
-            )?;
-            settle_run(db, &run_id)?;
-            Ok(result)
+            )
         })
     }
 
@@ -920,9 +1091,9 @@ impl KandriumServer {
         &self,
         Parameters(input): Parameters<PatchWikiPageInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run_wiki_write(|db, wiki, _| {
-            let run_id = input.run_id.clone();
-            let result = core::patch_page(
+        let label = run_label("patch_wiki_page", Some(&input.path));
+        self.run_wiki_mutating(label, input.run_id.clone(), |db, wiki, run_id| {
+            core::patch_page(
                 db,
                 wiki,
                 &core::PatchPageSpec {
@@ -933,11 +1104,9 @@ impl KandriumServer {
                     force: input.force.unwrap_or(false),
                     agent: input.agent,
                     instructions_version: input.instructions_version,
-                    run_id: run_id.clone(),
+                    run_id,
                 },
-            )?;
-            settle_run(db, &run_id)?;
-            Ok(result)
+            )
         })
     }
 
@@ -946,9 +1115,9 @@ impl KandriumServer {
         &self,
         Parameters(input): Parameters<DeleteWikiPageInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run_wiki_write(|db, wiki, _| {
+        let label = run_label("delete_wiki_page", Some(&input.path));
+        self.run_wiki_mutating(label, input.run_id.clone(), |db, wiki, run_id| {
             let path = input.path;
-            let run_id = input.run_id.clone();
             core::delete_page(
                 db,
                 wiki,
@@ -957,22 +1126,119 @@ impl KandriumServer {
                     expected_hash: input.expected_hash,
                     force: input.force.unwrap_or(false),
                     instructions_version: input.instructions_version,
-                    run_id: run_id.clone(),
+                    run_id,
                 },
             )?;
-            settle_run(db, &run_id)?;
             Ok(serde_json::json!({ "path": path, "deleted": true }))
         })
     }
 
     #[tool(
-        description = "Record a compile run and mark its sources compiled. Call once after a batch of page writes."
+        description = "Open an explicit task run: every wiki and Kanban write until end_wiki_run is undoable as one unit. Returns the run id."
+    )]
+    fn begin_wiki_run(
+        &self,
+        Parameters(BeginWikiRunInput { label }): Parameters<BeginWikiRunInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.with_db_write(|db, _, _| {
+            use core::history;
+            let store = history_store(db)?;
+            let mut state = self.run.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(active) = state.as_ref() {
+                return Err(core::KandriumError(format!(
+                    "a run is open: {}",
+                    active.label
+                )));
+            }
+            let manifest = history::begin_run(db, &store, &label)?;
+            let response = serde_json::json!({
+                "runId": manifest.run_id,
+                "label": manifest.label,
+                "state": manifest.state.as_str(),
+                "startedAt": manifest.started_at,
+            });
+            *state = Some(ActiveRun {
+                run_id: manifest.run_id,
+                label: manifest.label,
+                rows: None,
+            });
+            Ok(response)
+        })
+    }
+
+    #[tool(
+        description = "Close the open run: takes its end snapshot, derives the row diff, and makes it undoable. Optional note is stored with the run."
+    )]
+    fn end_wiki_run(
+        &self,
+        Parameters(EndWikiRunInput { note }): Parameters<EndWikiRunInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.with_db_write(|db, _, _| {
+            use core::history;
+            let store = history_store(db)?;
+            let mut state = self.run.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(active) = state.take() else {
+                return Err(core::KandriumError::new("no run is open"));
+            };
+            if let Some(session) = active.rows
+                && let Err(error) = session.end(db)
+            {
+                core::logging::warn!("row phase failed for run {}: {error}", active.run_id);
+            }
+            let manifest = history::end_open_run(
+                db,
+                &store,
+                &active.run_id,
+                history::ClosedBy::Explicit,
+                note.as_deref(),
+            )?;
+            Ok(RunSummary::from(&manifest))
+        })
+    }
+
+    #[tool(
+        description = "Advance the open run's heartbeat so it stays reclaimable for another 10 minutes; call it between long stretches of work outside the run."
+    )]
+    fn heartbeat_wiki_run(
+        &self,
+        Parameters(HeartbeatWikiRunInput { run_id }): Parameters<HeartbeatWikiRunInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.with_db_write(|db, _, _| {
+            use core::history;
+            let store = history_store(db)?;
+            let heartbeat_at = history::heartbeat_run(db, &store, &run_id)?;
+            Ok(serde_json::json!({ "runId": run_id, "heartbeatAt": heartbeat_at }))
+        })
+    }
+
+    #[tool(
+        description = "Record a compile run and mark its sources compiled. Call once after a batch of page writes. Closes an open run and records these stats with it."
     )]
     fn record_wiki_run(
         &self,
         Parameters(input): Parameters<RecordRunInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.run_wiki_write(|db, _, _| {
+        self.with_db_write(|db, _, _| {
+            use core::history;
+            if let Some(store) = history::HistoryStore::for_connection(db) {
+                let mut state = self.run.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(active) = state.take() {
+                    if let Some(session) = active.rows
+                        && let Err(error) = session.end(db)
+                    {
+                        core::logging::warn!("row phase failed for run {}: {error}", active.run_id);
+                    }
+                    if let Err(error) = history::end_open_run(
+                        db,
+                        &store,
+                        &active.run_id,
+                        history::ClosedBy::Explicit,
+                        None,
+                    ) {
+                        core::logging::warn!("cannot close run {}: {error}", active.run_id);
+                    }
+                }
+            }
             core::record_run(
                 db,
                 core::RunRecord {
@@ -1011,8 +1277,7 @@ impl KandriumServer {
     ) -> Result<CallToolResult, ErrorData> {
         let limit = input.limit.unwrap_or(50).min(200);
         self.run_wiki(|db, _, _| {
-            let store = core::history::HistoryStore::for_connection(db)
-                .ok_or_else(|| core::KandriumError::new("history needs a file-backed database"))?;
+            let store = history_store(db)?;
             let mut manifests = store.load_all()?;
             manifests.sort_by(|a, b| {
                 b.started_at
@@ -1033,9 +1298,8 @@ impl KandriumServer {
         Parameters(input): Parameters<UndoRunInput>,
     ) -> Result<CallToolResult, ErrorData> {
         let roots = self.restore_roots();
-        self.run_wiki_write(|db, _, _| {
-            let store = core::history::HistoryStore::for_connection(db)
-                .ok_or_else(|| core::KandriumError::new("history needs a file-backed database"))?;
+        self.with_db_write(|db, _, _| {
+            let store = history_store(db)?;
             let report = core::history::undo_run(
                 db,
                 &store,
@@ -1057,16 +1321,18 @@ impl KandriumServer {
     }
 }
 
-/// Close a client-supplied run id once its mutating call finishes. A live
-/// explicit run (with an open `run_undo` row) is left for its closer.
-fn settle_run(db: &rusqlite::Connection, run_id: &Option<String>) -> core::Result<()> {
-    let (Some(run_id), Some(store)) = (
-        run_id.as_deref(),
-        core::history::HistoryStore::for_connection(db),
-    ) else {
-        return Ok(());
-    };
-    core::history::close_unmanaged_run(db, &store, run_id, core::history::ClosedBy::Explicit)
+fn history_store(db: &rusqlite::Connection) -> core::Result<core::history::HistoryStore> {
+    core::history::HistoryStore::for_connection(db)
+        .ok_or_else(|| core::KandriumError::new("history needs a file-backed database"))
+}
+
+/// Label for a mutating call's implicit run: `tool target`, as the History
+/// panel groups it.
+fn run_label(tool: &str, target: Option<&str>) -> String {
+    match target {
+        Some(target) if !target.is_empty() => format!("{tool} {target}"),
+        _ => tool.to_string(),
+    }
 }
 
 fn undo_json(report: &core::history::UndoReport) -> serde_json::Value {
@@ -1105,8 +1371,10 @@ struct RunSummary {
     label: String,
     kind: String,
     state: String,
+    undoable: bool,
     started_at: i64,
     finished_at: Option<i64>,
+    heartbeat_at: i64,
     closed_by: Option<String>,
     operation: Option<String>,
     agent: Option<String>,
@@ -1139,13 +1407,19 @@ impl From<&core::history::Manifest> for RunSummary {
                 "restorable": rows.restorable,
             })
         });
+        let undoable = matches!(
+            manifest.state,
+            core::history::RunState::Committed | core::history::RunState::FilesRestored
+        );
         Self {
             run_id: manifest.run_id.clone(),
             label: manifest.label.clone(),
             kind: manifest.kind.as_str().to_string(),
             state: manifest.state.as_str().to_string(),
+            undoable,
             started_at: manifest.started_at,
             finished_at: manifest.finished_at,
+            heartbeat_at: manifest.heartbeat_at,
             closed_by: manifest.closed_by.map(|by| by.as_str().to_string()),
             operation: manifest.operation.clone(),
             agent: manifest.agent.clone(),
@@ -1213,13 +1487,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut db = core::open_db(&db_path)?;
     core::bootstrap(&mut db, &db_path)?;
+    if let Some(store) = core::history::HistoryStore::for_connection(&db) {
+        match core::history::sweep_abandoned(&db, &store) {
+            Ok(abandoned) if !abandoned.is_empty() => core::logging::info!(
+                "abandoned {} run(s) without a heartbeat for 24 hours",
+                abandoned.len()
+            ),
+            Ok(_) => {}
+            Err(error) => core::logging::warn!("run sweep failed: {error}"),
+        }
+    }
     core::logging::info!("DB: {}", db_path.display());
 
-    let service = KandriumServer::new(db)
-        .serve(rmcp::transport::stdio())
-        .await?;
-    service.waiting().await?;
+    let server = KandriumServer::new(db);
+    let db_handle = server.db.clone();
+    let run_handle = server.run.clone();
+    let service = server.serve(rmcp::transport::stdio()).await?;
+    let result = service.waiting().await;
+    close_open_run(&db_handle, &run_handle);
+    result?;
     Ok(())
+}
+
+/// Close this process's explicit run when the transport ends. A run that
+/// cannot be closed stays open and a later client reclaims it.
+fn close_open_run(
+    db: &std::sync::Arc<Mutex<rusqlite::Connection>>,
+    run: &std::sync::Arc<Mutex<Option<ActiveRun>>>,
+) {
+    let Some(active) = run.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    let db = db.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(store) = core::history::HistoryStore::for_connection(&db) else {
+        return;
+    };
+    if let Some(session) = active.rows
+        && let Err(error) = session.end(&db)
+    {
+        core::logging::warn!("row phase failed for run {}: {error}", active.run_id);
+    }
+    if let Err(error) = core::history::end_open_run(
+        &db,
+        &store,
+        &active.run_id,
+        core::history::ClosedBy::Exit,
+        None,
+    ) {
+        core::logging::warn!("cannot close run {} on exit: {error}", active.run_id);
+    }
 }
 
 #[cfg(test)]
@@ -1240,13 +1556,16 @@ mod tests {
         let expected = [
             "archive_all_cards",
             "archive_card",
+            "begin_wiki_run",
             "create_card",
             "delete_card",
             "delete_wiki_page",
+            "end_wiki_run",
             "get_all_board",
             "get_board",
             "get_wiki_instructions",
             "get_wiki_status",
+            "heartbeat_wiki_run",
             "lint_wiki",
             "list_archived_cards",
             "list_boards",
@@ -1299,17 +1618,9 @@ mod tests {
 
         let path = "concepts/attention.md";
         let original = page("Attention", "Original body.");
-        server
-            .write_wiki_page(Parameters(WriteWikiPageInput {
-                path: path.into(),
-                content: original.clone(),
-                expected_hash: None,
-                force: None,
-                agent: None,
-                instructions_version: core::WIKI_INSTRUCTIONS_VERSION,
-                run_id: None,
-            }))
-            .unwrap();
+        // Written outside any run: the run's undo must bring this back.
+        std::fs::create_dir_all(wiki.join("concepts")).unwrap();
+        std::fs::write(wiki.join(path), &original).unwrap();
 
         server
             .write_wiki_page(Parameters(WriteWikiPageInput {
@@ -1354,6 +1665,7 @@ mod tests {
         assert_eq!(runs.len(), 1, "{payload}");
         assert_eq!(runs[0]["runId"], "run1");
         assert_eq!(runs[0]["state"], "committed");
+        // Rewrite + patch + delete on one path: one entry per operation.
         assert_eq!(runs[0]["files"], 3);
 
         let undone = server
@@ -1367,6 +1679,279 @@ mod tests {
         assert_eq!(payload["state"], "undone", "{payload}");
         assert_eq!(payload["blocked"], false);
         assert_eq!(std::fs::read_to_string(wiki.join(path)).unwrap(), original);
+    }
+
+    #[test]
+    fn explicit_runs_group_writes_under_one_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let wiki = dir.path().join("wiki");
+        let documents = dir.path().join("documents");
+        std::fs::create_dir_all(&wiki).unwrap();
+        std::fs::create_dir_all(&documents).unwrap();
+        let server = file_backed_server(&wiki, &documents, &dir.path().join("kandrium.db"));
+
+        let begun = json(
+            &server
+                .begin_wiki_run(Parameters(BeginWikiRunInput {
+                    label: "ingest the attention papers".into(),
+                }))
+                .unwrap(),
+        );
+        assert_eq!(begun["state"], "open");
+        let run_id = begun["runId"].as_str().unwrap().to_string();
+
+        let nested = server
+            .begin_wiki_run(Parameters(BeginWikiRunInput {
+                label: "nested task".into(),
+            }))
+            .unwrap();
+        assert_eq!(nested.is_error, Some(true));
+        assert!(text(&nested).contains("a run is open: ingest the attention papers"));
+
+        for name in ["one", "two", "three"] {
+            let written = server
+                .write_wiki_page(Parameters(WriteWikiPageInput {
+                    path: format!("concepts/{name}.md"),
+                    content: page(name, "Body."),
+                    expected_hash: None,
+                    force: None,
+                    agent: None,
+                    instructions_version: core::WIKI_INSTRUCTIONS_VERSION,
+                    run_id: None,
+                }))
+                .unwrap();
+            assert_ne!(written.is_error, Some(true), "{}", text(&written));
+        }
+
+        let ended = json(
+            &server
+                .end_wiki_run(Parameters(EndWikiRunInput {
+                    note: Some("three pages".into()),
+                }))
+                .unwrap(),
+        );
+        assert_eq!(ended["runId"], run_id.as_str());
+        assert_eq!(ended["state"], "committed");
+        assert_eq!(ended["closedBy"], "explicit");
+        assert_eq!(ended["files"], 3);
+
+        let listed = json(
+            &server
+                .list_runs(Parameters(ListRunsInput { limit: None }))
+                .unwrap(),
+        );
+        let runs = listed["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 1, "{listed}");
+        assert_eq!(runs[0]["label"], "ingest the attention papers");
+        assert_eq!(runs[0]["undoable"], true);
+
+        let undone = json(
+            &server
+                .undo_run(Parameters(UndoRunInput {
+                    run_id: run_id.clone(),
+                    force: None,
+                }))
+                .unwrap(),
+        );
+        assert_eq!(undone["state"], "undone", "{undone}");
+        for name in ["one", "two", "three"] {
+            assert!(!wiki.join(format!("concepts/{name}.md")).exists());
+        }
+    }
+
+    #[test]
+    fn without_begin_each_mutating_call_is_its_own_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let wiki = dir.path().join("wiki");
+        let documents = dir.path().join("documents");
+        std::fs::create_dir_all(&wiki).unwrap();
+        std::fs::create_dir_all(&documents).unwrap();
+        let server = file_backed_server(&wiki, &documents, &dir.path().join("kandrium.db"));
+
+        for name in ["one", "two", "three"] {
+            let written = server
+                .write_wiki_page(Parameters(WriteWikiPageInput {
+                    path: format!("concepts/{name}.md"),
+                    content: page(name, "Body."),
+                    expected_hash: None,
+                    force: None,
+                    agent: None,
+                    instructions_version: core::WIKI_INSTRUCTIONS_VERSION,
+                    run_id: None,
+                }))
+                .unwrap();
+            assert_ne!(written.is_error, Some(true), "{}", text(&written));
+        }
+
+        let listed = json(
+            &server
+                .list_runs(Parameters(ListRunsInput { limit: None }))
+                .unwrap(),
+        );
+        let runs = listed["runs"].as_array().unwrap().clone();
+        assert_eq!(runs.len(), 3, "{listed}");
+        for run in &runs {
+            assert_eq!(run["kind"], "implicit");
+            assert_eq!(run["undoable"], true);
+            assert_eq!(run["files"], 1);
+        }
+        assert!(
+            runs.iter()
+                .any(|run| run["label"] == "write_wiki_page concepts/two.md")
+        );
+
+        // Read-only calls never open a run.
+        server
+            .list_wiki_pages(Parameters(ListWikiPagesInput {
+                kind: None,
+                source: None,
+                limit: None,
+                offset: None,
+            }))
+            .unwrap();
+        let listed = json(
+            &server
+                .list_runs(Parameters(ListRunsInput { limit: None }))
+                .unwrap(),
+        );
+        assert_eq!(listed["runs"].as_array().unwrap().len(), 3);
+
+        let middle = runs
+            .iter()
+            .find(|run| run["label"] == "write_wiki_page concepts/two.md")
+            .unwrap()["runId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let undone = json(
+            &server
+                .undo_run(Parameters(UndoRunInput {
+                    run_id: middle,
+                    force: None,
+                }))
+                .unwrap(),
+        );
+        assert_eq!(undone["state"], "undone", "{undone}");
+        assert!(!wiki.join("concepts/two.md").exists());
+        assert!(wiki.join("concepts/one.md").exists());
+        assert!(wiki.join("concepts/three.md").exists());
+    }
+
+    #[test]
+    fn a_second_client_is_refused_while_a_run_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let wiki = dir.path().join("wiki");
+        let documents = dir.path().join("documents");
+        std::fs::create_dir_all(&wiki).unwrap();
+        std::fs::create_dir_all(&documents).unwrap();
+        let db_path = dir.path().join("kandrium.db");
+        let first = file_backed_server(&wiki, &documents, &db_path);
+        let second = file_backed_server(&wiki, &documents, &db_path);
+
+        first
+            .begin_wiki_run(Parameters(BeginWikiRunInput {
+                label: "first task".into(),
+            }))
+            .unwrap();
+
+        let refused = second
+            .write_wiki_page(Parameters(WriteWikiPageInput {
+                path: "concepts/other.md".into(),
+                content: page("Other", "Body."),
+                expected_hash: None,
+                force: None,
+                agent: None,
+                instructions_version: core::WIKI_INSTRUCTIONS_VERSION,
+                run_id: None,
+            }))
+            .unwrap();
+        assert_eq!(refused.is_error, Some(true));
+        assert!(text(&refused).contains("a run is open: first task"));
+
+        let refused_begin = second
+            .begin_wiki_run(Parameters(BeginWikiRunInput {
+                label: "second task".into(),
+            }))
+            .unwrap();
+        assert!(text(&refused_begin).contains("a run is open: first task"));
+
+        // Read-only tools stay available.
+        assert_ne!(
+            second
+                .list_runs(Parameters(ListRunsInput { limit: None }))
+                .unwrap()
+                .is_error,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_stale_open_run_is_reclaimed_by_another_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let wiki = dir.path().join("wiki");
+        let documents = dir.path().join("documents");
+        std::fs::create_dir_all(&wiki).unwrap();
+        std::fs::create_dir_all(&documents).unwrap();
+        let db_path = dir.path().join("kandrium.db");
+        let owner = file_backed_server(&wiki, &documents, &db_path);
+
+        let begun = json(
+            &owner
+                .begin_wiki_run(Parameters(BeginWikiRunInput {
+                    label: "killed task".into(),
+                }))
+                .unwrap(),
+        );
+        let stale = begun["runId"].as_str().unwrap().to_string();
+        age_heartbeat(&db_path, &stale, core::history::HEARTBEAT_STALE_SECS + 1);
+
+        let reclaimer = file_backed_server(&wiki, &documents, &db_path);
+        let taken = json(
+            &reclaimer
+                .begin_wiki_run(Parameters(BeginWikiRunInput {
+                    label: "reclaimer".into(),
+                }))
+                .unwrap(),
+        );
+        assert_eq!(taken["state"], "open");
+
+        let refused = reclaimer
+            .end_wiki_run(Parameters(EndWikiRunInput::default()))
+            .unwrap();
+        assert_ne!(refused.is_error, Some(true));
+        let stale_end = owner
+            .end_wiki_run(Parameters(EndWikiRunInput::default()))
+            .unwrap();
+        assert_eq!(stale_end.is_error, Some(true));
+        assert!(text(&stale_end).contains("reclaimed"));
+
+        let listed = json(
+            &reclaimer
+                .list_runs(Parameters(ListRunsInput { limit: None }))
+                .unwrap(),
+        );
+        let stale_run = listed["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|run| run["runId"] == stale.as_str())
+            .unwrap()
+            .clone();
+        assert_eq!(stale_run["state"], "committed");
+        assert_eq!(stale_run["closedBy"], "abandoned");
+    }
+
+    fn age_heartbeat(db_path: &Path, run_id: &str, seconds: i64) {
+        let db = rusqlite::Connection::open(db_path).unwrap();
+        db.execute(
+            "UPDATE run_undo SET last_heartbeat_at = last_heartbeat_at - ?2 WHERE run_id = ?1",
+            rusqlite::params![run_id, seconds],
+        )
+        .unwrap();
+    }
+
+    fn json(result: &CallToolResult) -> serde_json::Value {
+        serde_json::from_str(&text(result)).unwrap()
     }
 
     #[test]

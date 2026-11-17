@@ -14,14 +14,19 @@ use serde::{Deserialize, Serialize};
 pub mod capture;
 pub mod restore;
 pub mod rows;
+pub mod run;
 pub mod store;
 pub mod undo;
 
 pub use capture::{CaptureGuard, RunContext, TreeCapture};
 pub use restore::{FileConflict, FileUndoReport, Roots, SkippedEntry, preflight, restore_files};
 pub use rows::{CAPTURED_TABLES, RowEnd, RowSession, captured_tables, row_begin};
+pub use run::{
+    ABANDON_AFTER_SECS, HEARTBEAT_STALE_SECS, OpenRun, begin_run, commit_run, discard_empty_run,
+    end_open_run, ensure_manifest, heartbeat_run, open_run, sweep_abandoned,
+};
 pub use store::{HISTORY_DIR, HistoryStore};
-pub use undo::{RowConflict, RowUndoReport, UndoReport, close_unmanaged_run, undo_run};
+pub use undo::{RowConflict, RowUndoReport, UndoReport, undo_run};
 
 /// Manifest schema version.
 pub const MANIFEST_VERSION: u32 = 1;
