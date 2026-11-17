@@ -316,6 +316,61 @@ fn toolbar_opens_status_lint_and_setup_panels(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn history_panel_lists_a_run_and_undoes_it_in_two_clicks(cx: &mut TestAppContext) {
+    use kandrium_core::history::{self, ClosedBy, RootKind, RunContext, RunKind};
+
+    let wiki_root = shared_root("KANDRIUM_WIKI");
+    let page = wiki_root.join("history-panel-page.md");
+    fs::write(&page, "before\n").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = seeded_db(dir.path());
+    let store = history::HistoryStore::for_db(&db);
+    history::ensure_manifest(
+        &store,
+        "run-hist",
+        RunKind::Explicit,
+        "ingest the attention papers",
+    )
+    .unwrap();
+    {
+        let conn = kandrium_core::open_db(&db).unwrap();
+        let context = RunContext::new(store.clone(), "run-hist");
+        let guard = context.capture(RootKind::Wiki, wiki_root, &page).unwrap();
+        fs::write(&page, "after\n").unwrap();
+        guard.commit(Some(b"after\n")).unwrap();
+        history::commit_run(&conn, &store, "run-hist", ClosedBy::Explicit).unwrap();
+    }
+
+    let (_view, cx) = boot(cx, db);
+    open_wiki(cx);
+
+    click(cx, "wiki-history");
+    cx.update(|window, _cx| {
+        assert!(window.find("wiki-panel-history").visible());
+        assert!(window.find("history-run-run-hist").visible());
+    });
+
+    click(cx, "history-run-run-hist");
+    cx.update(|window, _cx| {
+        assert!(window.find("history-detail").visible());
+    });
+
+    click(cx, "history-undo");
+    assert_eq!(
+        fs::read_to_string(&page).unwrap(),
+        "after\n",
+        "the first click only arms the undo"
+    );
+    click(cx, "history-undo");
+    assert_eq!(
+        fs::read_to_string(&page).unwrap(),
+        "before\n",
+        "the second click restores the pre-image"
+    );
+}
+
+#[gpui::test]
 fn closing_a_merged_tab_keeps_the_other_kind_intact(cx: &mut TestAppContext) {
     let notes_root = shared_root("KANDRIUM_NOTES");
     let docs_root = shared_root("KANDRIUM_DOCS");

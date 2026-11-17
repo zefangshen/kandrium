@@ -89,6 +89,7 @@ pub enum WikiPanel {
     Status,
     Lint,
     Setup,
+    History,
 }
 
 /// The compiled-page half: the wiki root's Markdown tree.
@@ -120,10 +121,17 @@ pub struct WikiState {
     pub notes_collapsed: bool,
     pub pages_collapsed: bool,
     pub docs_collapsed: bool,
-    /// Status, lint, or setup replaces the tab row until a tab is opened.
+    /// Status, lint, setup or history replaces the tab row until a tab is
+    /// opened.
     pub panel: Option<WikiPanel>,
     pub status: Option<WikiStatus>,
     pub findings: Vec<LintFinding>,
+    /// Run manifests for the History panel, newest first.
+    pub history: Vec<kandrium_core::history::Manifest>,
+    /// Run picked in the History list.
+    pub history_selected: Option<String>,
+    /// Run the History panel is asking to undo a second time.
+    pub history_confirm: Option<String>,
     pub busy: bool,
     pub panel_error: Option<String>,
 }
@@ -144,6 +152,9 @@ impl Default for WikiState {
             panel: None,
             status: None,
             findings: Vec::new(),
+            history: Vec::new(),
+            history_selected: None,
+            history_confirm: None,
             busy: false,
             panel_error: None,
         }
@@ -416,6 +427,15 @@ fn toolbar(state: &WikiState, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElem
             t,
             cx.listener(|this, _: &ClickEvent, _window, cx| {
                 this.open_wiki_panel(WikiPanel::Lint, cx)
+            }),
+        ))
+        .child(toolbar_button(
+            "wiki-history",
+            "History",
+            state.panel == Some(WikiPanel::History),
+            t,
+            cx.listener(|this, _: &ClickEvent, _window, cx| {
+                this.open_wiki_panel(WikiPanel::History, cx)
             }),
         ))
         .child(toolbar_button(
@@ -895,7 +915,9 @@ fn detail_column(
         .flex_col();
 
     if let Some(panel) = state.panel {
-        return column.child(panel_body(state, panel, t)).into_any_element();
+        return column
+            .child(panel_body(state, panel, t, cx))
+            .into_any_element();
     }
 
     if state.order.is_empty() {
@@ -999,11 +1021,17 @@ fn tab_row(state: &WikiState, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElem
     strip.child(div().flex_1()).into_any_element()
 }
 
-fn panel_body(state: &WikiState, panel: WikiPanel, t: &Tokens) -> AnyElement {
+fn panel_body(
+    state: &WikiState,
+    panel: WikiPanel,
+    t: &Tokens,
+    cx: &mut Context<AppShell>,
+) -> AnyElement {
     let (title, id) = match panel {
         WikiPanel::Status => ("Knowledge status", "wiki-panel-status"),
         WikiPanel::Lint => ("Lint findings", "wiki-panel-lint"),
         WikiPanel::Setup => ("Compile setup", "wiki-panel-setup"),
+        WikiPanel::History => ("History", "wiki-panel-history"),
     };
     let mut body = div()
         .id("wiki-panel-body")
@@ -1107,6 +1135,16 @@ fn panel_body(state: &WikiState, panel: WikiPanel, t: &Tokens) -> AnyElement {
                 }
             }
         }
+        WikiPanel::History => {
+            body = body.child(history_list(state, t, cx));
+            if let Some(run) = state
+                .history_selected
+                .as_ref()
+                .and_then(|run_id| state.history.iter().find(|run| &run.run_id == run_id))
+            {
+                body = body.child(history_detail(run, state, t, cx));
+            }
+        }
         WikiPanel::Setup => {
             body = body
                 .child(body_text(
@@ -1177,6 +1215,280 @@ fn panel_body(state: &WikiState, panel: WikiPanel, t: &Tokens) -> AnyElement {
         .child(div().text(Text::Heading).text_color(t.text).child(title))
         .child(body)
         .into_any_element()
+}
+
+/// Run list for the History panel, newest first with the open run pinned.
+fn history_list(state: &WikiState, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
+    if state.history.is_empty() {
+        return body_text(
+            "No runs yet. MCP writes and app actions each create one entry.",
+            t,
+        );
+    }
+    let mut list = div().id("history-list").flex().flex_col();
+    for run in &state.history {
+        let selected = state.history_selected.as_deref() == Some(run.run_id.as_str());
+        let open = run.state == kandrium_core::history::RunState::Open;
+        let run_id = run.run_id.clone();
+        list = list.child(
+            div()
+                .id(format!("history-run-{}", run.run_id))
+                .test_support()
+                .flex()
+                .flex_col()
+                .gap(px(1.))
+                .px(px(8.))
+                .py(px(5.))
+                .rounded(px(4.))
+                .when(selected, |this| this.bg(t.selected))
+                .hover(|style| style.bg(t.hover))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                    this.select_history_run(run_id.clone(), cx)
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .truncate()
+                                .text(Text::Small)
+                                .text_color(t.text)
+                                .child(run.label.clone()),
+                        )
+                        .child(
+                            div()
+                                .text(Text::Micro)
+                                .text_color(if open { t.accent } else { t.text_faint })
+                                .child(run.state.as_str()),
+                        ),
+                )
+                .child(
+                    div()
+                        .text(Text::Micro)
+                        .text_color(t.text_faint)
+                        .child(history_summary(run)),
+                ),
+        );
+    }
+    list.into_any_element()
+}
+
+fn history_summary(run: &kandrium_core::history::Manifest) -> String {
+    let mut parts = vec![run.kind.as_str().to_string(), relative_time(run.started_at)];
+    if !run.files.is_empty() {
+        parts.push(format!("{} files", run.files.len()));
+    }
+    if !run.dirs.is_empty() {
+        parts.push(format!("{} dirs", run.dirs.len()));
+    }
+    if !run.links.is_empty() {
+        parts.push(format!("{} links", run.links.len()));
+    }
+    if let Some(rows) = &run.rows
+        && rows.counts.total() > 0
+    {
+        parts.push(format!("{} rows", rows.counts.total()));
+    }
+    if run.state == kandrium_core::history::RunState::Open {
+        parts.push(format!("heartbeat {}", relative_time(run.heartbeat_at)));
+    }
+    parts.join(" · ")
+}
+
+/// One run's entries: files, directories, links and row counts, then the
+/// two-step undo action.
+fn history_detail(
+    run: &kandrium_core::history::Manifest,
+    state: &WikiState,
+    t: &Tokens,
+    cx: &mut Context<AppShell>,
+) -> AnyElement {
+    let mut body = div()
+        .id("history-detail")
+        .test_support()
+        .flex()
+        .flex_col()
+        .gap(px(3.))
+        .pt(px(10.));
+
+    if !run.files.is_empty() {
+        body = body.child(section_label("Files", t));
+        for entry in &run.files {
+            let mut row = div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .w(px(56.))
+                        .text(Text::Micro)
+                        .text_color(t.text_faint)
+                        .child(format!("{:?}", entry.op).to_lowercase()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .truncate()
+                        .text(Text::Small)
+                        .text_color(t.text_muted)
+                        .child(format!("{}:{}", entry.root.as_str(), entry.path)),
+                );
+            if !entry.restorable {
+                row = row.child(
+                    div()
+                        .text(Text::Micro)
+                        .text_color(t.danger)
+                        .child(entry.reason.map(|r| r.as_str()).unwrap_or("partial")),
+                );
+            }
+            body = body.child(row);
+        }
+    }
+    if !run.dirs.is_empty() {
+        body = body.child(section_label("Directories", t));
+        for entry in &run.dirs {
+            body = body.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .w(px(56.))
+                            .text(Text::Micro)
+                            .text_color(t.text_faint)
+                            .child(format!("{:?}", entry.op).to_lowercase()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .truncate()
+                            .text(Text::Small)
+                            .text_color(t.text_muted)
+                            .child(format!("{}:{}", entry.root.as_str(), entry.path)),
+                    ),
+            );
+        }
+    }
+    if !run.links.is_empty() {
+        body = body.child(section_label("Links", t));
+        for entry in &run.links {
+            body = body.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .truncate()
+                            .text(Text::Small)
+                            .text_color(t.text_muted)
+                            .child(format!("{}:{}", entry.root.as_str(), entry.path)),
+                    )
+                    .child(
+                        div()
+                            .text(Text::Micro)
+                            .text_color(t.text_faint)
+                            .child(format!("→ {}", entry.target)),
+                    ),
+            );
+        }
+    }
+    if let Some(rows) = &run.rows {
+        body = body.child(section_label("Rows", t)).child(kv_row(
+            "Inserted / updated / deleted",
+            &format!(
+                "{} / {} / {}",
+                rows.counts.inserted, rows.counts.updated, rows.counts.deleted
+            ),
+            t,
+        ));
+        if rows.contended {
+            body = body.child(kv_row(
+                "Snapshot",
+                "contended: another writer changed rows",
+                t,
+            ));
+        }
+        if !rows.restorable {
+            body = body.child(kv_row("Rows", "not restorable", t));
+        }
+    }
+
+    let undoable = matches!(
+        run.state,
+        kandrium_core::history::RunState::Committed
+            | kandrium_core::history::RunState::FilesRestored
+    );
+    if undoable {
+        let confirming = state.history_confirm.as_deref() == Some(run.run_id.as_str());
+        let label = if confirming {
+            "Confirm undo"
+        } else {
+            "Undo run"
+        };
+        let run_id = run.run_id.clone();
+        let mut actions =
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .pt(px(10.))
+                .child(toolbar_button(
+                    "history-undo",
+                    label,
+                    confirming,
+                    t,
+                    cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                        this.undo_history_run(run_id.clone(), cx)
+                    }),
+                ));
+        if confirming {
+            actions = actions.child(toolbar_button(
+                "history-undo-cancel",
+                "Cancel",
+                false,
+                t,
+                cx.listener(|this, _: &ClickEvent, _window, cx| this.cancel_history_undo(cx)),
+            ));
+        }
+        body = body.child(actions);
+    } else {
+        body = body.child(body_text(
+            match run.state {
+                kandrium_core::history::RunState::Open => {
+                    "This run is open. Close it before undoing."
+                }
+                kandrium_core::history::RunState::Undone => "This run was already undone.",
+                kandrium_core::history::RunState::Failed => {
+                    "This run failed; its history is incomplete."
+                }
+                _ => "This run cannot be undone.",
+            },
+            t,
+        ));
+    }
+    body.into_any_element()
+}
+
+/// `12 s ago`, `4 min ago`, `3 h ago`, `2 d ago`.
+fn relative_time(at: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    let age = (now - at).max(0);
+    match age {
+        0..=59 => format!("{age} s ago"),
+        60..=3599 => format!("{} min ago", age / 60),
+        3600..=86399 => format!("{} h ago", age / 3600),
+        _ => format!("{} d ago", age / 86400),
+    }
 }
 
 fn section_label(label: &str, t: &Tokens) -> AnyElement {

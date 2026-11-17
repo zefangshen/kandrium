@@ -567,7 +567,68 @@ impl AppShell {
         match panel {
             WikiPanel::Status => self.reload_wiki_status(),
             WikiPanel::Lint => self.run_wiki_lint(),
+            WikiPanel::History => self.reload_history(),
             WikiPanel::Setup => {}
+        }
+        cx.notify();
+    }
+
+    /// Load run manifests for the History panel, newest first.
+    fn reload_history(&mut self) {
+        match self.store.history_runs() {
+            Ok(runs) => {
+                if let Some(selected) = &self.wiki.history_selected
+                    && !runs.iter().any(|run| &run.run_id == selected)
+                {
+                    self.wiki.history_selected = None;
+                }
+                self.wiki.history = runs;
+            }
+            Err(error) => {
+                self.wiki.history.clear();
+                if self.wiki.panel == Some(WikiPanel::History) {
+                    self.wiki.panel_error = Some(error);
+                }
+            }
+        }
+        self.wiki.history_confirm = None;
+    }
+
+    /// Pick a run in the History panel.
+    pub(crate) fn select_history_run(&mut self, run_id: String, cx: &mut Context<Self>) {
+        self.wiki.history_selected = Some(run_id);
+        self.wiki.history_confirm = None;
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_history_undo(&mut self, cx: &mut Context<Self>) {
+        self.wiki.history_confirm = None;
+        cx.notify();
+    }
+
+    /// Undo a run from the History panel. The first click arms the button, the
+    /// second one restores the run; the Knowledge section reloads afterwards
+    /// because file restore bypasses the watcher's row bumps.
+    pub(crate) fn undo_history_run(&mut self, run_id: String, cx: &mut Context<Self>) {
+        if self.wiki.history_confirm.as_deref() != Some(run_id.as_str()) {
+            self.wiki.history_confirm = Some(run_id);
+            cx.notify();
+            return;
+        }
+        self.wiki.history_confirm = None;
+        self.wiki.panel_error = None;
+        match self.store.undo_history_run(&run_id, false) {
+            Ok(report) => {
+                self.load_notes();
+                self.load_wiki_pages();
+                self.load_documents();
+                self.reload_wiki_status();
+                self.reload_history();
+                if let Some(first) = report.conflicts.first() {
+                    self.wiki.panel_error = Some(format!("blocked by {first}"));
+                }
+            }
+            Err(error) => self.wiki.panel_error = Some(error),
         }
         cx.notify();
     }

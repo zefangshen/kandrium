@@ -286,6 +286,56 @@ impl Store {
     }
 
     // -----------------------------------------------------------------------
+    // History — run manifests live beside the database, so these work whenever
+    // the write handle does.
+    // -----------------------------------------------------------------------
+
+    fn history_store(&self) -> StoreResult<kandrium_core::history::HistoryStore> {
+        self.write
+            .as_ref()
+            .and_then(kandrium_core::history::HistoryStore::for_connection)
+            .ok_or_else(|| "history needs a file-backed database".to_string())
+    }
+
+    /// Run manifests, newest first.
+    pub fn history_runs(&self) -> StoreResult<Vec<kandrium_core::history::Manifest>> {
+        let mut runs = self
+            .history_store()?
+            .load_all()
+            .map_err(|e| e.to_string())?;
+        runs.sort_by(|a, b| {
+            b.started_at
+                .cmp(&a.started_at)
+                .then_with(|| b.run_id.cmp(&a.run_id))
+        });
+        Ok(runs)
+    }
+
+    /// One run's manifest, for the detail pane.
+    pub fn history_run(&self, run_id: &str) -> StoreResult<kandrium_core::history::Manifest> {
+        self.history_store()?
+            .load(run_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("run {run_id} not found"))
+    }
+
+    /// Undo one run. The caller reloads the section afterwards.
+    pub fn undo_history_run(
+        &mut self,
+        run_id: &str,
+        force: bool,
+    ) -> StoreResult<kandrium_core::history::UndoReport> {
+        let store = self.history_store()?;
+        let roots = kandrium_core::history::Roots::resolve();
+        let db = self
+            .write
+            .as_mut()
+            .ok_or_else(|| "database is closed".to_string())?;
+        kandrium_core::history::undo_run(db, &store, &roots, run_id, force)
+            .map_err(|e| e.to_string())
+    }
+
+    // -----------------------------------------------------------------------
     // Wiki index — a derived view over the page files and the documents
     // folder. Reads use the read handle; refresh/reindex use the write one.
     // -----------------------------------------------------------------------
