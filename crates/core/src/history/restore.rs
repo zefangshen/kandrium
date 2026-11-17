@@ -326,7 +326,14 @@ pub fn preflight(store: &HistoryStore, roots: &Roots, manifest: &Manifest) -> Ve
     let mut conflicts = Vec::new();
     let later = later_entries(store, manifest).unwrap_or_default();
 
-    for entry in &manifest.files {
+    // Only the last operation per path determines the state undo expects:
+    // a run that modified then deleted a file leaves it missing, and checking
+    // the earlier modify against the current disk would falsely conflict.
+    for entry in last_per_path(
+        &manifest.files,
+        |entry| (entry.root, entry.path.clone()),
+        |entry| entry.seq,
+    ) {
         if !entry.restorable {
             continue;
         }
@@ -379,7 +386,11 @@ pub fn preflight(store: &HistoryStore, roots: &Roots, manifest: &Manifest) -> Ve
         }
     }
 
-    for entry in &manifest.links {
+    for entry in last_per_path(
+        &manifest.links,
+        |entry| (entry.root, entry.path.clone()),
+        |entry| entry.seq,
+    ) {
         if later.contains(&(entry.root, entry.path.clone())) {
             conflicts.push(conflict(entry.root, &entry.path, "written by a later run"));
             continue;
@@ -399,7 +410,11 @@ pub fn preflight(store: &HistoryStore, roots: &Roots, manifest: &Manifest) -> Ve
         }
     }
 
-    for entry in &manifest.dirs {
+    for entry in last_per_path(
+        &manifest.dirs,
+        |entry| (entry.root, entry.path.clone()),
+        |entry| entry.seq,
+    ) {
         if later.contains(&(entry.root, entry.path.clone())) {
             conflicts.push(conflict(entry.root, &entry.path, "written by a later run"));
             continue;
@@ -428,6 +443,28 @@ pub fn preflight(store: &HistoryStore, roots: &Roots, manifest: &Manifest) -> Ve
         }
     }
     conflicts
+}
+
+/// The highest-`seq` entry per `(root, path)`. Used only by preflight, which
+/// must compare the run's net effect with the current disk, not every
+/// intermediate operation on the same path.
+fn last_per_path<'a, T>(
+    entries: &'a [T],
+    key: impl Fn(&T) -> (RootKind, String),
+    seq: impl Fn(&T) -> i64,
+) -> Vec<&'a T> {
+    let mut last: std::collections::HashMap<(RootKind, String), &'a T> =
+        std::collections::HashMap::new();
+    for entry in entries {
+        let entry_key = key(entry);
+        match last.get(&entry_key) {
+            Some(previous) if seq(previous) >= seq(entry) => {}
+            _ => {
+                last.insert(entry_key, entry);
+            }
+        }
+    }
+    last.into_values().collect()
 }
 
 /// Entries from runs that started at or after this one, so undo never deletes
@@ -507,10 +544,10 @@ fn reconcile(db: &Connection, roots: &Roots, manifest: &Manifest) -> Result<()> 
 fn orphan_projects(db: &Connection, manifest: &Manifest) -> Vec<String> {
     let mut ids = BTreeSet::new();
     for entry in &manifest.files {
-        if entry.root == RootKind::Projects {
-            if let Some(id) = entry.path.split('/').next() {
-                ids.insert(id.to_string());
-            }
+        if entry.root == RootKind::Projects
+            && let Some(id) = entry.path.split('/').next()
+        {
+            ids.insert(id.to_string());
         }
     }
     ids.into_iter()

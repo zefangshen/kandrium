@@ -53,6 +53,16 @@ impl HistoryStore {
         Self::for_db(&crate::db::resolve_db_path())
     }
 
+    /// History beside a live connection's database file. `None` for an
+    /// in-memory database, which has no persistent files to restore.
+    pub fn for_connection(db: &rusqlite::Connection) -> Option<Self> {
+        let path = db.path()?;
+        if path.is_empty() {
+            return None;
+        }
+        Some(Self::for_db(Path::new(path)))
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }

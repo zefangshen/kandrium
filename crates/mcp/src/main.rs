@@ -254,6 +254,9 @@ struct WriteWikiPageInput {
     agent: Option<String>,
     /// Value from get_wiki_instructions
     instructions_version: u32,
+    /// Group this write into a history run
+    #[serde(default)]
+    run_id: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -273,6 +276,9 @@ struct PatchWikiPageInput {
     agent: Option<String>,
     /// Value from get_wiki_instructions
     instructions_version: u32,
+    /// Group this patch into a history run
+    #[serde(default)]
+    run_id: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -287,6 +293,9 @@ struct DeleteWikiPageInput {
     force: Option<bool>,
     /// Value from get_wiki_instructions
     instructions_version: u32,
+    /// Group this delete into a history run
+    #[serde(default)]
+    run_id: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema, Default)]
@@ -349,6 +358,24 @@ struct ListWikiDedupCandidatesInput {
     /// Maximum candidates (default 20, capped at 50)
     #[serde(default)]
     limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+struct ListRunsInput {
+    /// Maximum runs to return (default 50, capped at 200)
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct UndoRunInput {
+    /// History run id returned by list_runs or a write
+    run_id: String,
+    /// Skip files that changed since the run and force row restore
+    #[serde(default)]
+    force: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -867,7 +894,8 @@ impl KandriumServer {
         Parameters(input): Parameters<WriteWikiPageInput>,
     ) -> Result<CallToolResult, ErrorData> {
         self.run_wiki_write(|db, wiki, _| {
-            core::write_page(
+            let run_id = input.run_id.clone();
+            let result = core::write_page(
                 db,
                 wiki,
                 &core::WritePageSpec {
@@ -877,9 +905,11 @@ impl KandriumServer {
                     force: input.force.unwrap_or(false),
                     agent: input.agent,
                     instructions_version: input.instructions_version,
-                    run_id: None,
+                    run_id: run_id.clone(),
                 },
-            )
+            )?;
+            settle_run(db, &run_id)?;
+            Ok(result)
         })
     }
 
@@ -891,7 +921,8 @@ impl KandriumServer {
         Parameters(input): Parameters<PatchWikiPageInput>,
     ) -> Result<CallToolResult, ErrorData> {
         self.run_wiki_write(|db, wiki, _| {
-            core::patch_page(
+            let run_id = input.run_id.clone();
+            let result = core::patch_page(
                 db,
                 wiki,
                 &core::PatchPageSpec {
@@ -902,9 +933,11 @@ impl KandriumServer {
                     force: input.force.unwrap_or(false),
                     agent: input.agent,
                     instructions_version: input.instructions_version,
-                    run_id: None,
+                    run_id: run_id.clone(),
                 },
-            )
+            )?;
+            settle_run(db, &run_id)?;
+            Ok(result)
         })
     }
 
@@ -915,6 +948,7 @@ impl KandriumServer {
     ) -> Result<CallToolResult, ErrorData> {
         self.run_wiki_write(|db, wiki, _| {
             let path = input.path;
+            let run_id = input.run_id.clone();
             core::delete_page(
                 db,
                 wiki,
@@ -923,9 +957,10 @@ impl KandriumServer {
                     expected_hash: input.expected_hash,
                     force: input.force.unwrap_or(false),
                     instructions_version: input.instructions_version,
-                    run_id: None,
+                    run_id: run_id.clone(),
                 },
             )?;
+            settle_run(db, &run_id)?;
             Ok(serde_json::json!({ "path": path, "deleted": true }))
         })
     }
@@ -965,6 +1000,161 @@ impl KandriumServer {
             let candidates = core::dedup_candidates(db, &input.source, limit)?;
             Ok(serde_json::json!({ "candidates": candidates }))
         })
+    }
+
+    #[tool(
+        description = "List recorded history runs, newest first, with file, directory and row change counts"
+    )]
+    fn list_runs(
+        &self,
+        Parameters(input): Parameters<ListRunsInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let limit = input.limit.unwrap_or(50).min(200);
+        self.run_wiki(|db, _, _| {
+            let store = core::history::HistoryStore::for_connection(db)
+                .ok_or_else(|| core::KandriumError::new("history needs a file-backed database"))?;
+            let mut manifests = store.load_all()?;
+            manifests.sort_by(|a, b| {
+                b.started_at
+                    .cmp(&a.started_at)
+                    .then_with(|| b.run_id.cmp(&a.run_id))
+            });
+            let runs: Vec<RunSummary> =
+                manifests.iter().take(limit).map(RunSummary::from).collect();
+            Ok(serde_json::json!({ "runs": runs }))
+        })
+    }
+
+    #[tool(
+        description = "Undo one history run: restores its files, directories and rows. Returns conflicts instead of changing anything when the run cannot be undone without force."
+    )]
+    fn undo_run(
+        &self,
+        Parameters(input): Parameters<UndoRunInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let roots = self.restore_roots();
+        self.run_wiki_write(|db, _, _| {
+            let store = core::history::HistoryStore::for_connection(db)
+                .ok_or_else(|| core::KandriumError::new("history needs a file-backed database"))?;
+            let report = core::history::undo_run(
+                db,
+                &store,
+                &roots,
+                &input.run_id,
+                input.force.unwrap_or(false),
+            )?;
+            Ok(undo_json(&report))
+        })
+    }
+
+    /// Roots restored paths are re-joined under: the server's wiki/documents
+    /// roots (so tests and overrides match) and the default notes/projects.
+    fn restore_roots(&self) -> core::history::Roots {
+        let mut roots = core::history::Roots::resolve();
+        roots.wiki = self.wiki_root.clone();
+        roots.documents = self.documents_root.clone();
+        roots
+    }
+}
+
+/// Close a client-supplied run id once its mutating call finishes. A live
+/// explicit run (with an open `run_undo` row) is left for its closer.
+fn settle_run(db: &rusqlite::Connection, run_id: &Option<String>) -> core::Result<()> {
+    let (Some(run_id), Some(store)) = (
+        run_id.as_deref(),
+        core::history::HistoryStore::for_connection(db),
+    ) else {
+        return Ok(());
+    };
+    core::history::close_unmanaged_run(db, &store, run_id, core::history::ClosedBy::Explicit)
+}
+
+fn undo_json(report: &core::history::UndoReport) -> serde_json::Value {
+    let skipped: Vec<serde_json::Value> = report
+        .files
+        .skipped
+        .iter()
+        .map(|entry| serde_json::json!({ "path": entry.path, "reason": entry.reason }))
+        .collect();
+    serde_json::json!({
+        "runId": report.run_id,
+        "state": report.state.as_str(),
+        "blocked": report.blocked,
+        "conflicts": report.conflicts,
+        "files": {
+            "restored": report.files.restored,
+            "deleted": report.files.deleted,
+            "dirsRecreated": report.files.dirs_recreated,
+            "dirsRemoved": report.files.dirs_removed,
+            "skipped": skipped,
+            "orphans": report.files.orphans,
+        },
+        "rows": {
+            "updated": report.rows.updated,
+            "inserted": report.rows.inserted,
+            "deleted": report.rows.deleted,
+            "note": report.rows.note,
+        },
+    })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunSummary {
+    run_id: String,
+    label: String,
+    kind: String,
+    state: String,
+    started_at: i64,
+    finished_at: Option<i64>,
+    closed_by: Option<String>,
+    operation: Option<String>,
+    agent: Option<String>,
+    files: usize,
+    dirs: usize,
+    links: usize,
+    unrestorable: Vec<serde_json::Value>,
+    rows: Option<serde_json::Value>,
+}
+
+impl From<&core::history::Manifest> for RunSummary {
+    fn from(manifest: &core::history::Manifest) -> Self {
+        let unrestorable = manifest
+            .files
+            .iter()
+            .filter(|entry| !entry.restorable)
+            .map(|entry| {
+                serde_json::json!({
+                    "path": entry.path,
+                    "reason": entry.reason.map(|reason| reason.as_str()),
+                })
+            })
+            .collect();
+        let rows = manifest.rows.as_ref().map(|rows| {
+            serde_json::json!({
+                "inserted": rows.counts.inserted,
+                "updated": rows.counts.updated,
+                "deleted": rows.counts.deleted,
+                "contended": rows.contended,
+                "restorable": rows.restorable,
+            })
+        });
+        Self {
+            run_id: manifest.run_id.clone(),
+            label: manifest.label.clone(),
+            kind: manifest.kind.as_str().to_string(),
+            state: manifest.state.as_str().to_string(),
+            started_at: manifest.started_at,
+            finished_at: manifest.finished_at,
+            closed_by: manifest.closed_by.map(|by| by.as_str().to_string()),
+            operation: manifest.operation.clone(),
+            agent: manifest.agent.clone(),
+            files: manifest.files.len(),
+            dirs: manifest.dirs.len(),
+            links: manifest.links.len(),
+            unrestorable,
+            rows,
+        }
     }
 }
 
@@ -1060,6 +1250,7 @@ mod tests {
             "lint_wiki",
             "list_archived_cards",
             "list_boards",
+            "list_runs",
             "list_wiki_dedup_candidates",
             "list_wiki_pages",
             "list_wiki_sources",
@@ -1072,11 +1263,151 @@ mod tests {
             "record_wiki_run",
             "restore_card",
             "search_wiki",
+            "undo_run",
             "update_card",
             "write_wiki_page",
         ];
         let expected: Vec<String> = expected.iter().map(|name| name.to_string()).collect();
         assert_eq!(names, expected);
+    }
+
+    fn page(title: &str, body: &str) -> String {
+        format!(
+            "---\ntype: concept\ntitle: {title}\nsummary: A page about {title}.\n\
+             aliases: [{title}]\nreviewed: false\n---\n{body}\n"
+        )
+    }
+
+    fn file_backed_server(
+        wiki: &std::path::Path,
+        documents: &std::path::Path,
+        db_path: &std::path::Path,
+    ) -> KandriumServer {
+        let mut db = core::open_db(db_path).unwrap();
+        core::bootstrap(&mut db, db_path).unwrap();
+        KandriumServer::with_roots(db, wiki.to_path_buf(), documents.to_path_buf())
+    }
+
+    #[test]
+    fn wiki_writes_group_into_one_run_and_undo_restores_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let wiki = dir.path().join("wiki");
+        let documents = dir.path().join("documents");
+        std::fs::create_dir_all(&wiki).unwrap();
+        std::fs::create_dir_all(&documents).unwrap();
+        let server = file_backed_server(&wiki, &documents, &dir.path().join("kandrium.db"));
+
+        let path = "concepts/attention.md";
+        let original = page("Attention", "Original body.");
+        server
+            .write_wiki_page(Parameters(WriteWikiPageInput {
+                path: path.into(),
+                content: original.clone(),
+                expected_hash: None,
+                force: None,
+                agent: None,
+                instructions_version: core::WIKI_INSTRUCTIONS_VERSION,
+                run_id: None,
+            }))
+            .unwrap();
+
+        server
+            .write_wiki_page(Parameters(WriteWikiPageInput {
+                path: path.into(),
+                content: page("Attention", "Middle body."),
+                expected_hash: None,
+                force: None,
+                agent: None,
+                instructions_version: core::WIKI_INSTRUCTIONS_VERSION,
+                run_id: Some("run1".into()),
+            }))
+            .unwrap();
+        server
+            .patch_wiki_page(Parameters(PatchWikiPageInput {
+                path: path.into(),
+                old_text: "Middle body.".into(),
+                new_text: "Final body.".into(),
+                expected_hash: None,
+                force: None,
+                agent: None,
+                instructions_version: core::WIKI_INSTRUCTIONS_VERSION,
+                run_id: Some("run1".into()),
+            }))
+            .unwrap();
+        server
+            .delete_wiki_page(Parameters(DeleteWikiPageInput {
+                path: path.into(),
+                expected_hash: None,
+                force: None,
+                instructions_version: core::WIKI_INSTRUCTIONS_VERSION,
+                run_id: Some("run1".into()),
+            }))
+            .unwrap();
+        assert!(!wiki.join(path).exists());
+
+        let listed = server
+            .list_runs(Parameters(ListRunsInput { limit: None }))
+            .unwrap();
+        assert_ne!(listed.is_error, Some(true));
+        let payload: serde_json::Value = serde_json::from_str(&text(&listed)).unwrap();
+        let runs = payload["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 1, "{payload}");
+        assert_eq!(runs[0]["runId"], "run1");
+        assert_eq!(runs[0]["state"], "committed");
+        assert_eq!(runs[0]["files"], 3);
+
+        let undone = server
+            .undo_run(Parameters(UndoRunInput {
+                run_id: "run1".into(),
+                force: None,
+            }))
+            .unwrap();
+        assert_ne!(undone.is_error, Some(true));
+        let payload: serde_json::Value = serde_json::from_str(&text(&undone)).unwrap();
+        assert_eq!(payload["state"], "undone", "{payload}");
+        assert_eq!(payload["blocked"], false);
+        assert_eq!(std::fs::read_to_string(wiki.join(path)).unwrap(), original);
+    }
+
+    #[test]
+    fn read_only_mode_refuses_writes_and_undo_but_allows_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let wiki = dir.path().join("wiki");
+        let documents = dir.path().join("documents");
+        std::fs::create_dir_all(&wiki).unwrap();
+        std::fs::create_dir_all(&documents).unwrap();
+        let db_path = dir.path().join("kandrium.db");
+        let mut db = core::open_db(&db_path).unwrap();
+        core::bootstrap(&mut db, &db_path).unwrap();
+        let server = KandriumServer::with_roots_and_mode(db, wiki, documents, WikiMode::Read);
+
+        let write = server
+            .write_wiki_page(Parameters(WriteWikiPageInput {
+                path: "concepts/attention.md".into(),
+                content: page("Attention", "Body."),
+                expected_hash: None,
+                force: None,
+                agent: None,
+                instructions_version: core::WIKI_INSTRUCTIONS_VERSION,
+                run_id: None,
+            }))
+            .unwrap();
+        assert_eq!(write.is_error, Some(true));
+        assert!(text(&write).contains("wiki writes are disabled"));
+
+        let undo = server
+            .undo_run(Parameters(UndoRunInput {
+                run_id: "run1".into(),
+                force: None,
+            }))
+            .unwrap();
+        assert_eq!(undo.is_error, Some(true));
+        assert!(text(&undo).contains("wiki writes are disabled"));
+
+        let listed = server
+            .list_runs(Parameters(ListRunsInput { limit: None }))
+            .unwrap();
+        assert_ne!(listed.is_error, Some(true));
     }
 
     fn text(result: &CallToolResult) -> String {
@@ -1182,6 +1513,7 @@ mod tests {
                 force: None,
                 agent: Some("codex".into()),
                 instructions_version: core::WIKI_INSTRUCTIONS_VERSION,
+                run_id: None,
             }))
             .unwrap();
         assert_ne!(created.is_error, Some(true));
@@ -1198,6 +1530,7 @@ mod tests {
                 force: None,
                 agent: None,
                 instructions_version: core::WIKI_INSTRUCTIONS_VERSION,
+                run_id: None,
             }))
             .unwrap();
         assert_eq!(conflict.is_error, Some(true));
@@ -1220,6 +1553,7 @@ mod tests {
                 force: None,
                 agent: Some("codex".into()),
                 instructions_version: core::WIKI_INSTRUCTIONS_VERSION,
+                run_id: None,
             }))
             .unwrap();
         assert_ne!(patched.is_error, Some(true));
@@ -1279,6 +1613,7 @@ mod tests {
                 expected_hash: None,
                 force: None,
                 instructions_version: core::WIKI_INSTRUCTIONS_VERSION,
+                run_id: None,
             }))
             .unwrap();
         let payload: serde_json::Value = serde_json::from_str(&text(&deleted)).unwrap();

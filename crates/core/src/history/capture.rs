@@ -49,11 +49,7 @@ impl RunContext {
     /// Returns `None` for an in-memory database: there is nowhere persistent to
     /// put the history, and no user file can be restored from it anyway.
     pub fn for_connection(db: &rusqlite::Connection, run_id: &str) -> Option<Self> {
-        let path = db.path()?;
-        if path.is_empty() {
-            return None;
-        }
-        Some(Self::new(HistoryStore::for_db(Path::new(path)), run_id))
+        Some(Self::new(HistoryStore::for_connection(db)?, run_id))
     }
 
     /// Same as [`Self::for_connection`], for the optional run id carried by a

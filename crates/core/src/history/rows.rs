@@ -501,14 +501,15 @@ pub(crate) fn open_snapshot(path: &Path) -> Result<Connection> {
     )?)
 }
 
-/// Snapshot one table as column names plus keyed owned values, for row restore.
-pub(crate) fn table_rows(
-    db: &Connection,
-    table: &TableSpec,
-) -> Result<(
+/// Column names plus every row keyed by its primary-key components, as used by
+/// snapshots and row restore.
+pub(crate) type TableRows = (
     Vec<String>,
     BTreeMap<Vec<String>, Vec<rusqlite::types::Value>>,
-)> {
+);
+
+/// Snapshot one table as column names plus keyed owned values, for row restore.
+pub(crate) fn table_rows(db: &Connection, table: &TableSpec) -> Result<TableRows> {
     let columns = table_columns(db, table.name)?;
     let names: Vec<String> = columns.iter().map(|column| column.name.clone()).collect();
     let key_indexes: Vec<usize> = table
