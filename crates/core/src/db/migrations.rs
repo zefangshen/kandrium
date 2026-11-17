@@ -71,13 +71,18 @@ pub const SCHEMA_V12_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../migrations/0012_wiki.sql"
 ));
+/// Additive v13 step (run-scoped file and row history).
+pub const SCHEMA_V13_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../migrations/0013_run_history.sql"
+));
 /// Latest schema version. Must match the number of entries in the migration set.
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// The SQL of every migration, in application order. `SCHEMA_VERSION` must
 /// equal its length; `every_sql_file_is_registered` proves the list still
 /// covers every file under `migrations/`.
-const MIGRATION_SQL: [&str; 12] = [
+const MIGRATION_SQL: [&str; 13] = [
     SCHEMA_SQL,
     SCHEMA_V2_SQL,
     SCHEMA_V3_SQL,
@@ -90,6 +95,7 @@ const MIGRATION_SQL: [&str; 12] = [
     SCHEMA_V10_SQL,
     SCHEMA_V11_SQL,
     SCHEMA_V12_SQL,
+    SCHEMA_V13_SQL,
 ];
 
 /// The ordered migration set. `rusqlite_migration` tracks the applied version
@@ -685,5 +691,99 @@ mod tests {
             })
             .unwrap();
         assert_eq!(violations, 0);
+    }
+
+    /// A v12 database only gains the additive history tables; existing rows
+    /// stay untouched, no run is open, and the partial unique index makes a
+    /// second `open` row impossible while `committed` rows coexist.
+    #[test]
+    fn v12_database_gains_the_run_history_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open_db(&dir.path().join("t.db")).unwrap();
+        Migrations::new(vec![
+            M::up(SCHEMA_SQL),
+            M::up(SCHEMA_V2_SQL),
+            M::up(SCHEMA_V3_SQL),
+            M::up(SCHEMA_V4_SQL),
+            M::up(SCHEMA_V5_SQL),
+            M::up(SCHEMA_V6_SQL),
+            M::up(SCHEMA_V7_SQL),
+            M::up(SCHEMA_V8_SQL),
+            M::up(SCHEMA_V9_SQL),
+            M::up(SCHEMA_V10_SQL),
+            M::up(SCHEMA_V11_SQL),
+            M::up(SCHEMA_V12_SQL),
+        ])
+        .to_latest(&mut db)
+        .unwrap();
+        db.execute(
+            "INSERT INTO boards (id, title, position) VALUES ('b1', 'Board', 0)",
+            [],
+        )
+        .unwrap();
+
+        run_schema(&mut db).unwrap();
+
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(version, 13);
+
+        for table in ["run_history", "run_row_changes", "run_undo"] {
+            let count: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = ?",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "missing table {table}");
+        }
+        let index: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_run_undo_one_open'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 1);
+        let boards: i64 = db
+            .query_row("SELECT COUNT(*) FROM boards WHERE id = 'b1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(boards, 1);
+
+        // The open slot is a database guarantee, not a convention.
+        db.execute(
+            "INSERT INTO run_undo (run_id, state, last_heartbeat_at) VALUES ('r1', 'committed', 1)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO run_undo (run_id, state, last_heartbeat_at) VALUES ('r2', 'open', 1)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            db.execute(
+                "INSERT INTO run_undo (run_id, state, last_heartbeat_at) VALUES ('r3', 'open', 1)",
+                [],
+            )
+            .is_err()
+        );
+        // Closing the first open run frees the slot.
+        db.execute(
+            "UPDATE run_undo SET state = 'committed' WHERE run_id = 'r2'",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO run_undo (run_id, state, last_heartbeat_at) VALUES ('r3', 'open', 1)",
+            [],
+        )
+        .unwrap();
     }
 }

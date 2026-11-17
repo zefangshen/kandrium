@@ -10,6 +10,7 @@ pub mod db;
 pub mod documents;
 pub mod error;
 pub mod fsutil;
+pub mod history;
 pub mod import;
 pub mod logging;
 pub mod models;
