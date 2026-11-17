@@ -20,8 +20,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::constants::status_from_column_title;
 use crate::db::uid;
+use crate::documents;
 use crate::error::{KandriumError, Result};
 use crate::fsutil::{self, FsEntry};
+use crate::history::{RootKind, RunContext};
 use crate::models::CardStatus;
 use crate::services::{board, column};
 
@@ -719,12 +721,29 @@ pub fn reorder_project(db: &Connection, id: &str, index: usize) -> Result<()> {
 /// Delete a project: its row and its board (cascading columns → cards →
 /// all_card_order), then its on-disk folder.
 pub fn delete_project(db: &Connection, root: &Path, id: &str) -> Result<()> {
+    delete_project_in_run(db, root, id, None)
+}
+
+/// Run-scoped variant of [`delete_project`]: the on-disk folder is enumerated
+/// in full before the SQL transaction, so rows and files can both be restored.
+pub fn delete_project_in_run(
+    db: &Connection,
+    root: &Path,
+    id: &str,
+    run: Option<&RunContext>,
+) -> Result<()> {
     let board_id: String = db
         .query_row("SELECT board_id FROM projects WHERE id = ?", [id], |r| {
             r.get(0)
         })
         .optional()?
         .ok_or_else(|| KandriumError::new("Project not found"))?;
+    if let Some(ctx) = run {
+        let dir = project_dir(root, id);
+        if dir.exists() {
+            ctx.capture_tree(RootKind::Projects, root, &dir)?;
+        }
+    }
     let tx = db.unchecked_transaction()?;
     tx.execute("DELETE FROM projects WHERE id = ?", [id])?;
     tx.execute("DELETE FROM boards WHERE id = ?", [board_id])?;
@@ -841,6 +860,17 @@ pub fn rename_folder(db: &Connection, id: &str, name: &str) -> Result<ProjectFol
 /// Delete a folder and everything under it: descendant folders and their
 /// projects (plus each project's board), then every project's on-disk folder.
 pub fn delete_folder(db: &Connection, root: &Path, id: &str) -> Result<()> {
+    delete_folder_in_run(db, root, id, None)
+}
+
+/// Run-scoped variant of [`delete_folder`]: every affected project folder is
+/// captured before the SQL transaction.
+pub fn delete_folder_in_run(
+    db: &Connection,
+    root: &Path,
+    id: &str,
+    run: Option<&RunContext>,
+) -> Result<()> {
     let folder_ids = descendant_folder_ids(db, id)?;
     if folder_ids.is_empty() {
         return Err(KandriumError::new("Folder not found"));
@@ -857,6 +887,15 @@ pub fn delete_folder(db: &Connection, root: &Path, id: &str) -> Result<()> {
         })?;
         for row in rows {
             projects.push(row?);
+        }
+    }
+
+    if let Some(ctx) = run {
+        for (project_id, _) in &projects {
+            let dir = project_dir(root, project_id);
+            if dir.exists() {
+                ctx.capture_tree(RootKind::Projects, root, &dir)?;
+            }
         }
     }
 
@@ -917,9 +956,28 @@ pub fn read_doc(root: &Path, id: &str, rel: &Path) -> Result<String> {
 /// Write one text document inside a project folder, with the same path guard
 /// as [`read_doc`].
 pub fn write_doc(root: &Path, id: &str, rel: &Path, text: &str) -> Result<()> {
+    write_doc_in_run(root, id, rel, text, None)
+}
+
+/// Run-scoped variant of [`write_doc`]. Project files are keyed
+/// `<project_id>/<rel>` under the projects root.
+pub fn write_doc_in_run(
+    root: &Path,
+    id: &str,
+    rel: &Path,
+    text: &str,
+    run: Option<&RunContext>,
+) -> Result<()> {
     let dir = project_dir(root, id);
     let path = fsutil::guard(&dir, &dir.join(rel))?;
+    let guard = match run {
+        Some(ctx) => Some(ctx.capture(RootKind::Projects, root, &path)?),
+        None => None,
+    };
     fsutil::write_atomic(&path, text)?;
+    if let Some(guard) = guard {
+        guard.commit(Some(text.as_bytes()))?;
+    }
     Ok(())
 }
 
@@ -929,6 +987,17 @@ pub fn write_doc(root: &Path, id: &str, rel: &Path, text: &str) -> Result<()> {
 /// `name` must be a bare file name with a `.md`, `.markdown` or `.txt`
 /// extension; separators, hidden names and existing paths are rejected.
 pub fn create_doc_file(root: &Path, id: &str, parent_rel: &Path, name: &str) -> Result<PathBuf> {
+    create_doc_file_in_run(root, id, parent_rel, name, None)
+}
+
+/// Run-scoped variant of [`create_doc_file`].
+pub fn create_doc_file_in_run(
+    root: &Path,
+    id: &str,
+    parent_rel: &Path,
+    name: &str,
+    run: Option<&RunContext>,
+) -> Result<PathBuf> {
     let dir = project_dir(root, id);
     let parent = project_parent(&dir, parent_rel)?;
     let name = validate_doc_name(name)?;
@@ -939,13 +1008,32 @@ pub fn create_doc_file(root: &Path, id: &str, parent_rel: &Path, name: &str) -> 
     if target.exists() {
         return Err(KandriumError::new(format!("\"{name}\" already exists")));
     }
+    let guard = match run {
+        Some(ctx) => Some(ctx.capture(RootKind::Projects, root, &target)?),
+        None => None,
+    };
     fsutil::write_atomic(&target, "")?;
+    if let Some(guard) = guard {
+        guard.commit(Some(b""))?;
+    }
     Ok(target)
 }
 
 /// Create a folder inside `parent_rel` (an empty path means the project root).
 /// Returns the absolute path of the new folder.
 pub fn create_doc_folder(root: &Path, id: &str, parent_rel: &Path, name: &str) -> Result<PathBuf> {
+    create_doc_folder_in_run(root, id, parent_rel, name, None)
+}
+
+/// Run-scoped variant of [`create_doc_folder`]: the new directory is recorded
+/// as an empty `mkdir` entry.
+pub fn create_doc_folder_in_run(
+    root: &Path,
+    id: &str,
+    parent_rel: &Path,
+    name: &str,
+    run: Option<&RunContext>,
+) -> Result<PathBuf> {
     let dir = project_dir(root, id);
     let parent = project_parent(&dir, parent_rel)?;
     let name = validate_doc_name(name)?;
@@ -954,7 +1042,21 @@ pub fn create_doc_folder(root: &Path, id: &str, parent_rel: &Path, name: &str) -
         return Err(KandriumError::new(format!("\"{name}\" already exists")));
     }
     fs::create_dir(&target)?;
+    if let Some(ctx) = run {
+        ctx.record_tree(RootKind::Projects, root, &target)?;
+    }
     Ok(target)
+}
+
+/// Import a PDF or Markdown file into a project folder under the run, keyed
+/// `<project_id>/…` rather than as a documents-root entry.
+pub fn import_doc_in_run(
+    source: &Path,
+    dest_dir: &Path,
+    root: &Path,
+    run: Option<&RunContext>,
+) -> Result<PathBuf> {
+    documents::import_file_into(source, dest_dir, root, RootKind::Projects, run)
 }
 
 /// Resolve `parent_rel` against the project folder, requiring the result to be
@@ -1500,6 +1602,127 @@ mod tests {
                 .map(|c| (c.name.as_str(), c.identifier.as_str()))
                 .collect::<Vec<_>>(),
             [("Zulu", "zul"), ("Alpha", "alp")]
+        );
+    }
+
+    fn run_ctx(f: &Fixture) -> RunContext {
+        let store = crate::history::HistoryStore::new(f._tmp.path().join("history"));
+        RunContext::new(store, "run1")
+    }
+
+    #[test]
+    fn run_scoped_project_documents_are_keyed_by_project() {
+        let f = fixture();
+        let ctx = run_ctx(&f);
+        let project = create_project(&f.db, &f.root, "Atlas", None, "software").unwrap();
+
+        write_doc_in_run(
+            &f.root,
+            &project.id,
+            Path::new("notes.md"),
+            "changed",
+            Some(&ctx),
+        )
+        .unwrap();
+        create_doc_file_in_run(&f.root, &project.id, Path::new(""), "fresh.md", Some(&ctx))
+            .unwrap();
+        create_doc_folder_in_run(&f.root, &project.id, Path::new(""), "archive", Some(&ctx))
+            .unwrap();
+        let source = f._tmp.path().join("report.pdf");
+        fs::write(&source, b"%PDF-1.4 atlas").unwrap();
+        import_doc_in_run(
+            &source,
+            &project_dir(&f.root, &project.id),
+            &f.root,
+            Some(&ctx),
+        )
+        .unwrap();
+
+        let manifest = ctx.store().load(ctx.run_id()).unwrap().unwrap();
+        assert!(manifest.files.iter().all(|entry| {
+            entry.root == RootKind::Projects && entry.path.starts_with(&format!("{}/", project.id))
+        }));
+        assert!(manifest.files.iter().any(|entry| {
+            entry.path == format!("{}/notes.md", project.id)
+                && entry.op == crate::history::FileOp::Modify
+        }));
+        assert!(manifest.files.iter().any(|entry| {
+            entry.path == format!("{}/fresh.md", project.id)
+                && entry.op == crate::history::FileOp::Create
+        }));
+        assert!(manifest.files.iter().any(|entry| {
+            entry.path == format!("{}/report.pdf", project.id)
+                && entry.op == crate::history::FileOp::Create
+        }));
+        assert!(manifest.dirs.iter().any(|entry| {
+            entry.path == format!("{}/archive", project.id)
+                && entry.op == crate::history::DirOp::Mkdir
+                && entry.empty
+        }));
+    }
+
+    #[test]
+    fn run_scoped_project_delete_captures_the_tree_before_rows() {
+        let f = fixture();
+        let ctx = run_ctx(&f);
+        let project = create_project(&f.db, &f.root, "Doomed", None, "software").unwrap();
+        let dir = project_dir(&f.root, &project.id);
+        fs::create_dir_all(dir.join("papers").join("empty")).unwrap();
+        fs::write(dir.join("papers").join("a.md"), "a").unwrap();
+        std::os::unix::fs::symlink("papers", dir.join("current")).unwrap();
+
+        delete_project_in_run(&f.db, &f.root, &project.id, Some(&ctx)).unwrap();
+        assert!(!dir.exists());
+
+        let manifest = ctx.store().load(ctx.run_id()).unwrap().unwrap();
+        assert!(
+            manifest
+                .files
+                .iter()
+                .all(|entry| entry.op == crate::history::FileOp::Delete)
+        );
+        assert!(
+            manifest
+                .files
+                .iter()
+                .any(|entry| entry.path.ends_with("/README.md"))
+        );
+        assert!(
+            manifest
+                .files
+                .iter()
+                .any(|entry| entry.path.ends_with("/papers/a.md"))
+        );
+        assert!(manifest.dirs.iter().any(|entry| {
+            entry.path.ends_with("/papers/empty") && entry.op == crate::history::DirOp::Rmdir
+        }));
+        assert!(
+            manifest
+                .links
+                .iter()
+                .any(|entry| entry.path.ends_with("/current") && entry.target == "papers")
+        );
+        assert!(get_project(&f.db, &project.id).is_err());
+    }
+
+    #[test]
+    fn run_scoped_folder_delete_captures_each_project_tree() {
+        let f = fixture();
+        let ctx = run_ctx(&f);
+        let folder = create_folder(&f.db, "Archive", None).unwrap();
+        let project =
+            create_project(&f.db, &f.root, "Filed", Some(&folder.id), "software").unwrap();
+        let dir = project_dir(&f.root, &project.id);
+
+        delete_folder_in_run(&f.db, &f.root, &folder.id, Some(&ctx)).unwrap();
+        assert!(!dir.exists());
+
+        let manifest = ctx.store().load(ctx.run_id()).unwrap().unwrap();
+        assert!(
+            manifest
+                .files
+                .iter()
+                .any(|entry| entry.path == format!("{}/notes.md", project.id))
         );
     }
 }

@@ -234,6 +234,18 @@ pub fn import_file_in_run(
     root: &Path,
     run: Option<&RunContext>,
 ) -> Result<PathBuf> {
+    import_file_into(source, dest_dir, root, RootKind::Documents, run)
+}
+
+/// Import with an explicit capture root, so a project upload records a
+/// `projects` entry keyed `<project_id>/…` instead of a documents entry.
+pub(crate) fn import_file_into(
+    source: &Path,
+    dest_dir: &Path,
+    root: &Path,
+    capture_root: RootKind,
+    run: Option<&RunContext>,
+) -> Result<PathBuf> {
     let dest_dir = fsutil::guard(root, dest_dir)?;
     if !dest_dir.is_dir() {
         return Err(KandriumError::new("Upload target is not a folder"));
@@ -251,7 +263,7 @@ pub fn import_file_in_run(
         .ok_or_else(|| KandriumError::new("Invalid file name"))?;
     let target = unique_target(&dest_dir, Path::new(name));
     let guard = match run {
-        Some(ctx) => Some(ctx.capture(RootKind::Documents, root, &target)?),
+        Some(ctx) => Some(ctx.capture(capture_root, root, &target)?),
         None => None,
     };
     fs::copy(source, &target)?;
