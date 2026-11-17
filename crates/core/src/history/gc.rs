@@ -8,7 +8,6 @@
 //! a directory delete that would cross it marks the overflow `budget` instead of
 //! refusing the delete (see `capture::capture_tree`).
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -78,7 +77,7 @@ pub fn prune(
             .iter()
             .filter(|manifest| manifest.kind == kind && prunable(manifest))
             .collect();
-        group.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        group.sort_by_key(|a| std::cmp::Reverse(a.started_at));
         for (index, manifest) in group.iter().enumerate() {
             let over_count = index >= limit;
             let too_old = now.saturating_sub(manifest.started_at) > secs;
@@ -340,12 +339,6 @@ mod tests {
         f.store.save(&manifest).unwrap();
         commit_run(&f.db, &f.store, id, ClosedBy::Action).unwrap();
         id.to_string()
-    }
-
-    fn age(f: &Fixture, id: &str, started_at: i64) {
-        let mut manifest = f.store.load(id).unwrap().unwrap();
-        manifest.started_at = started_at;
-        f.store.save(&manifest).unwrap();
     }
 
     #[test]

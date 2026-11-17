@@ -323,7 +323,7 @@ pub fn delete_page(db: &mut Connection, root: &Path, spec: &DeletePageSpec) -> R
     tx.execute("DELETE FROM wiki_fts WHERE path = ?1", [&spec.rel_path])?;
     tx.commit()?;
 
-    refresh_source_states(db, &affected)?;
+    sources::refresh_states(db, &affected)?;
     index::write_index_md(db, &root)?;
     Ok(())
 }
@@ -639,24 +639,6 @@ fn mark_source_compiled(db: &Connection, rel_path: &str, now: i64) -> Result<()>
           WHERE rel_path = ?2 AND state != 'failed'",
         params![now, rel_path],
     )?;
-    Ok(())
-}
-
-fn refresh_source_states(db: &Connection, sources: &[String]) -> Result<()> {
-    for source in sources {
-        db.execute(
-            "UPDATE wiki_sources
-                SET state = CASE
-                    WHEN state IN ('failed', 'stale') THEN state
-                    WHEN EXISTS (SELECT 1 FROM wiki_page_sources
-                                  WHERE source_path = wiki_sources.rel_path)
-                        THEN 'compiled'
-                    ELSE 'indexed'
-                END
-              WHERE rel_path = ?1",
-            [source],
-        )?;
-    }
     Ok(())
 }
 

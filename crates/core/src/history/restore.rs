@@ -14,7 +14,7 @@ use rusqlite::Connection;
 
 use crate::error::Result;
 use crate::fsutil;
-use crate::wiki::{hash_file, index, refresh_sources};
+use crate::wiki::{hash_file, index, refresh_sources, sources};
 
 use super::store::HistoryStore;
 use super::{DirEntry, DirOp, FileEntry, FileOp, LinkEntry, Manifest, RootKind};
@@ -563,16 +563,21 @@ fn expected_skips(manifest: &Manifest) -> Vec<SkippedEntry> {
 fn reconcile(db: &Connection, roots: &Roots, manifest: &Manifest) -> Result<()> {
     let mut wiki = false;
     let mut documents = false;
+    let mut affected_sources = BTreeSet::new();
     for entry in &manifest.files {
         match entry.root {
             RootKind::Wiki if entry.path != "index.md" => {
                 wiki = true;
+                // Citations from before and after the reindex: a forgotten page
+                // loses its rows, a restored page gains them again.
+                affected_sources.extend(cited_sources(db, &entry.path)?);
                 let exists = roots.wiki.join(&entry.path).exists();
                 if exists {
                     index::reindex_page(db, &roots.wiki, &entry.path)?;
                 } else {
                     index::forget_page(db, &entry.path)?;
                 }
+                affected_sources.extend(cited_sources(db, &entry.path)?);
             }
             RootKind::Documents => documents = true,
             _ => {}
@@ -580,11 +585,20 @@ fn reconcile(db: &Connection, roots: &Roots, manifest: &Manifest) -> Result<()> 
     }
     if wiki {
         index::write_index_md(db, &roots.wiki)?;
+        let paths: Vec<String> = affected_sources.into_iter().collect();
+        sources::refresh_states(db, &paths)?;
     }
     if documents {
         refresh_sources(db, &roots.documents)?;
     }
     Ok(())
+}
+
+fn cited_sources(db: &Connection, page_path: &str) -> Result<Vec<String>> {
+    let mut stmt =
+        db.prepare("SELECT DISTINCT source_path FROM wiki_page_sources WHERE page_path = ?1")?;
+    let rows = stmt.query_map([page_path], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
 fn orphan_projects(db: &Connection, manifest: &Manifest) -> Vec<String> {

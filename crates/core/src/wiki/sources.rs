@@ -120,6 +120,30 @@ pub fn refresh_sources(db: &Connection, documents_root: &Path) -> Result<SourceD
     Ok(delta)
 }
 
+/// Recompute `state` for the given sources from the page citations.
+///
+/// `failed` and `stale` are preserved; a source cited by any page is
+/// `compiled`, and an uncited source is `indexed`. Used after a derived-index
+/// change (a page delete or a history undo) so a source does not stay
+/// `compiled` once its last citing page is gone.
+pub fn refresh_states(db: &Connection, paths: &[String]) -> Result<()> {
+    for path in paths {
+        db.execute(
+            "UPDATE wiki_sources
+                SET state = CASE
+                    WHEN state IN ('failed', 'stale') THEN state
+                    WHEN EXISTS (SELECT 1 FROM wiki_page_sources
+                                  WHERE source_path = wiki_sources.rel_path)
+                        THEN 'compiled'
+                    ELSE 'indexed'
+                END
+              WHERE rel_path = ?1",
+            [path],
+        )?;
+    }
+    Ok(())
+}
+
 /// List indexed sources, optionally filtered by state.
 pub fn list_sources(db: &Connection, state: Option<SourceState>) -> Result<Vec<WikiSource>> {
     const SELECT: &str = "SELECT s.rel_path, s.kind, s.hash, s.size, s.mtime, s.state,

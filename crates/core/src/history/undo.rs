@@ -622,6 +622,39 @@ mod tests {
     }
 
     #[test]
+    fn undoing_a_page_create_recomputes_the_source_state() {
+        let f = fixture();
+        f.db.execute(
+            "INSERT INTO wiki_sources (rel_path, kind, hash, size, mtime, state)
+             VALUES ('papers/a.md', 'markdown', 'h', 1, 0, 'new')",
+            [],
+        )
+        .unwrap();
+
+        let target = f.roots.wiki.join("concepts/a.md");
+        let content = "---\ntype: concept\ntitle: A\nsummary: s.\n\
+                       sources: [papers/a.md]\n---\nBody with a citation.\n";
+        let ctx = RunContext::new(f.store.clone(), "run1");
+        let guard = ctx.capture(RootKind::Wiki, &f.roots.wiki, &target).unwrap();
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, content).unwrap();
+        guard.commit(Some(content.as_bytes())).unwrap();
+        crate::wiki::index::reindex_page(&f.db, &f.roots.wiki, "concepts/a.md").unwrap();
+        f.db.execute("UPDATE wiki_sources SET state = 'compiled'", [])
+            .unwrap();
+        close(&f, "run1");
+
+        let report = undo_run(&f.db, &f.store, &f.roots, "run1", false).unwrap();
+        assert!(!report.blocked, "{report:?}");
+        assert_eq!(report.state, RunState::Undone);
+        assert!(!target.exists());
+        let state: String =
+            f.db.query_row("SELECT state FROM wiki_sources", [], |row| row.get(0))
+                .unwrap();
+        assert_eq!(state, "indexed");
+    }
+
+    #[test]
     fn card_move_undo_restores_order_rows() {
         let f = fixture();
         let session = row_begin(&f.db, "run1").unwrap();
