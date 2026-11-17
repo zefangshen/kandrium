@@ -368,7 +368,10 @@ fn diff_keys(
 }
 
 /// Read one table into `key -> row hash`.
-fn read_table(db: &Connection, table: &TableSpec) -> Result<BTreeMap<Vec<String>, String>> {
+pub(crate) fn read_table(
+    db: &Connection,
+    table: &TableSpec,
+) -> Result<BTreeMap<Vec<String>, String>> {
     let columns = table_columns(db, table.name)?;
     let column_list = columns
         .iter()
@@ -471,7 +474,7 @@ fn table_columns(db: &Connection, table: &str) -> Result<Vec<ColumnInfo>> {
 }
 
 /// Stable hash of every allowlisted table's `PRAGMA table_info`.
-fn schema_hashes(db: &Connection) -> Result<BTreeMap<String, String>> {
+pub(crate) fn schema_hashes(db: &Connection) -> Result<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
     for table in CAPTURED_TABLES {
         let columns = table_columns(db, table.name)?;
@@ -491,24 +494,78 @@ fn schema_hashes(db: &Connection) -> Result<BTreeMap<String, String>> {
     Ok(out)
 }
 
-fn open_snapshot(path: &Path) -> Result<Connection> {
+pub(crate) fn open_snapshot(path: &Path) -> Result<Connection> {
     Ok(Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?)
 }
 
-fn vacuum_into(db: &Connection, target: &Path) -> Result<()> {
+/// Snapshot one table as column names plus keyed owned values, for row restore.
+pub(crate) fn table_rows(
+    db: &Connection,
+    table: &TableSpec,
+) -> Result<(
+    Vec<String>,
+    BTreeMap<Vec<String>, Vec<rusqlite::types::Value>>,
+)> {
+    let columns = table_columns(db, table.name)?;
+    let names: Vec<String> = columns.iter().map(|column| column.name.clone()).collect();
+    let key_indexes: Vec<usize> = table
+        .keys
+        .iter()
+        .map(|key| {
+            columns
+                .iter()
+                .position(|column| &column.name == key)
+                .ok_or_else(|| KandriumError(format!("{} has no column {key}", table.name)))
+        })
+        .collect::<Result<_>>()?;
+    let select = names
+        .iter()
+        .map(|name| quote_ident(name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut stmt = db.prepare(&format!("SELECT {select} FROM {}", quote_ident(table.name)))?;
+    let mut rows = stmt.query([])?;
+    let mut out = BTreeMap::new();
+    while let Some(row) = rows.next()? {
+        let mut key = Vec::with_capacity(key_indexes.len());
+        for index in &key_indexes {
+            key.push(key_component(row.get_ref(*index)?));
+        }
+        let mut values = Vec::with_capacity(names.len());
+        for index in 0..names.len() {
+            values.push(value_of(row.get_ref(index)?));
+        }
+        out.insert(key, values);
+    }
+    Ok((names, out))
+}
+
+fn value_of(value: ValueRef<'_>) -> rusqlite::types::Value {
+    match value {
+        ValueRef::Null => rusqlite::types::Value::Null,
+        ValueRef::Integer(value) => rusqlite::types::Value::Integer(value),
+        ValueRef::Real(value) => rusqlite::types::Value::Real(value),
+        ValueRef::Text(value) => {
+            rusqlite::types::Value::Text(String::from_utf8_lossy(value).into_owned())
+        }
+        ValueRef::Blob(value) => rusqlite::types::Value::Blob(value.to_vec()),
+    }
+}
+
+pub(crate) fn vacuum_into(db: &Connection, target: &Path) -> Result<()> {
     let target_sql = target.to_string_lossy().replace('\'', "''");
     db.execute_batch(&format!("VACUUM INTO '{target_sql}'"))?;
     Ok(())
 }
 
-fn read_user_version(db: &Connection) -> Result<i64> {
+pub(crate) fn read_user_version(db: &Connection) -> Result<i64> {
     Ok(db.query_row("PRAGMA user_version", [], |row| row.get(0))?)
 }
 
-fn data_version(db: &Connection) -> Result<i64> {
+pub(crate) fn data_version(db: &Connection) -> Result<i64> {
     Ok(db.query_row("PRAGMA data_version", [], |row| row.get(0))?)
 }
 

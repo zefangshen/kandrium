@@ -15,11 +15,13 @@ pub mod capture;
 pub mod restore;
 pub mod rows;
 pub mod store;
+pub mod undo;
 
 pub use capture::{CaptureGuard, RunContext, TreeCapture};
 pub use restore::{FileConflict, FileUndoReport, Roots, SkippedEntry, preflight, restore_files};
 pub use rows::{CAPTURED_TABLES, RowEnd, RowSession, captured_tables, row_begin};
 pub use store::{HISTORY_DIR, HistoryStore};
+pub use undo::{RowConflict, RowUndoReport, UndoReport, undo_run};
 
 /// Manifest schema version.
 pub const MANIFEST_VERSION: u32 = 1;
