@@ -12,10 +12,12 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 pub mod capture;
+pub mod restore;
 pub mod rows;
 pub mod store;
 
 pub use capture::{CaptureGuard, RunContext, TreeCapture};
+pub use restore::{FileConflict, FileUndoReport, Roots, SkippedEntry, preflight, restore_files};
 pub use rows::{CAPTURED_TABLES, RowEnd, RowSession, captured_tables, row_begin};
 pub use store::{HISTORY_DIR, HistoryStore};
 
@@ -131,7 +133,7 @@ impl RunState {
 }
 
 /// Root a captured path belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RootKind {
     Wiki,

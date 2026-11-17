@@ -372,6 +372,22 @@ pub fn reindex_page(db: &Connection, root: &Path, rel_path: &str) -> Result<()> 
     Ok(())
 }
 
+/// Drop one page from the derived index without touching the filesystem.
+///
+/// Used by undo when a run created a page that is now being deleted: calling
+/// the write pipeline would re-create history.
+pub fn forget_page(db: &Connection, rel_path: &str) -> Result<()> {
+    let tx = db.unchecked_transaction()?;
+    tx.execute("DELETE FROM wiki_pages WHERE rel_path = ?", [rel_path])?;
+    tx.execute(
+        "DELETE FROM wiki_links WHERE from_path = ?1 OR to_path = ?1",
+        [rel_path],
+    )?;
+    tx.execute("DELETE FROM wiki_fts WHERE path = ?", [rel_path])?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Counts for status surfaces.
 pub fn status(db: &Connection) -> Result<WikiStatus> {
     let mut pages = PageCounts::default();
