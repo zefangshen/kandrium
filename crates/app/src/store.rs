@@ -180,38 +180,52 @@ impl Store {
 
     /// Add a saved city. Core rejects duplicates.
     pub fn add_clock(&self, tz_identifier: &str) -> StoreResult<()> {
-        add_clock(self.wconn()?, tz_identifier)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        self.app_run("add_clock", |db, _| {
+            add_clock(db, tz_identifier)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
     }
 
     /// Remove a saved city. Core refuses while it has residents
     /// (`ON DELETE RESTRICT`); the returned message is the one to show.
     pub fn remove_clock(&self, clock_id: &str) -> StoreResult<()> {
-        remove_clock(self.wconn()?, clock_id).map_err(|e| e.to_string())
+        self.app_run("remove_clock", |db, _| {
+            remove_clock(db, clock_id).map_err(|e| e.to_string())
+        })
     }
 
     /// Commit a complete permutation of clock ids.
     pub fn reorder_clocks(&self, ids: &[String]) -> StoreResult<()> {
-        reorder_clocks(self.wconn()?, ids).map_err(|e| e.to_string())
+        self.app_run("reorder_clocks", |db, _| {
+            reorder_clocks(db, ids).map_err(|e| e.to_string())
+        })
     }
 
     pub fn add_person(&self, clock_id: &str, name: &str) -> StoreResult<()> {
-        add_person(self.wconn()?, clock_id, name)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        self.app_run("add_person", |db, _| {
+            add_person(db, clock_id, name)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
     }
 
     pub fn rename_person(&self, person_id: &str, name: &str) -> StoreResult<()> {
-        rename_person(self.wconn()?, person_id, name).map_err(|e| e.to_string())
+        self.app_run("rename_person", |db, _| {
+            rename_person(db, person_id, name).map_err(|e| e.to_string())
+        })
     }
 
     pub fn remove_person(&self, person_id: &str) -> StoreResult<()> {
-        remove_person(self.wconn()?, person_id).map_err(|e| e.to_string())
+        self.app_run("remove_person", |db, _| {
+            remove_person(db, person_id).map_err(|e| e.to_string())
+        })
     }
 
     pub fn relocate_person(&self, person_id: &str, clock_id: &str) -> StoreResult<()> {
-        relocate_person(self.wconn()?, person_id, clock_id).map_err(|e| e.to_string())
+        self.app_run("relocate_person", |db, _| {
+            relocate_person(db, person_id, clock_id).map_err(|e| e.to_string())
+        })
     }
 
     pub fn start_travel(
@@ -221,23 +235,31 @@ impl Store {
         starts_at: i64,
         ends_at: Option<i64>,
     ) -> StoreResult<()> {
-        start_travel(self.wconn()?, person_id, destination, starts_at, ends_at)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        self.app_run("start_travel", |db, _| {
+            start_travel(db, person_id, destination, starts_at, ends_at)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
     }
 
     /// End a running trip now.
     pub fn end_travel(&self, travel_id: &str) -> StoreResult<()> {
-        end_travel(self.wconn()?, travel_id).map_err(|e| e.to_string())
+        self.app_run("end_travel", |db, _| {
+            end_travel(db, travel_id).map_err(|e| e.to_string())
+        })
     }
 
     /// Set or push a trip's return time. `None` makes it open-ended.
     pub fn extend_travel(&self, travel_id: &str, ends_at: Option<i64>) -> StoreResult<()> {
-        extend_travel(self.wconn()?, travel_id, ends_at).map_err(|e| e.to_string())
+        self.app_run("extend_travel", |db, _| {
+            extend_travel(db, travel_id, ends_at).map_err(|e| e.to_string())
+        })
     }
 
     pub fn remove_travel(&self, travel_id: &str) -> StoreResult<()> {
-        remove_travel(self.wconn()?, travel_id).map_err(|e| e.to_string())
+        self.app_run("remove_travel", |db, _| {
+            remove_travel(db, travel_id).map_err(|e| e.to_string())
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -265,24 +287,44 @@ impl Store {
     }
 
     pub fn write_note(&self, path: &Path, root: &Path, text: &str) -> StoreResult<()> {
-        notes::write_note(path, root, text).map_err(|e| e.to_string())
+        self.files_run("write_note", |run| {
+            notes::write_note_in_run(path, root, text, run).map_err(|e| e.to_string())
+        })
     }
 
     /// Create a name-validated note inside `in_dir` (`.md` appended).
     pub fn create_note(&self, root: &Path, in_dir: &Path, name: &str) -> StoreResult<PathBuf> {
-        notes::create_named_note(root, in_dir, name).map_err(|e| e.to_string())
+        self.files_run("create_note", |run| {
+            let path = notes::create_named_note(root, in_dir, name).map_err(|e| e.to_string())?;
+            if let Some(run) = run {
+                run.record_created(kandrium_core::history::RootKind::Notes, root, &path)
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(path)
+        })
     }
 
     pub fn create_folder(&self, root: &Path, in_dir: &Path, name: &str) -> StoreResult<PathBuf> {
-        notes::create_named_folder(root, in_dir, name).map_err(|e| e.to_string())
+        self.files_run("create_folder", |run| {
+            let path = notes::create_named_folder(root, in_dir, name).map_err(|e| e.to_string())?;
+            if let Some(run) = run {
+                run.record_tree(kandrium_core::history::RootKind::Notes, root, &path)
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(path)
+        })
     }
 
     pub fn rename_note(&self, path: &Path, root: &Path, new_name: &str) -> StoreResult<PathBuf> {
-        notes::rename_path(path, root, new_name).map_err(|e| e.to_string())
+        self.files_run("rename_note", |run| {
+            notes::rename_path_in_run(path, root, new_name, run).map_err(|e| e.to_string())
+        })
     }
 
     pub fn delete_note(&self, path: &Path, root: &Path) -> StoreResult<()> {
-        notes::delete_path(path, root).map_err(|e| e.to_string())
+        self.files_run("delete_note", |run| {
+            notes::delete_path_in_run(path, root, run).map_err(|e| e.to_string())
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -295,6 +337,81 @@ impl Store {
             .as_ref()
             .and_then(kandrium_core::history::HistoryStore::for_connection)
             .ok_or_else(|| "history needs a file-backed database".to_string())
+    }
+
+    /// One app action inside its own history run: a start snapshot before the
+    /// call, file captures through the `RunContext`, an end snapshot plus diff
+    /// after it, and a `committed` mirror row at close. Falls back to a plain
+    /// call when the database has no file to keep history beside.
+    fn app_run<T>(
+        &self,
+        label: &str,
+        f: impl FnOnce(
+            &rusqlite::Connection,
+            Option<&kandrium_core::history::RunContext>,
+        ) -> StoreResult<T>,
+    ) -> StoreResult<T> {
+        let db = self.wconn()?;
+        self.with_run(Some(db), label, |db, run| {
+            let db = db.ok_or_else(|| self.unavailable())?;
+            f(db, run)
+        })
+    }
+
+    /// [`Store::app_run`] for a filesystem-only action: the Notes half keeps
+    /// working when the database itself failed to open, so a missing write
+    /// handle only means no history, not a refused edit.
+    fn files_run<T>(
+        &self,
+        label: &str,
+        f: impl FnOnce(Option<&kandrium_core::history::RunContext>) -> StoreResult<T>,
+    ) -> StoreResult<T> {
+        self.with_run(self.write.as_ref(), label, |_, run| f(run))
+    }
+
+    fn with_run<T>(
+        &self,
+        db: Option<&rusqlite::Connection>,
+        label: &str,
+        f: impl FnOnce(
+            Option<&rusqlite::Connection>,
+            Option<&kandrium_core::history::RunContext>,
+        ) -> StoreResult<T>,
+    ) -> StoreResult<T> {
+        use kandrium_core::history;
+        let Some(db) = db else {
+            return f(None, None);
+        };
+        let Some(store) = history::HistoryStore::for_connection(db) else {
+            return f(Some(db), None);
+        };
+        let run_id = kandrium_core::db::uid();
+        if let Err(error) = history::ensure_manifest(&store, &run_id, history::RunKind::App, label)
+        {
+            kandrium_core::logging::warn!("cannot open app run {run_id}: {error}");
+            return f(Some(db), None);
+        }
+        let session = match history::row_begin(db, &run_id) {
+            Ok(session) => Some(session),
+            Err(error) => {
+                kandrium_core::logging::warn!("cannot snapshot app run {run_id}: {error}");
+                None
+            }
+        };
+        let context = history::RunContext::new(store.clone(), run_id.clone());
+        let outcome = f(Some(db), Some(&context));
+        if let Some(session) = session
+            && let Err(error) = session.end(db)
+        {
+            kandrium_core::logging::warn!("row phase failed for app run {run_id}: {error}");
+        }
+        if outcome.is_err() && history::discard_empty_run(db, &store, &run_id).unwrap_or(false) {
+            return outcome;
+        }
+        if let Err(error) = history::commit_run(db, &store, &run_id, history::ClosedBy::Action) {
+            kandrium_core::logging::warn!("cannot close app run {run_id}: {error}");
+        }
+        outcome
     }
 
     /// Run manifests, newest first.
@@ -325,14 +442,39 @@ impl Store {
         run_id: &str,
         force: bool,
     ) -> StoreResult<kandrium_core::history::UndoReport> {
-        let store = self.history_store()?;
         let roots = kandrium_core::history::Roots::resolve();
+        self.undo_history_run_in(&roots, run_id, force)
+    }
+
+    /// [`Store::undo_history_run`] against explicit roots, for tests and
+    /// callers that do not use the default data directory.
+    fn undo_history_run_in(
+        &mut self,
+        roots: &kandrium_core::history::Roots,
+        run_id: &str,
+        force: bool,
+    ) -> StoreResult<kandrium_core::history::UndoReport> {
+        let store = self.history_store()?;
         let db = self
             .write
             .as_mut()
             .ok_or_else(|| "database is closed".to_string())?;
-        kandrium_core::history::undo_run(db, &store, &roots, run_id, force)
+        kandrium_core::history::undo_run(db, &store, roots, run_id, force)
             .map_err(|e| e.to_string())
+    }
+
+    /// Table names and change counts for one run's row diff, for the History
+    /// detail pane.
+    pub fn history_tables(&self, run_id: &str) -> StoreResult<Vec<(String, usize)>> {
+        let store = self.history_store()?;
+        let Some(diff) = store.load_diff(run_id).map_err(|e| e.to_string())? else {
+            return Ok(Vec::new());
+        };
+        Ok(diff
+            .tables
+            .into_iter()
+            .map(|(table, changes)| (table, changes.changes.len()))
+            .collect())
     }
 
     // -----------------------------------------------------------------------
@@ -396,12 +538,16 @@ impl Store {
     }
 
     pub fn write_document(&self, path: &Path, root: &Path, text: &str) -> StoreResult<()> {
-        documents::write_text(path, root, text).map_err(|e| e.to_string())
+        self.files_run("write_document", |run| {
+            documents::write_text_in_run(path, root, text, run).map_err(|e| e.to_string())
+        })
     }
 
     /// Create a Markdown file inside `parent` (bare names gain `.md`).
     pub fn create_markdown(&self, parent: &Path, root: &Path, name: &str) -> StoreResult<PathBuf> {
-        documents::create_markdown(parent, root, name).map_err(|e| e.to_string())
+        self.files_run("create_markdown", |run| {
+            documents::create_markdown_in_run(parent, root, name, run).map_err(|e| e.to_string())
+        })
     }
 
     pub fn create_doc_folder(
@@ -410,7 +556,14 @@ impl Store {
         root: &Path,
         name: &str,
     ) -> StoreResult<PathBuf> {
-        documents::create_folder(parent, root, name).map_err(|e| e.to_string())
+        self.files_run("create_doc_folder", |run| {
+            let path = documents::create_folder(parent, root, name).map_err(|e| e.to_string())?;
+            if let Some(run) = run {
+                run.record_tree(kandrium_core::history::RootKind::Documents, root, &path)
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(path)
+        })
     }
 
     /// Copy files into `dest`, never overwriting (`-2`, `-3`, …). A failed
@@ -421,14 +574,16 @@ impl Store {
         dest: &Path,
         root: &Path,
     ) -> StoreResult<Vec<(PathBuf, Option<String>)>> {
-        let mut results = Vec::with_capacity(sources.len());
-        for source in sources {
-            let outcome = documents::import_file(source, dest, root)
-                .map(|path| (path, None))
-                .unwrap_or_else(|e| (source.clone(), Some(e.to_string())));
-            results.push(outcome);
-        }
-        Ok(results)
+        self.files_run("import_documents", |run| {
+            let mut results = Vec::with_capacity(sources.len());
+            for source in sources {
+                let outcome = documents::import_file_in_run(source, dest, root, run)
+                    .map(|path| (path, None))
+                    .unwrap_or_else(|e| (source.clone(), Some(e.to_string())));
+                results.push(outcome);
+            }
+            Ok(results)
+        })
     }
 
     pub fn rename_document(
@@ -437,11 +592,15 @@ impl Store {
         root: &Path,
         new_name: &str,
     ) -> StoreResult<PathBuf> {
-        documents::rename_path(path, root, new_name).map_err(|e| e.to_string())
+        self.files_run("rename_document", |run| {
+            documents::rename_path_in_run(path, root, new_name, run).map_err(|e| e.to_string())
+        })
     }
 
     pub fn delete_document(&self, path: &Path, root: &Path) -> StoreResult<()> {
-        documents::delete_path(path, root).map_err(|e| e.to_string())
+        self.files_run("delete_document", |run| {
+            documents::delete_path_in_run(path, root, run).map_err(|e| e.to_string())
+        })
     }
 
     pub fn load_annotations(&self, pdf: &Path, root: &Path) -> StoreResult<AnnotationDoc> {
@@ -454,7 +613,9 @@ impl Store {
         root: &Path,
         doc: &AnnotationDoc,
     ) -> StoreResult<()> {
-        documents::save_annotations(pdf, root, doc).map_err(|e| e.to_string())
+        self.files_run("save_annotations", |run| {
+            documents::save_annotations_in_run(pdf, root, doc, run).map_err(|e| e.to_string())
+        })
     }
 
     /// Projects offered by the card modal's project picker.
@@ -499,8 +660,16 @@ impl Store {
         name: &str,
         folder: Option<&str>,
     ) -> StoreResult<Project> {
-        project_data::create_project(self.wconn()?, root, name, folder, "blank")
-            .map_err(|e| e.to_string())
+        self.app_run("create_project", |db, run| {
+            let project = project_data::create_project(db, root, name, folder, "blank")
+                .map_err(|e| e.to_string())?;
+            if let Some(run) = run {
+                let dir = project_data::project_dir(root, &project.id);
+                run.record_tree(kandrium_core::history::RootKind::Projects, root, &dir)
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(project)
+        })
     }
 
     pub fn create_project_folder(
@@ -508,19 +677,27 @@ impl Store {
         name: &str,
         parent: Option<&str>,
     ) -> StoreResult<ProjectFolder> {
-        project_data::create_folder(self.wconn()?, name, parent).map_err(|e| e.to_string())
+        self.app_run("create_project_folder", |db, _| {
+            project_data::create_folder(db, name, parent).map_err(|e| e.to_string())
+        })
     }
 
     pub fn rename_project_folder(&self, id: &str, name: &str) -> StoreResult<ProjectFolder> {
-        project_data::rename_folder(self.wconn()?, id, name).map_err(|e| e.to_string())
+        self.app_run("rename_project_folder", |db, _| {
+            project_data::rename_folder(db, id, name).map_err(|e| e.to_string())
+        })
     }
 
     pub fn delete_project_folder(&self, root: &Path, id: &str) -> StoreResult<()> {
-        project_data::delete_folder(self.wconn()?, root, id).map_err(|e| e.to_string())
+        self.app_run("delete_project_folder", |db, run| {
+            project_data::delete_folder_in_run(db, root, id, run).map_err(|e| e.to_string())
+        })
     }
 
     pub fn rename_project(&self, id: &str, name: &str) -> StoreResult<Project> {
-        project_data::rename_project(self.wconn()?, id, name).map_err(|e| e.to_string())
+        self.app_run("rename_project", |db, _| {
+            project_data::rename_project(db, id, name).map_err(|e| e.to_string())
+        })
     }
 
     pub fn update_project(
@@ -529,12 +706,15 @@ impl Store {
         description: Option<&str>,
         status: Option<&str>,
     ) -> StoreResult<Project> {
-        project_data::update_project(self.wconn()?, id, description, status)
-            .map_err(|e| e.to_string())
+        self.app_run("update_project", |db, _| {
+            project_data::update_project(db, id, description, status).map_err(|e| e.to_string())
+        })
     }
 
     pub fn set_project_source(&self, id: &str, source: &str) -> StoreResult<Project> {
-        project_data::set_source(self.wconn()?, id, source).map_err(|e| e.to_string())
+        self.app_run("set_project_source", |db, _| {
+            project_data::set_source(db, id, source).map_err(|e| e.to_string())
+        })
     }
 
     pub fn project_paths(&self, id: &str) -> StoreResult<Vec<ProjectPath>> {
@@ -542,31 +722,45 @@ impl Store {
     }
 
     pub fn add_project_path(&self, id: &str, path: &str) -> StoreResult<ProjectPath> {
-        project_data::add_project_path(self.wconn()?, id, path).map_err(|e| e.to_string())
+        self.app_run("add_project_path", |db, _| {
+            project_data::add_project_path(db, id, path).map_err(|e| e.to_string())
+        })
     }
 
     pub fn remove_project_path(&self, path_id: &str) -> StoreResult<()> {
-        project_data::remove_project_path(self.wconn()?, path_id).map_err(|e| e.to_string())
+        self.app_run("remove_project_path", |db, _| {
+            project_data::remove_project_path(db, path_id).map_err(|e| e.to_string())
+        })
     }
 
     pub fn set_project_identifier(&self, id: &str, identifier: &str) -> StoreResult<Project> {
-        project_data::set_identifier(self.wconn()?, id, identifier).map_err(|e| e.to_string())
+        self.app_run("set_project_identifier", |db, _| {
+            project_data::set_identifier(db, id, identifier).map_err(|e| e.to_string())
+        })
     }
 
     pub fn archive_project(&self, id: &str) -> StoreResult<()> {
-        project_data::archive_project(self.wconn()?, id).map_err(|e| e.to_string())
+        self.app_run("archive_project", |db, _| {
+            project_data::archive_project(db, id).map_err(|e| e.to_string())
+        })
     }
 
     pub fn unarchive_project(&self, id: &str) -> StoreResult<()> {
-        project_data::unarchive_project(self.wconn()?, id).map_err(|e| e.to_string())
+        self.app_run("unarchive_project", |db, _| {
+            project_data::unarchive_project(db, id).map_err(|e| e.to_string())
+        })
     }
 
     pub fn delete_project(&self, root: &Path, id: &str) -> StoreResult<()> {
-        project_data::delete_project(self.wconn()?, root, id).map_err(|e| e.to_string())
+        self.app_run("delete_project", |db, run| {
+            project_data::delete_project_in_run(db, root, id, run).map_err(|e| e.to_string())
+        })
     }
 
     pub fn reorder_project(&self, id: &str, index: usize) -> StoreResult<()> {
-        project_data::reorder_project(self.wconn()?, id, index).map_err(|e| e.to_string())
+        self.app_run("reorder_project", |db, _| {
+            project_data::reorder_project(db, id, index).map_err(|e| e.to_string())
+        })
     }
 
     pub fn read_project_doc(&self, root: &Path, id: &str, rel: &Path) -> StoreResult<String> {
@@ -580,7 +774,9 @@ impl Store {
         rel: &Path,
         text: &str,
     ) -> StoreResult<()> {
-        project_data::write_doc(root, id, rel, text).map_err(|e| e.to_string())
+        self.app_run("write_project_doc", |_, run| {
+            project_data::write_doc_in_run(root, id, rel, text, run).map_err(|e| e.to_string())
+        })
     }
 
     pub fn create_project_doc(
@@ -590,7 +786,10 @@ impl Store {
         parent_rel: &Path,
         name: &str,
     ) -> StoreResult<PathBuf> {
-        project_data::create_doc_file(root, id, parent_rel, name).map_err(|e| e.to_string())
+        self.app_run("create_project_doc", |_, run| {
+            project_data::create_doc_file_in_run(root, id, parent_rel, name, run)
+                .map_err(|e| e.to_string())
+        })
     }
 
     pub fn create_project_doc_folder(
@@ -600,7 +799,10 @@ impl Store {
         parent_rel: &Path,
         name: &str,
     ) -> StoreResult<PathBuf> {
-        project_data::create_doc_folder(root, id, parent_rel, name).map_err(|e| e.to_string())
+        self.app_run("create_project_doc_folder", |_, run| {
+            project_data::create_doc_folder_in_run(root, id, parent_rel, name, run)
+                .map_err(|e| e.to_string())
+        })
     }
 
     /// Move or reorder a card on the visible board. `move_area_card` keeps the
@@ -612,9 +814,11 @@ impl Store {
         to_column_id: &str,
         before_card_id: Option<&str>,
     ) -> StoreResult<()> {
-        move_area_card(self.wconn()?, card_id, to_column_id, before_card_id)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        self.app_run("move_card", |db, _| {
+            move_area_card(db, card_id, to_column_id, before_card_id)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
     }
 
     /// Move a card between status buckets from the All board. The home board's
@@ -625,40 +829,48 @@ impl Store {
         status: CardStatus,
         before_card_id: Option<&str>,
     ) -> StoreResult<()> {
-        move_all_card(self.wconn()?, card_id, status, before_card_id)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        self.app_run("move_all_card", |db, _| {
+            move_all_card(db, card_id, status, before_card_id)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
     }
 
     /// Move a card to another Tasks board, keeping its column by status when
     /// core can (mirrors the egui modal's "Move to board").
     pub fn move_card_to_board(&self, card_id: &str, board_id: &str) -> StoreResult<()> {
-        move_card_to_board(self.wconn()?, card_id, board_id)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        self.app_run("move_card_to_board", |db, _| {
+            move_card_to_board(db, card_id, board_id)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
     }
 
     /// Create a card in `column_id` from the inline "+ Add card" row.
     pub fn create_card(&self, column_id: &str, title: &str) -> StoreResult<()> {
-        kandrium_core::create_card(
-            self.wconn()?,
-            column_id,
-            &CreateCardBody {
-                title: title.to_string(),
-                description: None,
-                due_date: None,
-                labels: None,
-            },
-        )
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+        self.app_run("create_card", |db, _| {
+            kandrium_core::create_card(
+                db,
+                column_id,
+                &CreateCardBody {
+                    title: title.to_string(),
+                    description: None,
+                    due_date: None,
+                    labels: None,
+                },
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        })
     }
 
     /// Rename one card's title only, through the same core path as the modal.
     pub fn rename_card(&self, card_id: &str, title: &str) -> StoreResult<()> {
-        rename_card(self.wconn()?, card_id, title)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        self.app_run("rename_card", |db, _| {
+            rename_card(db, card_id, title)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
     }
 
     /// Every archived card with its board and column labels.
@@ -671,24 +883,30 @@ impl Store {
     /// Archive or restore one card. Archives go through the write handle so
     /// the board and the Archived page see the same row.
     pub fn set_card_archived(&self, card_id: &str, archived: bool) -> StoreResult<()> {
-        set_card_archived(self.wconn()?, card_id, archived)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        self.app_run("set_card_archived", |db, _| {
+            set_card_archived(db, card_id, archived)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
     }
 
     /// Delete one card permanently.
     pub fn delete_card(&self, card_id: &str) -> StoreResult<()> {
-        delete_card(self.wconn()?, card_id)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        self.app_run("delete_card", |db, _| {
+            delete_card(db, card_id)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
     }
 
     /// Link (or unlink) a card to a project. This is the modal dropdown's
     /// immediate write; it touches no other card column.
     pub fn set_card_project(&self, card_id: &str, project_id: Option<&str>) -> StoreResult<()> {
-        set_card_project(self.wconn()?, card_id, project_id)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        self.app_run("set_card_project", |db, _| {
+            set_card_project(db, card_id, project_id)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
     }
 
     /// Save the fields the modal owns. `project` / `area` are `Some` only when
@@ -700,15 +918,16 @@ impl Store {
         project: Option<Option<&str>>,
         area: Option<Option<&str>>,
     ) -> StoreResult<()> {
-        let db = self.wconn()?;
-        update_card(db, card_id, body).map_err(|e| e.to_string())?;
-        if let Some(project_id) = project {
-            set_card_project(db, card_id, project_id).map_err(|e| e.to_string())?;
-        }
-        if let Some(area_id) = area {
-            set_card_area(db, card_id, area_id).map_err(|e| e.to_string())?;
-        }
-        Ok(())
+        self.app_run("save_card", |db, _| {
+            update_card(db, card_id, body).map_err(|e| e.to_string())?;
+            if let Some(project_id) = project {
+                set_card_project(db, card_id, project_id).map_err(|e| e.to_string())?;
+            }
+            if let Some(area_id) = area {
+                set_card_area(db, card_id, area_id).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -722,6 +941,146 @@ mod tests {
         let mut db = kandrium_core::open_db(&path).expect("open temp db");
         kandrium_core::bootstrap(&mut db, &path).expect("bootstrap temp db");
         Store::open_path(path)
+    }
+
+    /// Roots beside a temp database, so undo never touches the real data dir.
+    fn temp_roots(dir: &Path, projects: &Path) -> kandrium_core::history::Roots {
+        kandrium_core::history::Roots {
+            wiki: dir.join("wiki"),
+            notes: dir.join("notes"),
+            documents: dir.join("documents"),
+            projects: projects.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn create_project_is_one_undoable_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = temp_store(dir.path());
+        let root = dir.path().join("projects");
+        let project = store
+            .create_project(&root, "Alpha Project", None)
+            .expect("project");
+
+        let run = store
+            .history_runs()
+            .expect("runs")
+            .into_iter()
+            .find(|run| run.label == "create_project")
+            .expect("create_project run");
+        assert!(!run.dirs.is_empty(), "the project folder is captured");
+        assert!(run.rows.is_some(), "board, columns and project rows differ");
+
+        store
+            .undo_history_run_in(&temp_roots(dir.path(), &root), &run.run_id, false)
+            .expect("undo");
+        assert!(store.project(&project.id).is_err(), "project row is gone");
+        assert!(!root.join(&project.id).exists(), "project folder is gone");
+    }
+
+    #[test]
+    fn a_card_move_undoes_column_and_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = temp_store(dir.path());
+        store
+            .move_card("card_work_1", "col_work_done", None)
+            .expect("move");
+        let moved = store.board("board_work").expect("board");
+        assert!(
+            moved
+                .columns
+                .iter()
+                .find(|column| column.id == "col_work_done")
+                .unwrap()
+                .cards
+                .iter()
+                .any(|card| card.id == "card_work_1")
+        );
+
+        let run = store
+            .history_runs()
+            .expect("runs")
+            .into_iter()
+            .find(|run| run.label == "move_card")
+            .expect("move_card run");
+        store.undo_history_run(&run.run_id, false).expect("undo");
+
+        let restored = store.board("board_work").expect("board");
+        assert!(
+            restored
+                .columns
+                .iter()
+                .find(|column| column.id == "col_work_todo")
+                .unwrap()
+                .cards
+                .iter()
+                .any(|card| card.id == "card_work_1"),
+            "card is back in its original column"
+        );
+    }
+
+    #[test]
+    fn a_clock_change_reverts_with_its_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = temp_store(dir.path());
+        let before = store.clock_data().expect("clocks").clocks.len();
+        store.add_clock("Europe/Paris").expect("add clock");
+
+        let run = store
+            .history_runs()
+            .expect("runs")
+            .into_iter()
+            .find(|run| run.label == "add_clock")
+            .expect("add_clock run");
+        store.undo_history_run(&run.run_id, false).expect("undo");
+        assert_eq!(store.clock_data().expect("clocks").clocks.len(), before);
+    }
+
+    #[test]
+    fn an_app_write_during_an_explicit_run_is_captured_and_marks_it_contended() {
+        use kandrium_core::history::{self, ClosedBy, HistoryStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = temp_store(dir.path());
+        let root = dir.path().join("projects");
+        let project = store
+            .create_project(&root, "Doomed", None)
+            .expect("project");
+
+        // Another client holds the open run and has taken its start snapshot.
+        let path = dir.path().join("kandrium.db");
+        let holder = kandrium_core::open_db(&path).expect("open holder");
+        let holder_store = HistoryStore::for_db(&path);
+        let open = history::begin_run(&holder, &holder_store, "ingest").expect("begin");
+        let session = history::row_begin(&holder, &open.run_id).expect("row begin");
+
+        store.delete_project(&root, &project.id).expect("delete");
+        assert!(!root.join(&project.id).exists());
+
+        let app_run = store
+            .history_runs()
+            .expect("runs")
+            .into_iter()
+            .find(|run| run.label == "delete_project")
+            .expect("app run");
+        assert!(
+            !app_run.dirs.is_empty(),
+            "the project folder is captured by its own run"
+        );
+
+        session.end(&holder).expect("row end");
+        let ended = history::end_open_run(
+            &holder,
+            &holder_store,
+            &open.run_id,
+            ClosedBy::Explicit,
+            None,
+        )
+        .expect("end");
+        assert!(
+            ended.rows.expect("rows").contended,
+            "the explicit run sees the app write"
+        );
     }
 
     #[test]

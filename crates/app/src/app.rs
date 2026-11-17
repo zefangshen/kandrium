@@ -592,10 +592,14 @@ impl AppShell {
             }
         }
         self.wiki.history_confirm = None;
+        if let Some(selected) = &self.wiki.history_selected {
+            self.wiki.history_tables = self.store.history_tables(selected).unwrap_or_default();
+        }
     }
 
     /// Pick a run in the History panel.
     pub(crate) fn select_history_run(&mut self, run_id: String, cx: &mut Context<Self>) {
+        self.wiki.history_tables = self.store.history_tables(&run_id).unwrap_or_default();
         self.wiki.history_selected = Some(run_id);
         self.wiki.history_confirm = None;
         cx.notify();
@@ -619,11 +623,18 @@ impl AppShell {
         self.wiki.panel_error = None;
         match self.store.undo_history_run(&run_id, false) {
             Ok(report) => {
+                // Undo may have deleted the card or project a modal is editing.
+                self.editing = None;
                 self.load_notes();
                 self.load_wiki_pages();
                 self.load_documents();
+                self.load_projects();
                 self.reload_wiki_status();
                 self.reload_history();
+                if let Some(selected) = &self.wiki.history_selected {
+                    self.wiki.history_tables =
+                        self.store.history_tables(selected).unwrap_or_default();
+                }
                 if let Some(first) = report.conflicts.first() {
                     self.wiki.panel_error = Some(format!("blocked by {first}"));
                 }

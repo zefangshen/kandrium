@@ -21,7 +21,7 @@ use crate::error::{KandriumError, Result};
 use crate::fsutil;
 use crate::wiki::hash_bytes;
 
-use super::Manifest;
+use super::{Manifest, RowDiff};
 
 /// Directory name under the database's parent.
 pub const HISTORY_DIR: &str = "history";
@@ -167,6 +167,21 @@ impl HistoryStore {
             ))
         })?;
         Ok(Some(manifest))
+    }
+
+    /// Read a run's derived row diff. Absent when the run captured no rows or
+    /// was abandoned before its end snapshot.
+    pub fn load_diff(&self, run_id: &str) -> Result<Option<RowDiff>> {
+        let path = self.diff_path(run_id)?;
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let diff = serde_json::from_str(&text).map_err(|error| {
+            KandriumError(format!("cannot read row diff {}: {error}", path.display()))
+        })?;
+        Ok(Some(diff))
     }
 
     /// Every stored manifest, oldest run id first. A corrupt manifest is an

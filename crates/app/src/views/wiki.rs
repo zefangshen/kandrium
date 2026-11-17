@@ -130,6 +130,8 @@ pub struct WikiState {
     pub history: Vec<kandrium_core::history::Manifest>,
     /// Run picked in the History list.
     pub history_selected: Option<String>,
+    /// Tables and change counts of the selected run's row diff.
+    pub history_tables: Vec<(String, usize)>,
     /// Run the History panel is asking to undo a second time.
     pub history_confirm: Option<String>,
     pub busy: bool,
@@ -154,6 +156,7 @@ impl Default for WikiState {
             findings: Vec::new(),
             history: Vec::new(),
             history_selected: None,
+            history_tables: Vec::new(),
             history_confirm: None,
             busy: false,
             panel_error: None,
@@ -1417,6 +1420,9 @@ fn history_detail(
         }
         if !rows.restorable {
             body = body.child(kv_row("Rows", "not restorable", t));
+        }
+        for (table, changes) in &state.history_tables {
+            body = body.child(kv_row(table, &format!("{changes} changed"), t));
         }
     }
 
