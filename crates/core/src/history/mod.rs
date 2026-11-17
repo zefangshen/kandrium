@@ -11,6 +11,12 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+pub mod capture;
+pub mod store;
+
+pub use capture::{CaptureGuard, RunContext};
+pub use store::{HISTORY_DIR, HistoryStore};
+
 /// Manifest schema version.
 pub const MANIFEST_VERSION: u32 = 1;
 /// Per-file capture cap. Entries above it are recorded as unrestorable.
