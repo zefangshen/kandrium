@@ -19,12 +19,32 @@ from a cached copy: the version and schema version can change.
    duplicating.
 4. `read_wiki_page` before editing an existing page. It returns the current
    content hash, citations, and backlinks.
-5. Write with `write_wiki_page`, `patch_wiki_page`, or `delete_wiki_page`.
+5. `begin_wiki_run` with a short task label, for example
+   `"ingest the attention papers"`. Everything you write until `end_wiki_run`
+   becomes one undoable entry in Kandrium's History. Only one run can be open:
+   a second client is refused with `a run is open: <label>`, so wait for the
+   previous closer or for its heartbeat to go stale (ten minutes).
+6. Write with `write_wiki_page`, `patch_wiki_page`, or `delete_wiki_page`.
    Pass `expectedHash` when you edited a page you read, so a concurrent user
-   edit is not overwritten.
-6. `record_wiki_run` once at the end with the pages you touched and the
-   sources you compiled.
-7. `lint_wiki` to confirm the result.
+   edit is not overwritten. When a long read separates your writes, call
+   `heartbeat_wiki_run` with the run id: a run without a heartbeat for ten
+   minutes is reclaimed, and your `end_wiki_run` then fails with
+   `run was reclaimed`.
+7. `end_wiki_run` once at the end, with an optional note. Do not call
+   `record_wiki_run` for new work; it remains the legacy close and records the
+   compile ledger row.
+8. `lint_wiki` to confirm the result.
+
+Without `begin_wiki_run`, each write is its own entry, labelled
+`write_wiki_page <path>`. Read-only calls never create one.
+
+## Undo
+
+`list_runs` lists runs newest first with their file, directory, link and row
+counts. `undo_run` restores one run's files and rows. If a file changed after
+the run, or a later run touched the same path, undo returns the conflicts and
+changes nothing; `force: true` skips those files and overwrites row conflicts.
+Schema changes are never forced.
 
 ## Where pages live
 

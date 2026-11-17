@@ -2069,7 +2069,7 @@ mod tests {
         let result = server.get_wiki_instructions().unwrap();
         assert_ne!(result.is_error, Some(true));
         let payload: serde_json::Value = serde_json::from_str(&text(&result)).unwrap();
-        assert_eq!(payload["version"], 1);
+        assert_eq!(payload["version"], core::WIKI_INSTRUCTIONS_VERSION);
         assert!(
             payload["instructions"]
                 .as_str()

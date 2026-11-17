@@ -8,7 +8,7 @@
 use super::sources::hash_bytes;
 
 /// Current instruction contract version.
-pub const WIKI_INSTRUCTIONS_VERSION: u32 = 1;
+pub const WIKI_INSTRUCTIONS_VERSION: u32 = 2;
 
 /// The instruction document shown to agents.
 pub const WIKI_INSTRUCTIONS: &str = include_str!("instructions.md");
@@ -59,6 +59,11 @@ mod tests {
             "write_wiki_page",
             "patch_wiki_page",
             "delete_wiki_page",
+            "begin_wiki_run",
+            "heartbeat_wiki_run",
+            "end_wiki_run",
+            "list_runs",
+            "undo_run",
             "record_wiki_run",
             "list_wiki_dedup_candidates",
             "lint_wiki",

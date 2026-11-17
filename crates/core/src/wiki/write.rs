@@ -846,6 +846,21 @@ mod tests {
     }
 
     #[test]
+    fn a_version_one_agent_must_refetch_before_writing() {
+        let mut f = fixture();
+        let mut legacy = write_spec("concepts/attention.md", page("Attention", false), None);
+        legacy.instructions_version = 1;
+        let error = write_page(&mut f.db, &f.root, &legacy).unwrap_err();
+        assert!(
+            error.to_string().contains("get_wiki_instructions"),
+            "the refusal tells the agent to refetch: {error}"
+        );
+
+        let fresh = write_spec("concepts/attention.md", page("Attention", false), None);
+        assert!(write_page(&mut f.db, &f.root, &fresh).is_ok());
+    }
+
+    #[test]
     fn paths_escaping_the_root_and_generated_index_are_rejected() {
         let mut f = fixture();
         assert!(

@@ -1,7 +1,7 @@
 # Undoable ingestion: file and row history
 
-Status: design plan, not implemented. No code or migration changes accompany this
-document.
+Status: implemented. Stages 0–8 landed on the `llm-wiki` branch; the plan is
+kept as the design record.
 
 This plan adds a run-scoped history store that makes an ingestion run undoable as
 one unit. It covers both sides of the application:

@@ -126,6 +126,21 @@ Workspace, edition 2024. All comments, identifiers, and docs are in English.
   `fsutil::write_atomic` (unique sibling temp + `sync_all` + rename). Never
   truncate a user file in place with `fs::write`. New-file creation is the
   same helper.
+- **Run history** (`crates/core/src/history/`) makes a task undoable as one
+  unit. Files are captured before mutation into a content-addressed object
+  store, and app-owned rows are diffed from a `VACUUM INTO` snapshot taken
+  before and after the run. The JSON manifest at
+  `<db parent>/history/runs/<run-id>.json` is authoritative; `run_history`,
+  `run_row_changes` and `run_undo` mirror it. One explicit run holds the
+  single `state = 'open'` row (partial unique index) and is opened and closed
+  by `begin_wiki_run` / `end_wiki_run`; every other mutating call — MCP
+  implicit runs and the app's per-action runs — is inserted `committed` at
+  close. A run without a heartbeat for 10 minutes is reclaimed, and the boot
+  sweep abandons 24-hour-old runs. Retention prunes per kind (implicit 200/7d,
+  app 100/3d, explicit 20/30d) under a shared 2 GB ceiling. New mutating paths
+  must run inside `Store::app_run`/`files_run` or the MCP `run_mutating`
+  wrapper, and new file writes must use the `*_in_run` core functions so the
+  pre-image is captured.
 
 ## Naming constraints (do not regress)
 

@@ -95,6 +95,12 @@ The server exposes the following tools:
 | Boards | `list_boards`, `get_board`, `get_all_board` |
 | Columns | `archive_all_cards` |
 | Cards | `create_card`, `update_card`, `move_card`, `move_all_card`, `move_card_to_board`, `delete_card`, `archive_card`, `restore_card`, `list_archived_cards` |
+| Wiki | `get_wiki_instructions`, `get_wiki_status`, `list_wiki_sources`, `read_wiki_source`, `list_wiki_pages`, `read_wiki_page`, `search_wiki`, `write_wiki_page`, `patch_wiki_page`, `delete_wiki_page`, `record_wiki_run`, `list_wiki_dedup_candidates`, `lint_wiki` |
+| History | `begin_wiki_run`, `heartbeat_wiki_run`, `end_wiki_run`, `list_runs`, `undo_run` |
+
+`begin_wiki_run` … `end_wiki_run` groups a batch of writes into one undoable
+task; without it, each mutating call is its own History entry, and
+`undo_run` restores one entry's files and rows.
 
 Tool results are JSON objects with camelCase field names (e.g.
 `boardId`, `dueDate`). All logging goes to stderr so stdout stays reserved for
@@ -106,6 +112,7 @@ the MCP transport.
 | --- | --- |
 | Database | `KANDRIUM_DB` env var, else `<data_dir>/kandrium/kandrium.db` |
 | Backups | `<database parent>/backups/` |
+| History | `<database parent>/history/` (manifests, file pre-images, snapshots, diffs) |
 | Logs | `KANDRIUM_LOG_DIR` env var, else `<data_dir>/kandrium/logs/` |
 | Notes root | `KANDRIUM_NOTES` env var, else `<data_dir>/kandrium/notes/` |
 | Documents root | `KANDRIUM_DOCS` env var, else `<data_dir>/kandrium/documents/` |
