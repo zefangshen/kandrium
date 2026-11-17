@@ -12,9 +12,11 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 pub mod capture;
+pub mod rows;
 pub mod store;
 
 pub use capture::{CaptureGuard, RunContext};
+pub use rows::{CAPTURED_TABLES, RowEnd, RowSession, captured_tables, row_begin};
 pub use store::{HISTORY_DIR, HistoryStore};
 
 /// Manifest schema version.
