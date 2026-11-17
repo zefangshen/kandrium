@@ -877,6 +877,7 @@ impl KandriumServer {
                     force: input.force.unwrap_or(false),
                     agent: input.agent,
                     instructions_version: input.instructions_version,
+                    run_id: None,
                 },
             )
         })
@@ -901,6 +902,7 @@ impl KandriumServer {
                     force: input.force.unwrap_or(false),
                     agent: input.agent,
                     instructions_version: input.instructions_version,
+                    run_id: None,
                 },
             )
         })
@@ -921,6 +923,7 @@ impl KandriumServer {
                     expected_hash: input.expected_hash,
                     force: input.force.unwrap_or(false),
                     instructions_version: input.instructions_version,
+                    run_id: None,
                 },
             )?;
             Ok(serde_json::json!({ "path": path, "deleted": true }))

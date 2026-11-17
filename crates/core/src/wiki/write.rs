@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{KandriumError, Result};
 use crate::fsutil;
+use crate::history;
 
 use super::index;
 use super::instructions::WIKI_INSTRUCTIONS_VERSION;
@@ -41,6 +42,8 @@ pub struct WritePageSpec {
     pub force: bool,
     pub agent: Option<String>,
     pub instructions_version: u32,
+    /// History run this write belongs to; `None` records no file history.
+    pub run_id: Option<String>,
 }
 
 /// Result of a page write.
@@ -51,6 +54,8 @@ pub struct PageWrite {
     pub previous_hash: Option<String>,
     pub content_hash: String,
     pub action: WriteAction,
+    /// History run the write was recorded under, when one was supplied.
+    pub run_id: Option<String>,
 }
 
 /// Input for [`patch_page`].
@@ -63,6 +68,8 @@ pub struct PatchPageSpec {
     pub force: bool,
     pub agent: Option<String>,
     pub instructions_version: u32,
+    /// History run this patch belongs to; inherited by the inner write.
+    pub run_id: Option<String>,
 }
 
 /// Result of a patch.
@@ -73,6 +80,8 @@ pub struct PagePatch {
     pub replaced: u32,
     pub previous_hash: Option<String>,
     pub content_hash: String,
+    /// History run the patch was recorded under, when one was supplied.
+    pub run_id: Option<String>,
 }
 
 /// Input for [`delete_page`].
@@ -82,6 +91,8 @@ pub struct DeletePageSpec {
     pub expected_hash: Option<String>,
     pub force: bool,
     pub instructions_version: u32,
+    /// History run this delete belongs to; `None` records no file history.
+    pub run_id: Option<String>,
 }
 
 /// Counters recorded with a run.
@@ -170,10 +181,18 @@ pub fn write_page(db: &mut Connection, root: &Path, spec: &WritePageSpec) -> Res
     };
 
     if action != WriteAction::Unchanged {
+        let history_ctx = history::RunContext::from_run_id(db, &spec.run_id);
+        let guard = match &history_ctx {
+            Some(ctx) => Some(ctx.capture(history::RootKind::Wiki, &root, &target)?),
+            None => None,
+        };
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
         fsutil::write_atomic(&target, spec.content.as_bytes())?;
+        if let Some(guard) = guard {
+            guard.commit(Some(spec.content.as_bytes()))?;
+        }
     }
 
     index::reindex_page(db, &root, &spec.rel_path)?;
@@ -196,6 +215,7 @@ pub fn write_page(db: &mut Connection, root: &Path, spec: &WritePageSpec) -> Res
         previous_hash,
         content_hash,
         action,
+        run_id: spec.run_id.clone(),
     })
 }
 
@@ -230,6 +250,7 @@ pub fn patch_page(db: &mut Connection, root: &Path, spec: &PatchPageSpec) -> Res
             force: spec.force,
             agent: spec.agent.clone(),
             instructions_version: spec.instructions_version,
+            run_id: spec.run_id.clone(),
         },
     )?;
     Ok(PagePatch {
@@ -237,6 +258,7 @@ pub fn patch_page(db: &mut Connection, root: &Path, spec: &PatchPageSpec) -> Res
         replaced: replaced as u32,
         previous_hash: write.previous_hash,
         content_hash: write.content_hash,
+        run_id: write.run_id,
     })
 }
 
@@ -267,7 +289,15 @@ pub fn delete_page(db: &mut Connection, root: &Path, spec: &DeletePageSpec) -> R
     }
 
     if existing.is_some() {
+        let history_ctx = history::RunContext::from_run_id(db, &spec.run_id);
+        let guard = match &history_ctx {
+            Some(ctx) => Some(ctx.capture(history::RootKind::Wiki, &root, &target)?),
+            None => None,
+        };
         fs::remove_file(&target)?;
+        if let Some(guard) = guard {
+            guard.commit(None)?;
+        }
     }
 
     let affected: Vec<String> = {
@@ -664,6 +694,7 @@ mod tests {
         _tmp: tempfile::TempDir,
         root: PathBuf,
         documents: PathBuf,
+        db_path: PathBuf,
         db: Connection,
     }
 
@@ -673,12 +704,14 @@ mod tests {
         let documents = tmp.path().join("documents");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&documents).unwrap();
-        let mut db = crate::db::open_db(&tmp.path().join("test.db")).unwrap();
+        let db_path = tmp.path().join("test.db");
+        let mut db = crate::db::open_db(&db_path).unwrap();
         crate::db::migrations::run_schema(&mut db).unwrap();
         Fixture {
             _tmp: tmp,
             root,
             documents,
+            db_path,
             db,
         }
     }
@@ -699,6 +732,7 @@ mod tests {
             force: false,
             agent: Some("test".into()),
             instructions_version: WIKI_INSTRUCTIONS_VERSION,
+            run_id: None,
         }
     }
 
@@ -865,6 +899,7 @@ mod tests {
                 force: false,
                 agent: Some("test".into()),
                 instructions_version: WIKI_INSTRUCTIONS_VERSION,
+                run_id: None,
             },
         )
         .unwrap();
@@ -880,6 +915,7 @@ mod tests {
                 expected_hash: Some(patch.content_hash),
                 force: false,
                 instructions_version: WIKI_INSTRUCTIONS_VERSION,
+                run_id: None,
             },
         )
         .unwrap();
@@ -916,6 +952,7 @@ mod tests {
                 expected_hash: None,
                 force: false,
                 instructions_version: WIKI_INSTRUCTIONS_VERSION,
+                run_id: None,
             },
         );
         assert!(blocked.is_err());
@@ -928,6 +965,7 @@ mod tests {
                 expected_hash: None,
                 force: true,
                 instructions_version: WIKI_INSTRUCTIONS_VERSION,
+                run_id: None,
             },
         )
         .unwrap();
@@ -1035,5 +1073,87 @@ mod tests {
             &write_spec("Hand Written.md", page("Attention", false), None),
         );
         assert!(hand_written.is_ok());
+    }
+
+    #[test]
+    fn wiki_writes_are_captured_under_the_run() {
+        let mut f = fixture();
+        let store = crate::history::HistoryStore::for_db(&f.db_path);
+        let run_id = Some("run1".to_string());
+
+        let mut create = write_spec("concepts/attention.md", page("Attention", false), None);
+        create.run_id = run_id.clone();
+        write_page(&mut f.db, &f.root, &create).unwrap();
+
+        let mut replace = write_spec("concepts/attention.md", page("Attention v2", false), None);
+        replace.run_id = run_id.clone();
+        write_page(&mut f.db, &f.root, &replace).unwrap();
+
+        let delete = DeletePageSpec {
+            rel_path: "concepts/attention.md".into(),
+            expected_hash: None,
+            force: true,
+            instructions_version: WIKI_INSTRUCTIONS_VERSION,
+            run_id: run_id.clone(),
+        };
+        delete_page(&mut f.db, &f.root, &delete).unwrap();
+
+        let manifest = store.load("run1").unwrap().expect("manifest");
+        let ops: Vec<(String, crate::history::FileOp)> = manifest
+            .files
+            .iter()
+            .map(|entry| (entry.path.clone(), entry.op))
+            .collect();
+        assert_eq!(
+            ops,
+            vec![
+                (
+                    "concepts/attention.md".to_string(),
+                    crate::history::FileOp::Create
+                ),
+                (
+                    "concepts/attention.md".to_string(),
+                    crate::history::FileOp::Modify
+                ),
+                (
+                    "concepts/attention.md".to_string(),
+                    crate::history::FileOp::Delete
+                ),
+            ]
+        );
+        // The generated index is never captured.
+        assert!(manifest.files.iter().all(|entry| entry.path != "index.md"));
+        // The delete's pre-image is readable.
+        let delete_entry = manifest.files.last().unwrap();
+        assert_eq!(
+            store
+                .read_object(&delete_entry.before.as_ref().unwrap().hash)
+                .unwrap(),
+            page("Attention v2", false).into_bytes()
+        );
+    }
+
+    #[test]
+    fn failed_hash_checks_write_no_history() {
+        let mut f = fixture();
+        let store = crate::history::HistoryStore::for_db(&f.db_path);
+
+        let mut spec = write_spec(
+            "concepts/attention.md",
+            page("Attention", false),
+            Some("stale"),
+        );
+        spec.run_id = Some("run1".into());
+        assert!(write_page(&mut f.db, &f.root, &spec).is_err());
+        assert!(store.load("run1").unwrap().is_none());
+
+        // An unchanged write also records nothing.
+        let mut first = write_spec("concepts/attention.md", page("Attention", false), None);
+        first.run_id = Some("run2".into());
+        write_page(&mut f.db, &f.root, &first).unwrap();
+        let mut again = write_spec("concepts/attention.md", page("Attention", false), None);
+        again.run_id = Some("run2".into());
+        write_page(&mut f.db, &f.root, &again).unwrap();
+        assert_eq!(store.load("run2").unwrap().unwrap().files.len(), 1);
     }
 }
