@@ -125,13 +125,14 @@ impl NotesState {
     }
 }
 
-/// The half's 38 px title row: optional leading control (the Wiki half
-/// toggle), name, new-note, new-folder and whole-tree collapse. The separator
-/// below is only drawn while the half is collapsed, where it keeps the two
-/// headers readable as separate rows.
+/// The half's 38 px title row: optional leading control (the half toggle),
+/// name, new-note, new-folder and whole-tree collapse. The separator below is
+/// only drawn while the half is collapsed, where it keeps the headers readable
+/// as separate rows.
 pub(crate) fn tree_header(
     t: &Tokens,
     cx: &mut Context<AppShell>,
+    title: &'static str,
     leading: Option<AnyElement>,
     separator: bool,
 ) -> AnyElement {
@@ -150,7 +151,7 @@ pub(crate) fn tree_header(
                 .truncate()
                 .text(Text::Label)
                 .text_color(t.text_muted)
-                .child("WIKI"),
+                .child(title),
         )
         .child(tree_action(
             "notes-new-note",
@@ -248,7 +249,7 @@ pub(crate) fn tree_body(state: &NotesState, t: &Tokens, cx: &mut Context<AppShel
                 .py(px(10.))
                 .text(Text::Small)
                 .text_color(t.text_faint)
-                .child("No wiki pages yet."),
+                .child("No notes yet."),
         );
     }
     for entry in &state.entries {

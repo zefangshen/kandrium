@@ -170,8 +170,8 @@ pub fn field_textarea(state: &Entity<TextareaState>, t: &Tokens) -> Textarea {
 }
 
 /// The open file's path for a document header: a middle-ellipsized label with
-/// the full path as its tooltip. It truncates first so the vim indicator and
-/// Edit | Preview stay on one row at the minimum window width.
+/// the full path as its tooltip. It truncates first so the Edit | Preview
+/// toggle stays on one row at the minimum window width.
 pub fn path_label(
     id: &'static str,
     full: String,
@@ -193,54 +193,6 @@ pub fn path_label(
                 label: tooltip.clone(),
             })
             .into()
-        })
-        .into_any_element()
-}
-
-/// Live vim state for a document header: the modal label, any pending
-/// operator or ex text, and a quiet "vim off" when the global toggle is off.
-///
-/// It sits next to Edit | Preview and is informational; the status bar's
-/// badge remains the toggle.
-pub fn vim_indicator(id: &'static str, vim: &crate::vim::VimSession, t: &Tokens) -> AnyElement {
-    let enabled = vim.is_enabled();
-    let insert = vim.mode_label() == "INSERT";
-    let pending = if enabled {
-        vim.pending()
-    } else {
-        String::new()
-    };
-    div()
-        .id(id)
-        .test_support()
-        .flex()
-        .items_center()
-        .gap(px(5.))
-        .h(px(22.))
-        .px(px(7.))
-        .rounded(px(4.))
-        .border_1()
-        .border_color(t.border)
-        .hover(|style| style.border_color(t.border_hover))
-        .text(Text::Micro)
-        .text_color(if !enabled {
-            t.text_ghost
-        } else if insert {
-            t.accent_text
-        } else {
-            t.text_muted
-        })
-        .when(enabled, |this| {
-            this.child(div().size(px(4.)).rounded(px(2.)).bg(t.accent))
-        })
-        .child(if enabled { vim.mode_label() } else { "vim off" })
-        .when(!pending.is_empty(), |this| {
-            this.child(
-                div()
-                    .text(Text::Micro)
-                    .text_color(t.text_faint)
-                    .child(pending),
-            )
         })
         .into_any_element()
 }
@@ -316,7 +268,8 @@ pub fn gutter_rule(lines: usize, t: &Tokens, window: &Window) -> AnyElement {
 pub struct EditorStatus<'a> {
     /// `NORMAL` / `INSERT` / `vim` while editing, `PREVIEW` in preview mode.
     pub mode: &'a str,
-    /// Whether vim owns the buffer; the badge is the vim toggle only then.
+    /// Whether vim owns the buffer. The badge reads `vim off` when false and
+    /// is the toggle in both states.
     pub vim: bool,
     /// Pending vim keys, `:` line or its error, with `true` for an error.
     pub pending: Option<(String, bool)>,
@@ -340,7 +293,8 @@ pub fn editor_status_bar(
     t: &Tokens,
     on_mode: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
-    let toggle = status.vim && status.mode != "PREVIEW";
+    let editable = status.mode != "PREVIEW";
+    let active = status.vim && editable;
     let mode_label = if status.mode == "PREVIEW" || status.vim {
         status.mode.to_string()
     } else {
@@ -365,10 +319,10 @@ pub fn editor_status_bar(
                 .px(px(6.))
                 .py(px(1.))
                 .rounded(px(4.))
-                .bg(if toggle { t.accent_soft } else { t.surface_2 })
+                .bg(if active { t.accent_soft } else { t.surface_2 })
                 .text(Text::Micro)
-                .text_color(if toggle { t.accent_text } else { t.text_muted })
-                .when(toggle, |this| {
+                .text_color(if active { t.accent_text } else { t.text_muted })
+                .when(editable, |this| {
                     this.cursor_pointer()
                         .hover(|style| style.bg(t.selected))
                         .on_click(on_mode)

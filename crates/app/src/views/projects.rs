@@ -2490,7 +2490,6 @@ fn doc_body(
                 cx,
             ))
             .child(div().flex_1())
-            .child(crate::views::vim_indicator("project-doc-vim", &tab.vim, t))
             .child(crate::views::mode_switch(
                 "project-doc-preview",
                 tab.preview,

@@ -52,19 +52,15 @@ pub use write::{
 
 /// Environment variable that overrides the wiki page root.
 pub const WIKI_ENV: &str = "KANDRIUM_WIKI";
-/// Retired environment variable, accepted as a read alias for one release.
-pub const LEGACY_NOTES_ENV: &str = "KANDRIUM_NOTES";
 
 /// Resolve the wiki root:
 /// 1. `KANDRIUM_WIKI` (explicit override)
-/// 2. `KANDRIUM_NOTES` (deprecated read alias)
-/// 3. `<data_dir>/kandrium/wiki`
+/// 2. `<data_dir>/kandrium/wiki`
+///
+/// `KANDRIUM_NOTES` is deliberately not an alias: it names the personal notes
+/// root, which the app shows as its own tree beside the compiled pages.
 pub fn resolve_wiki_root() -> PathBuf {
-    resolve_root_from(
-        std::env::var_os(WIKI_ENV),
-        std::env::var_os(LEGACY_NOTES_ENV),
-        dirs::data_dir(),
-    )
+    resolve_root_from(std::env::var_os(WIKI_ENV), dirs::data_dir())
 }
 
 /// Create the wiki root if missing and return it.
@@ -74,15 +70,8 @@ pub fn ensure_wiki_root() -> Result<PathBuf> {
     Ok(root)
 }
 
-fn resolve_root_from(
-    wiki: Option<OsString>,
-    legacy: Option<OsString>,
-    data_dir: Option<PathBuf>,
-) -> PathBuf {
+fn resolve_root_from(wiki: Option<OsString>, data_dir: Option<PathBuf>) -> PathBuf {
     if let Some(path) = wiki {
-        return PathBuf::from(path);
-    }
-    if let Some(path) = legacy {
         return PathBuf::from(path);
     }
     data_dir
@@ -281,28 +270,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wiki_env_wins_over_the_legacy_alias() {
+    fn wiki_env_wins_over_the_default() {
         let root = resolve_root_from(
             Some(OsString::from("/tmp/wiki")),
-            Some(OsString::from("/tmp/legacy")),
             Some(PathBuf::from("/data")),
         );
         assert_eq!(root, PathBuf::from("/tmp/wiki"));
     }
 
     #[test]
-    fn legacy_alias_is_used_when_wiki_env_is_absent() {
-        let root = resolve_root_from(
-            None,
-            Some(OsString::from("/tmp/legacy")),
-            Some(PathBuf::from("/data")),
-        );
-        assert_eq!(root, PathBuf::from("/tmp/legacy"));
-    }
-
-    #[test]
     fn default_root_is_the_wiki_directory() {
-        let root = resolve_root_from(None, None, Some(PathBuf::from("/data")));
+        let root = resolve_root_from(None, Some(PathBuf::from("/data")));
         assert_eq!(root, PathBuf::from("/data/kandrium/wiki"));
     }
 

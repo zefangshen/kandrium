@@ -21,11 +21,15 @@ pub const MIN_TREE_W: f32 = 160.0;
 /// Widest tree the splitter allows.
 pub const MAX_TREE_W: f32 = 420.0;
 
-/// Notes-half share of the Wiki tree split, in permille.
-pub const DEFAULT_SPLIT_PERMILLE: u16 = 500;
-/// Smallest share a half may take while both are expanded.
+/// Notes-half share of the Knowledge tree split, in permille.
+pub const DEFAULT_SPLIT_PERMILLE: u16 = 333;
+/// Notes + Wiki share (the second seam), in permille. The two defaults give
+/// the three halves roughly a third each.
+pub const DEFAULT_SPLIT_PAGES_PERMILLE: u16 = 667;
+/// Smallest share a half may take while expanded, and the smallest gap the
+/// two seams keep between them.
 pub const MIN_SPLIT_PERMILLE: u16 = 150;
-/// Largest share a half may take while both are expanded.
+/// Largest share a half may take while expanded.
 pub const MAX_SPLIT_PERMILLE: u16 = 850;
 
 /// The collapsible trees the shell remembers.
@@ -67,18 +71,22 @@ impl TreePanel {
     }
 }
 
-/// Which half of the Wiki tree column a collapse flag belongs to.
+/// Which half of the Knowledge tree column a collapse flag belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WikiHalf {
     Notes,
-    Documents,
+    Wiki,
+    Sources,
 }
 
 impl WikiHalf {
     fn collapsed_key(self) -> &'static str {
         match self {
             Self::Notes => "wiki_notes_collapsed",
-            Self::Documents => "wiki_documents_collapsed",
+            Self::Wiki => "wiki_pages_collapsed",
+            // Sources keeps the key the documents half used, so existing
+            // settings files restore the same state.
+            Self::Sources => "wiki_documents_collapsed",
         }
     }
 }
@@ -126,7 +134,7 @@ impl Settings {
         if let Some(section) = ron_scalar(&text, "section") {
             let key = section.to_ascii_lowercase();
             let section = match key.as_str() {
-                "notes" | "documents" => Section::Wiki,
+                "notes" | "documents" | "wiki" | "knowledge" => Section::Wiki,
                 other => Section::from_key(other).unwrap_or(Section::Tasks),
             };
             self.set_section(section);
@@ -194,20 +202,21 @@ impl Settings {
     }
 
     /// Last active section. A saved id this build no longer knows falls back to
-    /// Tasks, except the retired Notes/Documents ids, which become Wiki.
+    /// Tasks. `knowledge` is this build's value for the Knowledge section; the
+    /// ids it replaced (`wiki`, `notes`, `documents`) still restore it.
     pub fn section(&self) -> Section {
         let Some(key) = self.values.get("section").map(String::as_str) else {
             return Section::Tasks;
         };
-        Section::from_key(key).unwrap_or(match key {
-            "notes" | "documents" => Section::Wiki,
-            _ => Section::Tasks,
-        })
+        match key {
+            "notes" | "documents" | "wiki" | "knowledge" => Section::Wiki,
+            other => Section::from_key(other).unwrap_or(Section::Tasks),
+        }
     }
 
     pub fn set_section(&mut self, section: Section) {
         self.values
-            .insert("section".into(), section.id().to_string());
+            .insert("section".into(), section.setting_key().to_string());
     }
 
     /// Clock id shown in the titlebar. Missing, blank or unparsable values
@@ -269,27 +278,56 @@ impl Settings {
         self.set_bool(panel.open_key(), open);
     }
 
-    /// Notes-half share of the Wiki tree split, 0.15–0.85.
+    /// Notes-half share of the Knowledge tree split, 0.15–0.85.
     pub fn wiki_split(&self) -> f32 {
-        let permille = self
-            .values
-            .get("wiki_split")
-            .and_then(|value| value.parse::<u16>().ok())
-            .unwrap_or(DEFAULT_SPLIT_PERMILLE);
-        clamp_split_permille(permille) as f32 / 1000.0
+        Self::split_at(&self.values, "wiki_split", DEFAULT_SPLIT_PERMILLE)
+    }
+
+    /// Cumulative Notes + Wiki share: where the second seam sits, 0.15–0.85.
+    pub fn wiki_split_pages(&self) -> f32 {
+        Self::split_at(
+            &self.values,
+            "wiki_split_pages",
+            DEFAULT_SPLIT_PAGES_PERMILLE,
+        )
     }
 
     /// Persist the split as an integer permille so the key-sorted file stays
     /// byte-stable.
     pub fn set_wiki_split(&mut self, share: f32) {
+        Self::set_split_at(
+            &mut self.values,
+            "wiki_split",
+            share,
+            DEFAULT_SPLIT_PERMILLE,
+        );
+    }
+
+    pub fn set_wiki_split_pages(&mut self, share: f32) {
+        Self::set_split_at(
+            &mut self.values,
+            "wiki_split_pages",
+            share,
+            DEFAULT_SPLIT_PAGES_PERMILLE,
+        );
+    }
+
+    fn split_at(values: &BTreeMap<String, String>, key: &str, default: u16) -> f32 {
+        let permille = values
+            .get(key)
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(default);
+        clamp_split_permille(permille) as f32 / 1000.0
+    }
+
+    fn set_split_at(values: &mut BTreeMap<String, String>, key: &str, share: f32, default: u16) {
         let permille = if share.is_finite() {
-            (share * 1000.0).round() as i64
+            (share * 1000.0).round()
         } else {
-            DEFAULT_SPLIT_PERMILLE as i64
+            default as f32
         };
-        let permille = clamp_split_permille(permille.clamp(0, u16::MAX as i64) as u16);
-        self.values
-            .insert("wiki_split".into(), permille.to_string());
+        let permille = clamp_split_permille(permille.clamp(0.0, u16::MAX as f32) as u16);
+        values.insert(key.into(), permille.to_string());
     }
 
     /// Whether one Wiki tree half is collapsed to its header.
@@ -450,19 +488,38 @@ mod tests {
         assert_eq!(settings.tree_width(TreePanel::Wiki), DEFAULT_TREE_W);
         assert!(settings.tree_open(TreePanel::Wiki));
         assert_eq!(settings.tree_width(TreePanel::Projects), DEFAULT_TREE_W);
-        assert_eq!(settings.wiki_split(), 0.5);
+        assert_eq!(
+            settings.wiki_split(),
+            DEFAULT_SPLIT_PERMILLE as f32 / 1000.0
+        );
+        assert_eq!(
+            settings.wiki_split_pages(),
+            DEFAULT_SPLIT_PAGES_PERMILLE as f32 / 1000.0
+        );
         assert!(!settings.wiki_half_collapsed(WikiHalf::Notes));
-        assert!(!settings.wiki_half_collapsed(WikiHalf::Documents));
+        assert!(!settings.wiki_half_collapsed(WikiHalf::Wiki));
+        assert!(!settings.wiki_half_collapsed(WikiHalf::Sources));
     }
 
     #[test]
-    fn retired_section_ids_resolve_to_wiki() {
-        for key in ["notes", "documents", "wiki"] {
+    fn section_ids_resolve_to_knowledge() {
+        for key in ["notes", "documents", "wiki", "knowledge"] {
             let settings = Settings::parse(&format!("section={key}\n"));
             assert_eq!(settings.section(), Section::Wiki, "section={key}");
         }
         let settings = Settings::parse("section=elsewhere\n");
         assert_eq!(settings.section(), Section::Tasks);
+    }
+
+    #[test]
+    fn knowledge_is_persisted_under_its_new_key() {
+        let mut settings = Settings::default();
+        settings.set_section(Section::Wiki);
+        assert_eq!(settings.to_text(), "section=knowledge\n");
+        assert_eq!(
+            Settings::parse(&settings.to_text()).section(),
+            Section::Wiki
+        );
     }
 
     #[test]
@@ -517,26 +574,49 @@ mod tests {
         let settings = Settings::parse("wiki_split=9999\n");
         assert_eq!(settings.wiki_split(), MAX_SPLIT_PERMILLE as f32 / 1000.0);
         let settings = Settings::parse("wiki_split=garbage\n");
-        assert_eq!(settings.wiki_split(), 0.5);
+        assert_eq!(
+            settings.wiki_split(),
+            DEFAULT_SPLIT_PERMILLE as f32 / 1000.0
+        );
+
+        let settings = Settings::parse("wiki_split_pages=0\n");
+        assert_eq!(
+            settings.wiki_split_pages(),
+            MIN_SPLIT_PERMILLE as f32 / 1000.0
+        );
+        let settings = Settings::parse("wiki_split_pages=9999\n");
+        assert_eq!(
+            settings.wiki_split_pages(),
+            MAX_SPLIT_PERMILLE as f32 / 1000.0
+        );
+        let settings = Settings::parse("wiki_split_pages=garbage\n");
+        assert_eq!(
+            settings.wiki_split_pages(),
+            DEFAULT_SPLIT_PAGES_PERMILLE as f32 / 1000.0
+        );
 
         let mut settings = Settings::default();
         settings.set_wiki_split(0.63);
-        assert_eq!(settings.to_text(), "wiki_split=630\n");
+        settings.set_wiki_split_pages(0.78);
+        assert_eq!(settings.to_text(), "wiki_split=630\nwiki_split_pages=780\n");
     }
 
     #[test]
     fn collapsed_flags_parse_and_persist() {
-        let settings = Settings::parse("wiki_notes_collapsed=1\nwiki_documents_collapsed=true\n");
+        let settings = Settings::parse(
+            "wiki_notes_collapsed=1\nwiki_pages_collapsed=1\nwiki_documents_collapsed=true\n",
+        );
         assert!(settings.wiki_half_collapsed(WikiHalf::Notes));
-        assert!(settings.wiki_half_collapsed(WikiHalf::Documents));
+        assert!(settings.wiki_half_collapsed(WikiHalf::Wiki));
+        assert!(settings.wiki_half_collapsed(WikiHalf::Sources));
         let settings = Settings::parse("wiki_notes_collapsed=garbage\n");
         assert!(!settings.wiki_half_collapsed(WikiHalf::Notes));
 
         let mut settings = Settings::default();
-        settings.set_wiki_half_collapsed(WikiHalf::Notes, true);
-        assert!(settings.wiki_half_collapsed(WikiHalf::Notes));
-        settings.set_wiki_half_collapsed(WikiHalf::Notes, false);
-        assert!(!settings.wiki_half_collapsed(WikiHalf::Notes));
+        settings.set_wiki_half_collapsed(WikiHalf::Wiki, true);
+        assert!(settings.wiki_half_collapsed(WikiHalf::Wiki));
+        settings.set_wiki_half_collapsed(WikiHalf::Wiki, false);
+        assert!(!settings.wiki_half_collapsed(WikiHalf::Wiki));
     }
 
     #[test]
@@ -550,7 +630,7 @@ mod tests {
         settings.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
-            text, "section=wiki\nvim_mode=0\nwiki_tree_open=0\n",
+            text, "section=knowledge\nvim_mode=0\nwiki_tree_open=0\n",
             "keys must be deterministic for a clean diff"
         );
     }

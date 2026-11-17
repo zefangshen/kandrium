@@ -245,10 +245,15 @@ impl Store {
     // even when the database itself failed to open.
     // -----------------------------------------------------------------------
 
-    /// The wiki page root (`KANDRIUM_WIKI`, with `KANDRIUM_NOTES` as a
-    /// deprecated alias), created when missing.
+    /// The compiled wiki page root (`KANDRIUM_WIKI`), created when missing.
     pub fn notes_root(&self) -> StoreResult<PathBuf> {
         wiki::ensure_wiki_root().map_err(|e| e.to_string())
+    }
+
+    /// The personal notes root (`KANDRIUM_NOTES`), created when missing. The
+    /// Notes half of the Knowledge tree reads and writes here.
+    pub fn personal_notes_root(&self) -> StoreResult<PathBuf> {
+        notes::ensure_root().map_err(|e| e.to_string())
     }
 
     pub fn notes_tree(&self, root: &Path) -> StoreResult<Vec<NoteEntry>> {

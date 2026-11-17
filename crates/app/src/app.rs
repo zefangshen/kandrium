@@ -80,7 +80,7 @@ impl Section {
         match self {
             Section::Tasks => "Tasks",
             Section::Clocks => "Clocks",
-            Section::Wiki => "Wiki",
+            Section::Wiki => "Knowledge",
             Section::Projects => "Projects",
         }
     }
@@ -92,6 +92,16 @@ impl Section {
             Section::Clocks => "clocks",
             Section::Wiki => "wiki",
             Section::Projects => "projects",
+        }
+    }
+
+    /// Value persisted in the settings file. The section's id doubles as its
+    /// element id and must stay stable, so the stored key follows the
+    /// user-facing name instead.
+    pub fn setting_key(self) -> &'static str {
+        match self {
+            Section::Wiki => "knowledge",
+            other => other.id(),
         }
     }
 
@@ -319,8 +329,11 @@ impl AppShell {
         wiki.documents.tree_open = wiki.notes.tree_open;
         wiki.documents.tree_w = wiki.notes.tree_w;
         wiki.split = settings.wiki_split();
+        wiki.pages_split = settings.wiki_split_pages();
         wiki.notes_collapsed = settings.wiki_half_collapsed(settings::WikiHalf::Notes);
-        wiki.docs_collapsed = settings.wiki_half_collapsed(settings::WikiHalf::Documents);
+        wiki.pages_collapsed = settings.wiki_half_collapsed(settings::WikiHalf::Wiki);
+        wiki.docs_collapsed = settings.wiki_half_collapsed(settings::WikiHalf::Sources);
+        wiki.settle_splits();
         let mut projects = ProjectsState::new();
         projects.tree_open = settings.tree_open(TreePanel::Projects);
         projects.tree_w = settings.tree_width(TreePanel::Projects);
@@ -393,6 +406,7 @@ impl AppShell {
         match section {
             Section::Wiki => {
                 shell.load_notes();
+                shell.load_wiki_pages();
                 shell.load_documents();
                 shell.reload_wiki_status();
             }
@@ -416,10 +430,13 @@ impl AppShell {
         self.settings
             .set_tree_width(TreePanel::Wiki, self.wiki.notes.tree_w);
         self.settings.set_wiki_split(self.wiki.split);
+        self.settings.set_wiki_split_pages(self.wiki.pages_split);
         self.settings
             .set_wiki_half_collapsed(settings::WikiHalf::Notes, self.wiki.notes_collapsed);
         self.settings
-            .set_wiki_half_collapsed(settings::WikiHalf::Documents, self.wiki.docs_collapsed);
+            .set_wiki_half_collapsed(settings::WikiHalf::Wiki, self.wiki.pages_collapsed);
+        self.settings
+            .set_wiki_half_collapsed(settings::WikiHalf::Sources, self.wiki.docs_collapsed);
         self.settings
             .set_tree_open(TreePanel::Projects, self.projects.tree_open);
         self.settings
@@ -472,16 +489,37 @@ impl AppShell {
         }
     }
 
-    /// Live split while the Wiki vertical splitter is dragged. The share is
-    /// clamped so neither half can be squeezed away.
+    /// Live split while the first vertical splitter (Notes ↔ Wiki) is dragged.
+    /// The share is clamped so the seams stay ordered and no half is squeezed
+    /// away.
     pub(crate) fn set_wiki_split(&mut self, share: f32, cx: &mut Context<Self>) {
+        let gap = settings::MIN_SPLIT_PERMILLE as f32 / 1000.0;
+        let min = gap;
+        let max = (self.wiki.pages_split - gap).max(min);
         let share = if share.is_finite() {
-            share.clamp(0.15, 0.85)
+            share.clamp(min, max)
         } else {
-            0.5
+            settings::DEFAULT_SPLIT_PERMILLE as f32 / 1000.0
         };
         if (self.wiki.split - share).abs() > 0.001 {
             self.wiki.split = share;
+            cx.notify();
+        }
+    }
+
+    /// Live split while the second vertical splitter (Wiki ↔ Sources) is
+    /// dragged.
+    pub(crate) fn set_wiki_pages_split(&mut self, share: f32, cx: &mut Context<Self>) {
+        let gap = settings::MIN_SPLIT_PERMILLE as f32 / 1000.0;
+        let max = settings::MAX_SPLIT_PERMILLE as f32 / 1000.0;
+        let min = (self.wiki.split + gap).min(max);
+        let share = if share.is_finite() {
+            share.clamp(min, max)
+        } else {
+            settings::DEFAULT_SPLIT_PAGES_PERMILLE as f32 / 1000.0
+        };
+        if (self.wiki.pages_split - share).abs() > 0.001 {
+            self.wiki.pages_split = share;
             cx.notify();
         }
     }
@@ -498,7 +536,10 @@ impl AppShell {
             settings::WikiHalf::Notes => {
                 self.wiki.notes_collapsed = !self.wiki.notes_collapsed;
             }
-            settings::WikiHalf::Documents => {
+            settings::WikiHalf::Wiki => {
+                self.wiki.pages_collapsed = !self.wiki.pages_collapsed;
+            }
+            settings::WikiHalf::Sources => {
                 self.wiki.docs_collapsed = !self.wiki.docs_collapsed;
             }
         }
@@ -540,6 +581,7 @@ impl AppShell {
         }
         self.wiki.busy = false;
         self.load_notes();
+        self.load_wiki_pages();
         self.load_documents();
         self.reload_wiki_status();
         if self.wiki.panel == Some(WikiPanel::Lint) {
@@ -650,6 +692,7 @@ impl AppShell {
             Section::Clocks => self.load_clocks(),
             Section::Wiki => {
                 self.load_notes();
+                self.load_wiki_pages();
                 self.load_documents();
                 self.reload_wiki_status();
             }
@@ -3487,6 +3530,7 @@ impl AppShell {
                 // trees are file-backed, so rescanning is the reload; the
                 // status panel only re-reads the derived index.
                 self.load_notes();
+                self.load_wiki_pages();
                 self.load_documents();
                 self.reload_wiki_status();
             }
@@ -4376,10 +4420,10 @@ impl AppShell {
     // Notes
     // -----------------------------------------------------------------------
 
-    /// Resolve the notes root and rescan it. Tabs and the expanded set survive
-    /// because they are keyed by path.
+    /// Resolve the personal notes root and rescan it. Tabs and the expanded set
+    /// survive because they are keyed by path.
     fn load_notes(&mut self) {
-        let root = match self.store.notes_root() {
+        let root = match self.store.personal_notes_root() {
             Ok(root) => root,
             Err(error) => {
                 self.wiki.notes.root = None;
@@ -4402,6 +4446,32 @@ impl AppShell {
         }
     }
 
+    /// Rescan the compiled wiki page root into the Wiki half. Pages open as
+    /// notes but live under the wiki root, so saves there reindex the wiki.
+    fn load_wiki_pages(&mut self) {
+        let root = match self.store.notes_root() {
+            Ok(root) => root,
+            Err(error) => {
+                self.wiki.pages.root = None;
+                self.wiki.pages.entries.clear();
+                self.wiki.pages.error = Some(error.to_string());
+                return;
+            }
+        };
+        match self.store.notes_tree(&root) {
+            Ok(entries) => {
+                self.wiki.pages.root = Some(root);
+                self.wiki.pages.entries = entries;
+                self.wiki.pages.error = None;
+            }
+            Err(error) => {
+                self.wiki.pages.root = Some(root);
+                self.wiki.pages.entries.clear();
+                self.wiki.pages.error = Some(error.to_string());
+            }
+        }
+    }
+
     pub(crate) fn toggle_notes_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if !self.wiki.notes.expanded.remove(&path) {
             self.wiki.notes.expanded.insert(path.clone());
@@ -4410,10 +4480,48 @@ impl AppShell {
         cx.notify();
     }
 
+    /// Expand or fold a folder in the Wiki page tree.
+    pub(crate) fn toggle_wiki_page_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if !self.wiki.pages.expanded.remove(&path) {
+            self.wiki.pages.expanded.insert(path.clone());
+        }
+        self.wiki.pages.selected = Some(path);
+        cx.notify();
+    }
+
+    /// Which tree a note tab belongs to: the compiled wiki root wins when the
+    /// path lives there, otherwise the personal notes root.
+    fn note_root_for(&self, path: &Path) -> Option<PathBuf> {
+        if let Some(root) = &self.wiki.pages.root
+            && path.starts_with(root)
+        {
+            return Some(root.clone());
+        }
+        self.wiki
+            .notes
+            .root
+            .clone()
+            .or_else(|| self.wiki.pages.root.clone())
+    }
+
+    fn is_wiki_page(&self, path: &Path) -> bool {
+        self.wiki
+            .pages
+            .root
+            .as_ref()
+            .is_some_and(|root| path.starts_with(root))
+    }
+
     /// Open a note in a tab, reusing the tab when the path is already open.
+    /// Personal notes and compiled pages share the tab list; the root is
+    /// resolved from the path.
     pub(crate) fn open_note(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.wiki.panel = None;
-        self.wiki.notes.selected = Some(path.clone());
+        if self.is_wiki_page(&path) {
+            self.wiki.pages.selected = Some(path.clone());
+        } else {
+            self.wiki.notes.selected = Some(path.clone());
+        }
         if let Some(index) = self.wiki.notes.tab_index(&path) {
             self.wiki.notes.active = Some(index);
             self.wiki.set_active(TabKey::note(path.clone()));
@@ -4422,7 +4530,7 @@ impl AppShell {
             cx.notify();
             return;
         }
-        let Some(root) = self.wiki.notes.root.clone() else {
+        let Some(root) = self.note_root_for(&path) else {
             self.wiki.notes.error = Some("The notes folder is unavailable".into());
             cx.notify();
             return;
@@ -4556,7 +4664,7 @@ impl AppShell {
         if !self.wiki.notes.tabs[index].draft.is_dirty() {
             return;
         }
-        let Some(root) = self.wiki.notes.root.clone() else {
+        let Some(root) = self.note_root_for(path) else {
             return;
         };
         let value = self.wiki.notes.tabs[index]
@@ -4564,12 +4672,14 @@ impl AppShell {
             .read(cx)
             .value()
             .to_string();
+        let wiki_page = self.is_wiki_page(path);
         match self.store.write_note(path, &root, &value) {
             Ok(()) => {
                 let tab = &mut self.wiki.notes.tabs[index];
                 tab.draft.mark_saved(value);
                 self.wiki.notes.error = None;
-                if let Some(relative) = documents::rel_path(&root, path)
+                if wiki_page
+                    && let Some(relative) = documents::rel_path(&root, path)
                     && let Err(error) = self.store.reindex_wiki_page(&relative)
                 {
                     kandrium_core::logging::warn!(
