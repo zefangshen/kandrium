@@ -3,7 +3,8 @@ Kandrium.app
 Kandrium_*.dmg
 Planly.app/
 .cargo-packager/
-.trae/
 .DS_Store
-.documents/2026-*
 .trae-html-share-packages/
+
+# Planning docs and editor state stay local; nothing under .trae is tracked.
+.trae/

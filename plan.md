@@ -2,7 +2,7 @@
 
 > **Historical snapshot (2026-11-05).** This file records the roadmap as it stood
 > on that date; it is not a description of the current tree. Current plans live
-> in `.documents/specs/`, and the architecture rules in [AGENTS.md](AGENTS.md).
+> in `.trae/specs/`, and the architecture rules in [AGENTS.md](AGENTS.md).
 
 Roadmap as of **2026-11-05**. Version `0.1.0`, schema `v7`
 (`migrations/0007_project_source.sql`). Architecture constraints live in
@@ -46,7 +46,7 @@ those rules.
 
 ## Decided: Wiki page root and agent model
 
-Specified in [.documents/specs/llm-wiki/plan.md](.documents/specs/llm-wiki/plan.md). Two
+Specified in [.trae/specs/llm-wiki/plan.md](.trae/specs/llm-wiki/plan.md). Two
 decisions are settled and supersede the current-state wording below:
 
 - **`wiki/` is the page root.** There is no separate notes root. Compiled
