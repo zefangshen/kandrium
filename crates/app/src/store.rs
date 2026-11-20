@@ -315,7 +315,14 @@ impl Store {
 
     pub fn write_note(&self, path: &Path, root: &Path, text: &str) -> StoreResult<()> {
         self.files_run("write_note", |run| {
-            notes::write_note_in_run(path, root, text, run).map_err(|e| e.to_string())
+            notes::write_note_in_run(
+                path,
+                root,
+                text,
+                kandrium_core::history::RootKind::Wiki,
+                run,
+            )
+            .map_err(|e| e.to_string())
         })
     }
 

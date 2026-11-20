@@ -262,7 +262,45 @@ pub fn sweep_abandoned(db: &Connection, store: &HistoryStore) -> Result<Vec<Stri
         abandon(db, store, &open, "abandoned: no heartbeat for 24 hours")?;
         abandoned.push(open.run_id);
     }
+
+    // A process that died between `ensure_manifest` and `commit_run` leaves a
+    // manifest in `open` state with no `run_undo` row, so the query above never
+    // sees it. Close it here or it can never be pruned or undone.
+    let mirrored: std::collections::HashSet<String> = {
+        let mut stmt = db.prepare("SELECT run_id FROM run_undo")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for mut manifest in store.load_all()? {
+        if manifest.state != RunState::Open
+            || manifest.heartbeat_at > cutoff
+            || mirrored.contains(&manifest.run_id)
+        {
+            continue;
+        }
+        manifest.state = RunState::Committed;
+        manifest.closed_by = Some(ClosedBy::Abandoned);
+        manifest.finished_at = Some(now());
+        store.save(&manifest)?;
+        abandoned.push(manifest.run_id);
+    }
     Ok(abandoned)
+}
+
+/// Reclaim the open slot when its owner stopped heartbeating.
+///
+/// Returns the reclaimed run, or `None` when the slot is free or still fresh.
+/// Callers that would otherwise refuse work because "a run is open" use this
+/// so a crashed owner cannot wedge them for a day.
+pub fn reclaim_stale(db: &Connection, store: &HistoryStore) -> Result<Option<OpenRun>> {
+    let Some(open) = open_run(db, store)? else {
+        return Ok(None);
+    };
+    if now() - open.last_heartbeat_at < HEARTBEAT_STALE_SECS {
+        return Ok(None);
+    }
+    abandon(db, store, &open, "reclaimed: no heartbeat for 10 minutes")?;
+    Ok(Some(open))
 }
 
 /// Close a run's manifest and mirror row as abandoned.

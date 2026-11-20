@@ -17,7 +17,7 @@ use crate::fsutil;
 use crate::wiki::{hash_file, index, refresh_sources, sources};
 
 use super::store::HistoryStore;
-use super::{DirEntry, DirOp, FileEntry, FileOp, LinkEntry, Manifest, RootKind};
+use super::{DirEntry, DirOp, FileEntry, FileOp, LinkEntry, Manifest, RootKind, RunState};
 
 /// One path the restore refused to touch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -513,12 +513,17 @@ fn last_per_path<'a, T>(
     last.into_values().collect()
 }
 
-/// Entries from runs that started at or after this one, so undo never deletes
-/// content a later run wrote.
+/// Entries from runs that started after this one, so undo never deletes
+/// content a later run wrote. Runs whose changes were already reverted, and
+/// runs started in the same second, are left to the content preflight, which
+/// compares the actual file state.
 fn later_entries(store: &HistoryStore, manifest: &Manifest) -> Result<HashSet<(RootKind, String)>> {
     let mut out = HashSet::new();
     for other in store.load_all()? {
-        if other.run_id == manifest.run_id || other.started_at < manifest.started_at {
+        if other.run_id == manifest.run_id || other.started_at <= manifest.started_at {
+            continue;
+        }
+        if matches!(other.state, RunState::Undone | RunState::Partial) {
             continue;
         }
         out.extend(

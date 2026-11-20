@@ -49,20 +49,25 @@ pub fn read_note(path: &Path, root: &Path) -> Result<String> {
 }
 
 pub fn write_note(path: &Path, root: &Path, text: &str) -> Result<()> {
-    write_note_in_run(path, root, text, None)
+    write_note_in_run(path, root, text, RootKind::Notes, None)
 }
 
 /// Run-scoped variant of [`write_note`]: captures the previous bytes before
 /// the write and records the after-image.
+///
+/// `root_kind` names the root the file belongs to in the run manifest; callers
+/// that store wiki pages through this helper must pass [`RootKind::Wiki`] so
+/// undo resolves the same directory.
 pub fn write_note_in_run(
     path: &Path,
     root: &Path,
     text: &str,
+    root_kind: RootKind,
     run: Option<&RunContext>,
 ) -> Result<()> {
     let path = fsutil::guard(root, path)?;
     let guard = match run {
-        Some(ctx) => Some(ctx.capture(RootKind::Notes, root, &path)?),
+        Some(ctx) => Some(ctx.capture(root_kind, root, &path)?),
         None => None,
     };
     fsutil::write_atomic(&path, text)?;
@@ -362,8 +367,8 @@ mod tests {
         let note = f.root.join("topic.md");
         fs::write(&note, "one").unwrap();
 
-        write_note_in_run(&note, &f.root, "two", Some(&ctx)).unwrap();
-        write_note_in_run(&note, &f.root, "two", Some(&ctx)).unwrap();
+        write_note_in_run(&note, &f.root, "two", RootKind::Notes, Some(&ctx)).unwrap();
+        write_note_in_run(&note, &f.root, "two", RootKind::Notes, Some(&ctx)).unwrap();
         let renamed = rename_path_in_run(&note, &f.root, "renamed.md", Some(&ctx)).unwrap();
         delete_path_in_run(&renamed, &f.root, Some(&ctx)).unwrap();
 

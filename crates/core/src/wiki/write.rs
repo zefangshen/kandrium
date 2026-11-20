@@ -161,6 +161,20 @@ pub fn write_page(db: &mut Connection, root: &Path, spec: &WritePageSpec) -> Res
     ensure_editable(db, &spec.rel_path, existing.as_deref(), spec.force)?;
 
     let previous_hash = existing.as_deref().map(sources::hash_bytes);
+    // Sources the old text cited: rewriting must not leave one behind as
+    // `compiled` after its last citation disappears.
+    let previous_sources: Vec<String> = existing
+        .as_deref()
+        .map(|bytes| {
+            pages::page_sources(&pages::parse_page(
+                &spec.rel_path,
+                &String::from_utf8_lossy(bytes),
+            ))
+            .into_iter()
+            .map(|source| source.source_path)
+            .collect()
+        })
+        .unwrap_or_default();
     if let Some(expected) = &spec.expected_hash {
         match &previous_hash {
             Some(current) if current == expected => {}
@@ -203,12 +217,18 @@ pub fn write_page(db: &mut Connection, root: &Path, spec: &WritePageSpec) -> Res
         params![content_hash, spec.rel_path],
     )?;
     let parsed = pages::parse_page(&spec.rel_path, &spec.content);
-    mark_compiled(
-        db,
-        pages::page_sources(&parsed)
-            .into_iter()
-            .map(|source| source.source_path),
-    )?;
+    let cited: Vec<String> = pages::page_sources(&parsed)
+        .into_iter()
+        .map(|source| source.source_path)
+        .collect();
+    mark_compiled(db, cited.iter().cloned())?;
+    let dropped: Vec<String> = previous_sources
+        .into_iter()
+        .filter(|source| !cited.contains(source))
+        .collect();
+    if !dropped.is_empty() {
+        sources::refresh_states(db, &dropped)?;
+    }
 
     Ok(PageWrite {
         path: spec.rel_path.clone(),

@@ -1426,8 +1426,8 @@ fn history_detail(
                     label,
                     confirming,
                     t,
-                    cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                        this.undo_history_run(run_id.clone(), cx)
+                    cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.undo_history_run(run_id.clone(), window, cx)
                     }),
                 ));
         if confirming {

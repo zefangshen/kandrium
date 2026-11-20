@@ -414,6 +414,12 @@ pub fn read_source(
             let lines: Vec<&str> = text.lines().collect();
             let total = lines.len() as u32;
             let start = range.start_line.max(1);
+            if range.end_line != 0 && range.end_line < start {
+                return Err(KandriumError(format!(
+                    "endLine {} is before startLine {start}",
+                    range.end_line
+                )));
+            }
             let end = if range.end_line == 0 {
                 total
             } else {

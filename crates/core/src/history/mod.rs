@@ -24,7 +24,7 @@ pub use restore::{FileConflict, FileUndoReport, Roots, SkippedEntry, preflight, 
 pub use rows::{CAPTURED_TABLES, RowEnd, RowSession, captured_tables, row_begin};
 pub use run::{
     ABANDON_AFTER_SECS, HEARTBEAT_STALE_SECS, OpenRun, begin_run, commit_run, discard_empty_run,
-    end_open_run, ensure_manifest, heartbeat_run, open_run, sweep_abandoned,
+    end_open_run, ensure_manifest, heartbeat_run, open_run, reclaim_stale, sweep_abandoned,
 };
 pub use store::{HISTORY_DIR, HistoryStore};
 pub use undo::{RowConflict, RowUndoReport, UndoReport, undo_run};

@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
@@ -101,6 +101,35 @@ pub fn index_links(db: &Connection, rel_path: &str, body: &str) -> Result<usize>
         )?;
     }
     Ok(links.len())
+}
+
+/// Re-resolve stored dead links that may now point at `rel_path`.
+///
+/// Other pages keep the raw target they were written with; when a page
+/// appears (or is renamed) their rows are never revisited by the per-page
+/// index. Returns how many rows changed.
+pub fn resolve_pending_links(db: &Connection, rel_path: &str) -> Result<usize> {
+    let bare = rel_path
+        .strip_suffix(".md")
+        .or_else(|| rel_path.strip_suffix(".markdown"))
+        .unwrap_or(rel_path);
+    let stem = stem_key(rel_path);
+    let title: String = db
+        .query_row(
+            "SELECT title FROM wiki_pages WHERE rel_path = ?1",
+            [rel_path],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or_default();
+    let title = title.trim().to_lowercase();
+    let changed = db.execute(
+        "UPDATE OR IGNORE wiki_links SET to_path = ?1
+         WHERE from_path <> ?1
+           AND lower(to_path) IN (lower(?2), lower(?3), lower(?4))",
+        params![rel_path, bare, stem, title],
+    )?;
+    Ok(changed)
 }
 
 /// Rebuild the whole graph from page bodies. `wiki_pages` must already hold

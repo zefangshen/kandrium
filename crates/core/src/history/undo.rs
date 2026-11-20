@@ -175,7 +175,10 @@ pub fn undo_run(
         }
     }
 
-    let partial = files_report.partial();
+    // Rows that were never captured, or were captured but cannot be restored,
+    // leave the database mutated; the run is not fully undone.
+    let rows_unrestorable = manifest.rows.as_ref().is_some_and(|meta| !meta.restorable);
+    let partial = files_report.partial() || rows_unrestorable;
     let state = if partial {
         RunState::Partial
     } else {
@@ -192,6 +195,9 @@ pub fn undo_run(
         .map(|conflict| format!("file {}: {}", conflict.path, conflict.reason))
         .collect();
     conflicts.extend(rows_report.conflicts.iter().map(RowConflict::render));
+    if rows_unrestorable {
+        conflicts.push("rows: this run has no restorable row diff".to_string());
+    }
     conflicts.extend(
         files_report
             .skipped

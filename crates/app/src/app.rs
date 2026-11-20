@@ -584,7 +584,12 @@ impl AppShell {
     /// Undo a run from the History panel. The first click arms the button, the
     /// second one restores the run; the Knowledge section reloads afterwards
     /// because file restore bypasses the watcher's row bumps.
-    pub(crate) fn undo_history_run(&mut self, run_id: String, cx: &mut Context<Self>) {
+    pub(crate) fn undo_history_run(
+        &mut self,
+        run_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.wiki.history_confirm.as_deref() != Some(run_id.as_str()) {
             self.wiki.history_confirm = Some(run_id);
             cx.notify();
@@ -601,6 +606,7 @@ impl AppShell {
                 self.load_projects();
                 self.reload_wiki_status();
                 self.reload_history();
+                self.refresh_tabs_after_undo(window, cx);
                 if let Some(selected) = &self.wiki.history_selected {
                     self.wiki.history_tables =
                         self.store.history_tables(selected).unwrap_or_default();
@@ -611,6 +617,74 @@ impl AppShell {
             }
             Err(error) => self.wiki.panel_error = Some(error),
         }
+        cx.notify();
+    }
+
+    /// Re-read open editors after an undo rewrote files underneath them.
+    ///
+    /// Tabs keep their own buffer, so without this a stale draft would be
+    /// autosaved over the restored file. Tabs whose file the undo removed are
+    /// closed.
+    fn refresh_tabs_after_undo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut index = 0;
+        while index < self.wiki.notes.tabs.len() {
+            let path = self.wiki.notes.tabs[index].path.clone();
+            let Some(root) = self.note_root_for(&path) else {
+                index += 1;
+                continue;
+            };
+            match self.store.read_note(&path, &root) {
+                Ok(text) => {
+                    let tab = &mut self.wiki.notes.tabs[index];
+                    replace_editor_text(&tab.editor, &text, window, cx);
+                    tab.draft = Draft::new(text);
+                    index += 1;
+                }
+                Err(_) => {
+                    self.wiki.notes.tabs.remove(index);
+                    self.wiki.forget(&TabKey::note(path));
+                }
+            }
+        }
+        self.wiki.notes.active = match (self.wiki.notes.tabs.is_empty(), self.wiki.notes.active) {
+            (true, _) => None,
+            (false, Some(active)) => Some(active.min(self.wiki.notes.tabs.len() - 1)),
+            (false, None) => Some(0),
+        };
+
+        let mut doc = 0;
+        while doc < self.wiki.documents.tabs.len() {
+            if self.wiki.documents.tabs[doc].kind != DocKind::Markdown {
+                doc += 1;
+                continue;
+            }
+            let path = self.wiki.documents.tabs[doc].path.clone();
+            let Some(root) = self.wiki.documents.root.clone() else {
+                doc += 1;
+                continue;
+            };
+            match self.store.read_document(&path, &root) {
+                Ok(text) => {
+                    let tab = &mut self.wiki.documents.tabs[doc];
+                    if let Some(editor) = &tab.editor {
+                        replace_editor_text(editor, &text, window, cx);
+                    }
+                    tab.draft = Draft::new(text);
+                    doc += 1;
+                }
+                Err(_) => {
+                    self.wiki.documents.tabs.remove(doc);
+                }
+            }
+        }
+        self.wiki.documents.active = match (
+            self.wiki.documents.tabs.is_empty(),
+            self.wiki.documents.active,
+        ) {
+            (true, _) => None,
+            (false, Some(active)) => Some(active.min(self.wiki.documents.tabs.len() - 1)),
+            (false, None) => Some(0),
+        };
         cx.notify();
     }
 
@@ -6770,6 +6844,21 @@ fn dialog_button(
         .child(label)
         .on_click(handler)
         .into_any_element()
+}
+
+/// Replace an editor's whole buffer with `text`, keeping the caret at the start.
+fn replace_editor_text(
+    editor: &Entity<EditorState>,
+    text: &str,
+    window: &mut Window,
+    cx: &mut Context<AppShell>,
+) {
+    editor.update(cx, |state, cx| {
+        let len = state.text().chars().count();
+        state.set_selected_range(0..len, cx);
+        state.replace(text, window, cx);
+        state.set_selected_range_with_direction(0..0, false, cx);
+    });
 }
 
 #[cfg(test)]

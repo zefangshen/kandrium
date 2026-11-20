@@ -196,14 +196,17 @@ pub fn rebuild_fts(db: &Connection, root: &Path) -> Result<usize> {
     let mut files = Vec::new();
     collect_files(&tree, &mut files);
 
-    db.execute("DELETE FROM wiki_fts", [])?;
+    // One transaction: a page that cannot be read must not leave the search
+    // table half-populated.
+    let tx = db.unchecked_transaction()?;
+    tx.execute("DELETE FROM wiki_fts", [])?;
     let mut count = 0;
     for entry in files {
         let rel_path = sources::relative_path(&root, &entry.path)?;
         let text = std::fs::read_to_string(&entry.path)?;
         let parsed = pages::parse_page(&rel_path, &text);
         sync_fts_row(
-            db,
+            &tx,
             &rel_path,
             &parsed.title(),
             &parsed.summary(),
@@ -212,6 +215,7 @@ pub fn rebuild_fts(db: &Connection, root: &Path) -> Result<usize> {
         )?;
         count += 1;
     }
+    tx.commit()?;
     Ok(count)
 }
 
@@ -367,6 +371,7 @@ pub fn reindex_page(db: &Connection, root: &Path, rel_path: &str) -> Result<()> 
     let tx = db.unchecked_transaction()?;
     index_page(&tx, &root, &page, &parsed.body)?;
     links::index_links(&tx, rel_path, &parsed.body)?;
+    links::resolve_pending_links(&tx, rel_path)?;
     tx.commit()?;
     write_index_md(db, &root)?;
     Ok(())

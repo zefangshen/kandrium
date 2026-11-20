@@ -197,13 +197,19 @@ pub fn lint(
 
     let inbound = load_inbound(db)?;
     let duplicates = duplicate_labels(&parsed_pages);
-    for (rel_path, _, parsed) in &parsed_pages {
+    for (rel_path, raw, parsed) in &parsed_pages {
+        // The body excludes frontmatter; findings must name real file lines.
+        let offset = raw
+            .lines()
+            .count()
+            .saturating_sub(parsed.body.lines().count()) as u32;
         findings.extend(check_provenance(
             db,
             documents_root,
             rel_path,
             parsed,
             &source_map,
+            offset,
         )?);
 
         let kind = page_kind_for_path(rel_path);
@@ -363,6 +369,7 @@ fn check_provenance(
     rel_path: &str,
     parsed: &PageText,
     source_map: &HashMap<&str, &WikiSource>,
+    offset: u32,
 ) -> Result<Vec<LintFinding>> {
     let mut findings = Vec::new();
     let mut cited: BTreeSet<String> = BTreeSet::new();
@@ -427,7 +434,7 @@ fn check_provenance(
         ));
     }
 
-    findings.extend(check_footnotes(rel_path, &parsed.body));
+    findings.extend(check_footnotes(rel_path, &parsed.body, offset));
     Ok(findings)
 }
 
@@ -455,7 +462,7 @@ fn stale_page(
     Ok(false)
 }
 
-fn check_footnotes(rel_path: &str, body: &str) -> Vec<LintFinding> {
+fn check_footnotes(rel_path: &str, body: &str, file_offset: u32) -> Vec<LintFinding> {
     let mut findings = Vec::new();
     let mut definitions: HashSet<String> = HashSet::new();
     let mut references: Vec<(usize, String)> = Vec::new();
@@ -496,7 +503,7 @@ fn check_footnotes(rel_path: &str, body: &str) -> Vec<LintFinding> {
                     findings.push(LintFinding::new(
                         LintCode::BadCitation,
                         rel_path,
-                        (index + 1) as u32,
+                        (index + 1) as u32 + file_offset,
                         format!("malformed citation for footnote {id}"),
                     ));
                 }
@@ -512,7 +519,7 @@ fn check_footnotes(rel_path: &str, body: &str) -> Vec<LintFinding> {
             findings.push(LintFinding::new(
                 LintCode::BadCitation,
                 rel_path,
-                line as u32,
+                line as u32 + file_offset,
                 format!("footnote {id} has no definition"),
             ));
         }

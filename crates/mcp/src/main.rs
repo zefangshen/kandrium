@@ -610,7 +610,9 @@ impl KandriumServer {
         }
 
         // The slot belongs to another client, or to a previous process whose
-        // heartbeat has not expired yet.
+        // heartbeat has not expired yet. A stale slot is reclaimed here so a
+        // crashed owner cannot block every mutation for a day.
+        history::reclaim_stale(db, &store)?;
         if let Some(open) = history::open_run(db, &store)? {
             return Err(core::KandriumError(format!(
                 "a run is open: {}",
@@ -885,11 +887,21 @@ impl KandriumServer {
         ) {
             Ok(source) => {
                 if source.kind == core::SourceKind::Pdf && source.text.trim().is_empty() {
-                    let _ = core::mark_source_failed(
-                        &db,
-                        &source.path,
-                        "PDF has no readable text layer",
-                    );
+                    // Only a full-document read in write mode proves the PDF
+                    // has no text layer; a page range past the end must not
+                    // mark a healthy document failed, and a read-only server
+                    // must not write at all.
+                    let start_page = input.start_page.unwrap_or(0);
+                    let end_page = input.end_page.unwrap_or(0);
+                    let whole_document =
+                        start_page <= 1 && (end_page == 0 || end_page >= source.page_count);
+                    if self.wiki_mode == WikiMode::Write && whole_document {
+                        let _ = core::mark_source_failed(
+                            &db,
+                            &source.path,
+                            "PDF has no readable text layer",
+                        );
+                    }
                     return Ok(error_result(format!(
                         "{} has no readable text layer",
                         source.path
@@ -1177,21 +1189,28 @@ impl KandriumServer {
             use core::history;
             let store = history_store(db)?;
             let mut state = self.run.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(active) = state.take() else {
+            let Some(mut active) = state.take() else {
                 return Err(core::KandriumError::new("no run is open"));
             };
-            if let Some(session) = active.rows
+            if let Some(session) = active.rows.take()
                 && let Err(error) = session.end(db)
             {
                 core::logging::warn!("row phase failed for run {}: {error}", active.run_id);
             }
-            let manifest = history::end_open_run(
+            let manifest = match history::end_open_run(
                 db,
                 &store,
                 &active.run_id,
                 history::ClosedBy::Explicit,
                 note.as_deref(),
-            )?;
+            ) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    // Keep ownership so the caller can retry the close.
+                    *state = Some(active);
+                    return Err(error);
+                }
+            };
             Ok(RunSummary::from(&manifest))
         })
     }
@@ -1509,6 +1528,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
             Ok(_) => {}
             Err(error) => core::logging::warn!("history prune failed: {error}"),
+        }
+        // Per-kind limits alone do not bound disk use; evict oldest runs until
+        // the shared byte ceiling is met.
+        match core::history::gc::prune_to_fit(&db, &store, core::history::gc::DEFAULT_RETENTION, 0)
+        {
+            Ok(report) if !report.pruned.is_empty() => core::logging::info!(
+                "evicted {} history run(s) to stay under the size ceiling, freed {} bytes",
+                report.pruned.len(),
+                report.freed_bytes
+            ),
+            Ok(_) => {}
+            Err(error) => core::logging::warn!("history budget prune failed: {error}"),
         }
     }
     core::logging::info!("DB: {}", db_path.display());
