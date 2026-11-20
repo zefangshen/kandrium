@@ -25,11 +25,12 @@ use kandrium_core::wiki::{self, LintFinding, SourceDelta, SourceState, WikiStatu
 use kandrium_core::{
     ArchivedCard, Board, BoardWithColumns, CardStatus, Clock, CreateCardBody, Person,
     ProjectChoice, Travel, add_clock, add_person, bootstrap, delete_card, end_travel,
-    extend_travel, get_all_board, get_board_readonly, list_all_people, list_all_travels,
-    list_archived_cards, list_boards, list_clocks, list_project_choices, migrate_legacy_db,
-    move_all_card, move_area_card, move_card_to_board, open_db, open_db_readonly, relocate_person,
-    remove_clock, remove_person, remove_travel, rename_card, rename_person, reorder_clocks,
-    resolve_db_path, set_card_archived, set_card_area, set_card_project, start_travel, update_card,
+    extend_travel, get_all_board, get_board_readonly, get_project_board, list_all_people,
+    list_all_travels, list_archived_cards, list_boards, list_clocks, list_project_choices,
+    migrate_legacy_db, move_all_card, move_area_card, move_card_to_board, move_card_to_status,
+    open_db, open_db_readonly, relocate_person, remove_clock, remove_person, remove_travel,
+    rename_card, rename_person, reorder_clocks, resolve_db_path, set_card_archived, set_card_area,
+    set_card_project, start_travel, update_card,
 };
 
 /// One snapshot of the Clocks data. The app caches this so the minute tick
@@ -151,6 +152,12 @@ impl Store {
     /// One board, derived without persisting the lazy area order.
     pub fn board(&self, id: &str) -> StoreResult<BoardWithColumns> {
         get_board_readonly(self.conn()?, id).map_err(|e| e.to_string())
+    }
+
+    /// A project's board plus the cards tagged with that project from other
+    /// boards, bucketed by status. The project Tasks page renders this.
+    pub fn project_board(&self, id: &str) -> StoreResult<BoardWithColumns> {
+        get_project_board(self.conn()?, id).map_err(|e| e.to_string())
     }
 
     /// The virtual All board, shaped like a real one so the board surface can
@@ -848,6 +855,17 @@ impl Store {
     ) -> StoreResult<()> {
         self.app_run("move_all_card", |db, _| {
             move_all_card(db, card_id, status, before_card_id)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Move a card to the matching status column of its own board. Used when a
+    /// project-tagged card from another board changes status on the project
+    /// page, so it stays on its own board.
+    pub fn move_card_to_status(&self, card_id: &str, status: CardStatus) -> StoreResult<()> {
+        self.app_run("move_card_to_status", |db, _| {
+            move_card_to_status(db, card_id, status)
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         })

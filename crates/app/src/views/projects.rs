@@ -490,6 +490,7 @@ pub fn projects_view(
     state: &ProjectsState,
     board: Option<&BoardWithColumns>,
     drag: tasks::BoardDrag<'_>,
+    add: tasks::AddCard<'_>,
     t: &Tokens,
     window: &mut Window,
     cx: &mut Context<AppShell>,
@@ -516,7 +517,7 @@ pub fn projects_view(
     .on_drop::<ProjectsTreeDrag>(cx.listener(|this, _drag: &ProjectsTreeDrag, _window, cx| {
         this.finish_tree_resize(cx);
     }))
-    .child(detail_pane(state, board, drag, t, window, cx))
+    .child(detail_pane(state, board, drag, add, t, window, cx))
     .into_any_element()
 }
 
@@ -1553,6 +1554,7 @@ fn detail_pane(
     state: &ProjectsState,
     board: Option<&BoardWithColumns>,
     drag: tasks::BoardDrag<'_>,
+    add: tasks::AddCard<'_>,
     t: &Tokens,
     window: &Window,
     cx: &mut Context<AppShell>,
@@ -1666,14 +1668,15 @@ fn detail_pane(
                     .test_support()
                     .flex_1()
                     .min_h_0()
-                    // Project boards create cards through the card modal, so
-                    // the board surface never shows an add row here.
+                    // Same board surface as the Tasks section, including the
+                    // per-column "+ Add card" row. `create_card` resolves the
+                    // project from the board, so new cards inherit it.
                     .child(tasks::board_view(
                         board,
                         drag,
                         tasks::AddCard {
-                            allowed: false,
-                            form: None,
+                            allowed: true,
+                            form: add.form,
                         },
                         "",
                         None,

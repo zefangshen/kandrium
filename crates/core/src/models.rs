@@ -108,9 +108,11 @@ pub struct Column {
     pub id: String,
     pub title: String,
     pub cards: Vec<Card>,
-    /// Project cards filed to the owning area board. Kept out of `cards` so
-    /// MCP clients keep the legacy payload shape; the app renders the merged
-    /// order from [`Column::ordered_cards`].
+    /// Cards shown in this column that physically live elsewhere: project
+    /// cards filed onto the owning area board, or project-tagged cards from
+    /// other boards on a project page. Kept out of `cards` so MCP clients keep
+    /// the legacy payload shape; the app renders the merged order from
+    /// [`Column::ordered_cards`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mirrored: Vec<Card>,
 }

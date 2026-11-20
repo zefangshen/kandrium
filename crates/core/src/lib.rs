@@ -52,7 +52,7 @@ pub use projects::{
 };
 pub use seed::seed;
 pub use services::board::{
-    create_board, get_all_board, get_board, get_board_readonly, list_boards,
+    create_board, get_all_board, get_board, get_board_readonly, get_project_board, list_boards,
 };
 pub use services::card::{
     create_card, create_card_in_status, delete_card, list_archived_cards, move_all_card,

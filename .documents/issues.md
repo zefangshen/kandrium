@@ -1,6 +1,0 @@
-- project page, new project does not work, new project remove options
-- improve ui
-    - use html as templates
-- card module description field autosave
-- auto select board
-- relocate project and board

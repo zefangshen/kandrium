@@ -288,7 +288,8 @@ pub fn tabs_strip(
 }
 
 /// The inline "+ Add card" footer: whether it is shown at all (never on the
-/// synthetic All board or a project board) and the open draft, if any.
+/// synthetic All board; a project board's own Tasks tab opts in) and the open
+/// draft, if any.
 #[derive(Clone, Copy)]
 pub struct AddCard<'a> {
     pub allowed: bool,

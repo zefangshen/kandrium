@@ -49,6 +49,27 @@ fn a_project_renders_its_tree_overview_tasks_and_documents(cx: &mut TestAppConte
         },
     )
     .expect("card");
+    // A card that lives on a normal board but is tagged with the project. The
+    // project Tasks page must show it, bucketed by its own column's status.
+    let normal = kandrium_core::list_boards(&db)
+        .expect("boards")
+        .boards
+        .into_iter()
+        .find(|candidate| candidate.id != project.board_id)
+        .expect("normal board");
+    let normal_board =
+        kandrium_core::get_board_readonly(&db, &normal.id).expect("normal board columns");
+    let tagged_column = normal_board.columns[1].id.clone();
+    let tagged = kandrium_core::create_card(
+        &db,
+        &tagged_column,
+        &kandrium_core::CreateCardBody {
+            title: "Tagged from a normal board".into(),
+            ..Default::default()
+        },
+    )
+    .expect("tagged card");
+    kandrium_core::set_card_project(&db, &tagged.id, Some(&project.id)).expect("tag card");
     let doc = projects_root.join(&project.id).join("brief.md");
     std::fs::write(&doc, "# Brief\n").unwrap();
     // Read the row id from the same listing the view uses: the OS resolves
@@ -190,6 +211,81 @@ fn a_project_renders_its_tree_overview_tasks_and_documents(cx: &mut TestAppConte
         assert!(window.find(format!("board-card-{}", card.id)).visible());
     });
 
+    // The same "+ Add card" row as a normal board, and a card created there
+    // inherits the project from the board.
+    let todo = board.columns[0].id.clone();
+    cx.update(|window, _cx| {
+        assert!(
+            window.find(format!("board-add-card-{todo}")).visible(),
+            "the project Tasks tab needs the column add row"
+        );
+    });
+    cx.update(|window, cx| window.click(format!("board-add-card-{todo}"), cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, _cx| {
+        assert!(
+            window.find(format!("board-add-form-{todo}")).visible(),
+            "the project add draft did not open"
+        );
+    });
+    cx.update(|window, cx| {
+        window.input("Earth", cx);
+        window.press("enter", cx);
+    });
+    cx.update(|window, cx| window.render_frame(cx));
+    let db = kandrium_core::open_db(&path).expect("open db");
+    let board = kandrium_core::get_board_readonly(&db, &project.board_id).expect("board");
+    let created = board
+        .columns
+        .iter()
+        .flat_map(|column| column.cards.iter())
+        .find(|card| card.title == "Earth")
+        .expect("the add row creates a card on the project board");
+    let created_id = created.id.clone();
+    assert_eq!(
+        created.project_id.as_deref(),
+        Some(project.id.as_str()),
+        "a card created on a project board inherits that project"
+    );
+    drop(db);
+    cx.update(|window, _cx| {
+        assert!(
+            window.find(format!("board-card-{created_id}")).visible(),
+            "the new card should appear in its column"
+        );
+        assert!(
+            window.find(format!("board-add-card-{todo}")).visible(),
+            "the add row should come back after the draft closes"
+        );
+    });
+
+    // A card tagged with the project from a normal board shows here too, in
+    // the column matching its own status, while staying on its own board.
+    cx.update(|window, _cx| {
+        assert!(
+            window.find(format!("board-card-{}", tagged.id)).visible(),
+            "a project-tagged card from a normal board must show on the project page"
+        );
+        let card = window.find(format!("board-card-{}", tagged.id)).bounds();
+        let lane = window
+            .find(format!("board-column-{}", board.columns[1].id))
+            .bounds();
+        let left = f32::from(lane.origin.x);
+        assert!(
+            f32::from(card.origin.x) >= left
+                && f32::from(card.origin.x) < left + f32::from(lane.size.width),
+            "the tagged card sits under the In Progress column"
+        );
+    });
+    let db = kandrium_core::open_db(&path).expect("open db");
+    let home = kandrium_core::get_board_readonly(&db, &normal.id).expect("normal board");
+    assert!(
+        home.columns.iter().any(|column| column.id == tagged_column
+            && column.cards.iter().any(|card| card.id == tagged.id)),
+        "the tagged card must stay on its own board"
+    );
+    drop(db);
+
     // Dropping on the project's Tasks tab must reload the project board the
     // section is showing, not the Tasks section's own board; otherwise the
     // project cards disappear from the surface right after the drop.
@@ -217,6 +313,39 @@ fn a_project_renders_its_tree_overview_tasks_and_documents(cx: &mut TestAppConte
             .find(|column| column.id == in_progress)
             .is_some_and(|column| column.cards.iter().any(|c| c.id == card.id)),
         "the drop must move the card into the project board's second column"
+    );
+    drop(db);
+
+    // Dragging the tagged card on the project page changes its status on its
+    // own board instead of pulling it onto the project board.
+    let done = board.columns[2].id.clone();
+    cx.update(|window, cx| {
+        window.drag_to(
+            format!("board-card-{}", tagged.id),
+            format!("board-column-{done}"),
+            cx,
+        );
+    });
+    cx.update(|window, cx| window.render_frame(cx));
+    let db = kandrium_core::open_db(&path).expect("open db");
+    let home = kandrium_core::get_board_readonly(&db, &normal.id).expect("normal board");
+    let on_done = home.columns.iter().any(|column| {
+        kandrium_core::status_from_column_title(&column.title)
+            == Some(kandrium_core::CardStatus::Done)
+            && column.cards.iter().any(|card| card.id == tagged.id)
+    });
+    assert!(
+        on_done,
+        "the project-page drop must move the tagged card to Done on its own board"
+    );
+    let project_after =
+        kandrium_core::get_board_readonly(&db, &project.board_id).expect("project board");
+    assert!(
+        !project_after
+            .columns
+            .iter()
+            .any(|column| column.cards.iter().any(|card| card.id == tagged.id)),
+        "the tagged card must not be moved onto the project board"
     );
     drop(db);
 

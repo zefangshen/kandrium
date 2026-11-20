@@ -1529,14 +1529,37 @@ impl AppShell {
             return;
         }
 
+        // Cards that live on another board are shown on the project page in
+        // their status bucket. Moving them onto the project board would remove
+        // them from their own board, so a drop changes only their status in
+        // their real board's matching column.
+        let external_project_card = self.project_board_shown.is_some()
+            && self.board.as_ref().is_some_and(|board| {
+                board
+                    .columns
+                    .iter()
+                    .any(|column| column.mirrored.iter().any(|card| card.id == card_id))
+            });
         // All-board columns are synthetic `all:<status>` ids: a drop there
         // changes the card's status on its home board (core handles the move).
-        let result = match column_id
-            .strip_prefix("all:")
-            .and_then(CardStatus::from_key)
-        {
-            Some(status) => self.store.move_all_card(card_id, status, before.as_deref()),
-            None => self.store.move_card(card_id, column_id, before.as_deref()),
+        let result = if external_project_card {
+            let status = self
+                .board
+                .as_ref()
+                .and_then(|board| board.columns.iter().find(|column| column.id == column_id))
+                .and_then(|column| kandrium_core::status_from_column_title(&column.title));
+            match status {
+                Some(status) => self.store.move_card_to_status(card_id, status),
+                None => self.store.move_card(card_id, column_id, before.as_deref()),
+            }
+        } else {
+            match column_id
+                .strip_prefix("all:")
+                .and_then(CardStatus::from_key)
+            {
+                Some(status) => self.store.move_all_card(card_id, status, before.as_deref()),
+                None => self.store.move_card(card_id, column_id, before.as_deref()),
+            }
         };
         match result {
             Ok(()) => {
@@ -2113,7 +2136,7 @@ impl AppShell {
     /// `active_board_id`; the Tasks section keeps its own board selection.
     fn load_project_board(&mut self, id: &str) -> Result<(), String> {
         self.clear_drag_state();
-        match self.store.board(id) {
+        match self.store.project_board(id) {
             Ok(board) => {
                 self.project_board_shown = Some(board.id.clone());
                 self.board = Some(board);
@@ -6402,6 +6425,15 @@ impl AppShell {
                         scrolls: &self.column_scrolls,
                         pointer: self.drag_pointer.clone(),
                     },
+                    // The project Tasks tab gets the same inline add row as a
+                    // normal board; the shared draft state keeps text per column.
+                    tasks::AddCard {
+                        allowed: true,
+                        form: self
+                            .add_card
+                            .as_ref()
+                            .map(|form| (form.column_id.as_str(), &form.input)),
+                    },
                     &t,
                     window,
                     cx,
@@ -6494,7 +6526,8 @@ impl AppShell {
             .map(|column| column.ordered_cards().len())
             .sum();
         // "+ Add card" belongs to real boards only: the synthetic All board has
-        // no column to write to, and a project board creates cards in its modal.
+        // no column to write to. Project boards are not Tasks tabs, so this
+        // section excludes them; the project Tasks pane opts in separately.
         let allow_add = self.boards.iter().any(|candidate| candidate.id == board.id);
         let add_form = self
             .add_card

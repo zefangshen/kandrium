@@ -65,6 +65,55 @@ pub fn get_board_readonly(db: &Connection, id: &str) -> Result<BoardWithColumns>
     get_board_impl(db, id, false)
 }
 
+/// A project board plus the cards tagged with that project from other boards.
+///
+/// A card can live on a normal board and carry a `project_id`; those cards are
+/// appended to the project column whose canonical status matches the card's
+/// own column (To Do / In Progress / Done), so the project Tasks page shows
+/// every card tagged with the project. Cards that already live on the project
+/// board are untouched, and project cards filed onto an area board are already
+/// in their real project column, so nothing is shown twice.
+///
+/// The added cards sit in [`Column::mirrored`]; their `column_id` and
+/// `board_id` stay their real ones, so a status change must go through
+/// `move_card_to_status`, not a move onto the project board.
+pub fn get_project_board(db: &Connection, id: &str) -> Result<BoardWithColumns> {
+    let mut board = get_board_impl(db, id, false)?;
+    let mut stmt = db.prepare(
+        r#"SELECT c.id, c.column_id, c.title, c.description, c.due_date, c.labels,
+                  c.project_id, c.area_board_id, p.identifier, b.title,
+                  col.board_id, col.title
+           FROM cards c
+           JOIN columns col ON c.column_id = col.id
+           JOIN boards b ON b.id = col.board_id
+           JOIN projects p ON p.id = c.project_id
+           WHERE p.board_id = ? AND col.board_id <> ? AND c.archived = 0
+           ORDER BY c.position"#,
+    )?;
+    let rows: Vec<(Card, String)> = stmt
+        .query_map([&board.id, &board.id], |r| {
+            let home_board_id: String = r.get(10)?;
+            let home_column_title: String = r.get(11)?;
+            // `project_board = true` puts the home board's title in
+            // `meta_label`, so a tag from another board says where it lives.
+            Ok((map_card_row(r, &home_board_id, true)?, home_column_title))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (card, home_column_title) in rows {
+        let Some(status) = status_from_column_title(&home_column_title) else {
+            continue;
+        };
+        if let Some(column) = board
+            .columns
+            .iter_mut()
+            .find(|c| status_from_column_title(&c.title) == Some(status))
+        {
+            column.mirrored.push(card);
+        }
+    }
+    Ok(board)
+}
+
 fn get_board_impl(db: &Connection, id: &str, reconcile: bool) -> Result<BoardWithColumns> {
     let board: Option<(String, String)> = db
         .query_row("SELECT id, title FROM boards WHERE id = ?", [id], |r| {
