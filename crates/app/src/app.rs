@@ -6001,8 +6001,8 @@ impl AppShell {
                     div()
                         .id("titlebar-clock-text")
                         .test_support()
-                        .text(Text::Micro)
-                        .text_color(t.text_ghost)
+                        .text(Text::TitlebarClock)
+                        .text_color(t.text_faint)
                         .whitespace_nowrap()
                         .child(label),
                 )

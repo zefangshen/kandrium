@@ -180,6 +180,9 @@ pub enum Text {
     Chrome,
     /// 10 px monospace: counts, identifiers, due dates, offsets.
     Micro,
+    /// 11 px monospace: the titlebar clock, a step up from `Micro` so the
+    /// date reads at a glance without competing with the section control.
+    TitlebarClock,
     /// 10 px semibold: uppercase tree-head labels.
     Label,
     /// 16 px monospace: summary metrics.
@@ -214,6 +217,7 @@ impl Text {
             Text::ClockTime => metrics(30.0, 35.0, FontWeight::NORMAL, true),
             Text::Chrome => metrics(12.5, 17.0, FontWeight::NORMAL, false),
             Text::Micro => metrics(10.0, 14.0, FontWeight::NORMAL, true),
+            Text::TitlebarClock => metrics(11.0, 15.0, FontWeight::NORMAL, true),
             Text::Label => metrics(10.0, 14.0, FontWeight::SEMIBOLD, false),
             Text::Metric => metrics(16.0, 20.0, FontWeight::NORMAL, true),
             Text::Reading => metrics(14.0, 23.0, FontWeight::NORMAL, false),
@@ -399,6 +403,7 @@ mod tests {
             (Text::ClockTime, 30.0, "JetBrains Mono"),
             (Text::Chrome, 12.5, "Inter"),
             (Text::Micro, 10.0, "JetBrains Mono"),
+            (Text::TitlebarClock, 11.0, "JetBrains Mono"),
             (Text::Label, 10.0, "Inter"),
             (Text::Metric, 16.0, "JetBrains Mono"),
             (Text::Reading, 14.0, "Inter"),
