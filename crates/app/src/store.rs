@@ -66,6 +66,15 @@ fn prune_history(db: &rusqlite::Connection, path: &Path) {
         Ok(_) => {}
         Err(error) => kandrium_core::logging::warn!("history prune failed: {error}"),
     }
+    match gc::prune_to_fit(db, &store, gc::DEFAULT_RETENTION, 0) {
+        Ok(report) if !report.pruned.is_empty() => kandrium_core::logging::info!(
+            "evicted {} history run(s) to stay under the size ceiling, freed {} bytes",
+            report.pruned.len(),
+            report.freed_bytes
+        ),
+        Ok(_) => {}
+        Err(error) => kandrium_core::logging::warn!("history budget prune failed: {error}"),
+    }
 }
 
 impl Store {
@@ -287,19 +296,13 @@ impl Store {
     }
 
     // -----------------------------------------------------------------------
-    // Notes — the filesystem layer needs no database handle, so these work
-    // even when the database itself failed to open.
+    // Markdown files — the filesystem layer needs no database handle, so these
+    // work even when the database itself failed to open.
     // -----------------------------------------------------------------------
 
     /// The compiled wiki page root (`KANDRIUM_WIKI`), created when missing.
     pub fn notes_root(&self) -> StoreResult<PathBuf> {
         wiki::ensure_wiki_root().map_err(|e| e.to_string())
-    }
-
-    /// The personal notes root (`KANDRIUM_NOTES`), created when missing. The
-    /// Notes half of the Knowledge tree reads and writes here.
-    pub fn personal_notes_root(&self) -> StoreResult<PathBuf> {
-        notes::ensure_root().map_err(|e| e.to_string())
     }
 
     pub fn notes_tree(&self, root: &Path) -> StoreResult<Vec<NoteEntry>> {
@@ -313,41 +316,6 @@ impl Store {
     pub fn write_note(&self, path: &Path, root: &Path, text: &str) -> StoreResult<()> {
         self.files_run("write_note", |run| {
             notes::write_note_in_run(path, root, text, run).map_err(|e| e.to_string())
-        })
-    }
-
-    /// Create a name-validated note inside `in_dir` (`.md` appended).
-    pub fn create_note(&self, root: &Path, in_dir: &Path, name: &str) -> StoreResult<PathBuf> {
-        self.files_run("create_note", |run| {
-            let path = notes::create_named_note(root, in_dir, name).map_err(|e| e.to_string())?;
-            if let Some(run) = run {
-                run.record_created(kandrium_core::history::RootKind::Notes, root, &path)
-                    .map_err(|e| e.to_string())?;
-            }
-            Ok(path)
-        })
-    }
-
-    pub fn create_folder(&self, root: &Path, in_dir: &Path, name: &str) -> StoreResult<PathBuf> {
-        self.files_run("create_folder", |run| {
-            let path = notes::create_named_folder(root, in_dir, name).map_err(|e| e.to_string())?;
-            if let Some(run) = run {
-                run.record_tree(kandrium_core::history::RootKind::Notes, root, &path)
-                    .map_err(|e| e.to_string())?;
-            }
-            Ok(path)
-        })
-    }
-
-    pub fn rename_note(&self, path: &Path, root: &Path, new_name: &str) -> StoreResult<PathBuf> {
-        self.files_run("rename_note", |run| {
-            notes::rename_path_in_run(path, root, new_name, run).map_err(|e| e.to_string())
-        })
-    }
-
-    pub fn delete_note(&self, path: &Path, root: &Path) -> StoreResult<()> {
-        self.files_run("delete_note", |run| {
-            notes::delete_path_in_run(path, root, run).map_err(|e| e.to_string())
         })
     }
 

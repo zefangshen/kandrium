@@ -1088,7 +1088,7 @@ fn settings_file_records_section_tree_and_vim(cx: &mut TestAppContext) {
     // Section and tree flag.
     cx.update(|window, cx| window.click("nav-wiki", cx));
     cx.update(|window, cx| window.render_frame(cx));
-    cx.update(|window, cx| window.click("notes-collapse", cx));
+    cx.update(|window, cx| window.click("wiki-collapse", cx));
     cx.update(|window, cx| window.render_frame(cx));
 
     let saved = Settings::load(&settings_path);

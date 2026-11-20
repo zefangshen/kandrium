@@ -584,8 +584,8 @@ fn tree_collapses_to_a_rail_and_expands_back(cx: &mut TestAppContext) {
     let (_view, cx) = boot(cx, db);
     open_documents(cx);
 
-    // The whole-tree collapse lives in the notes half's header.
-    cx.update(|window, cx| window.click("notes-collapse", cx));
+    // The whole-tree collapse lives in the Wiki half's header.
+    cx.update(|window, cx| window.click("wiki-collapse", cx));
     cx.update(|window, cx| window.render_frame(cx));
     cx.update(|window, _cx| {
         assert!(window.find("wiki-tree-rail").visible());

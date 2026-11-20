@@ -1,30 +1,17 @@
-//! Notes flows through `kandrium-core` plus a headless render check.
+//! Notes flows through `kandrium-core`.
 //!
 //! The shell keeps no filesystem logic of its own: every create, read, write,
-//! rename and delete below is the same `kandrium_core::notes` call the view
-//! makes. The render test covers the tree header and the empty content state.
+//! rename and delete below is the same `kandrium_core::notes` call the wiki
+//! page editor makes. The Knowledge tree no longer lists the notes root, but
+//! the files and these core operations are unchanged.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-
-use gpui::TestAppContext;
-use gpui_kit::test::TestWindowExt;
-
-use kandrium_app::app::AppShell;
-use kandrium_app::store::Store;
 
 fn notes_root(dir: &Path) -> PathBuf {
     let root = dir.join("notes");
     fs::create_dir_all(&root).expect("notes root");
     root
-}
-
-/// A bootstrapped database (schema + seed) in the temp directory.
-fn seeded_db(dir: &Path) -> PathBuf {
-    let path = dir.join("kandrium.db");
-    let mut db = kandrium_core::open_db(&path).expect("open temp db");
-    kandrium_core::bootstrap(&mut db, &path).expect("bootstrap temp db");
-    path
 }
 
 /// Create → read → write → rename → delete, the way the shell drives core.
@@ -68,7 +55,7 @@ fn notes_round_trip_through_core() {
     assert!(kandrium_core::notes::scan_tree(&root).unwrap().is_empty());
 }
 
-/// The root guard and name rules are what the inline name field surfaces.
+/// The root guard and name rules are what core enforces for both roots.
 #[test]
 fn notes_reject_escapes_and_collisions() {
     let dir = tempfile::tempdir().unwrap();
@@ -84,27 +71,4 @@ fn notes_reject_escapes_and_collisions() {
     assert!(kandrium_core::notes::create_named_note(&root, &root, "../escape").is_err());
     assert!(kandrium_core::notes::create_named_folder(&root, &root, "..").is_err());
     assert!(kandrium_core::notes::delete_path(&root, &root).is_err());
-}
-
-/// The Wiki section renders the notes tree and the empty content state.
-#[gpui::test]
-fn notes_view_renders_the_tree_and_empty_content(cx: &mut TestAppContext) {
-    let dir = tempfile::tempdir().unwrap();
-    let path = seeded_db(dir.path());
-    cx.update(gpui_kit::init);
-
-    let (_view, cx) =
-        cx.add_window_view(|_window, _cx| AppShell::with_store(Store::open_path(path)));
-    cx.update(|window, cx| window.render_frame(cx));
-    cx.update(|window, cx| window.click("nav-wiki", cx));
-    cx.update(|window, cx| window.render_frame(cx));
-
-    cx.update(|window, _cx| {
-        assert!(window.find("wiki-view").visible());
-        assert!(window.find("wiki-notes-tree").visible());
-        assert!(window.find("notes-new-note").visible());
-        assert!(window.find("notes-new-folder").visible());
-        assert!(window.find("notes-collapse").visible());
-        assert!(window.find("wiki-empty").visible());
-    });
 }

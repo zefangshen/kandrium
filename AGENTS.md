@@ -106,7 +106,7 @@ Workspace, edition 2024. All comments, identifiers, and docs are in English.
 - App settings live in `gpui-settings.conf` next to the database. Keys:
   `vim_mode`, `section`, `titlebar_clock`, `wiki_tree_open`,
   `wiki_tree_width`, `projects_tree_open`, `projects_tree_width`,
-  `wiki_notes_collapsed`, `wiki_documents_collapsed`, `wiki_split`,
+  `wiki_pages_collapsed`, `wiki_documents_collapsed`, `wiki_split`,
   `tasks_archive`, `clocks_use_24h`. Unknown keys are preserved. When the
   file is absent, boot imports `vim_mode`, `section`, the merged tree flag,
   `projects_tree_open` and `clocks_use_24h` from the retired egui store
@@ -209,7 +209,7 @@ shell (screen capture blocked) — ask the user to confirm UI changes.
   highlighting grammar comes from the `tree-sitter-markdown` feature on
   `gpui-component`; do not add unrelated grammar features without a reason.
 - The shell is one `AppShell` entity (`crates/app/src/app.rs`). Sections
-  are Tasks, Clocks, Wiki (notes + documents) and Projects. Views live under
+  are Tasks, Clocks, Wiki (compiled pages + sources) and Projects. Views live under
   `crates/app/src/views/`, reusable widgets under `src/views/` helpers or
   `gpui-kit`.
 - Every screen keeps its data in the shell's `Store`

@@ -1,12 +1,10 @@
-//! Wiki: the merged Notes, Wiki and Sources section.
+//! Wiki: the merged Knowledge section (compiled pages and sources).
 //!
-//! The tree column splits vertically — personal notes on top, compiled wiki
-//! pages in the middle, source documents below — with two drag seams, one
-//! shared tab row and one detail column serving all three kinds. Each half
-//! keeps its own tree panel (header actions, inline drafts, context menus)
-//! from [`super::notes`], [`super::documents`] or this module; this module
-//! owns the split, the collapse flags, the merged tab order and the detail
-//! dispatcher.
+//! The tree column splits vertically — compiled wiki pages above, source
+//! documents below — with one drag seam, one shared tab row and one detail
+//! column serving both kinds. The Sources half keeps its own tree panel from
+//! [`super::documents`]; this module owns the split, the collapse flags, the
+//! merged tab order and the detail dispatcher.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -39,6 +37,10 @@ const SPLITTER_H: f32 = 1.0;
 /// The titlebar the section body sits below, subtracted from the window height
 /// when the split is converted to pixels.
 const TITLEBAR_H: f32 = 38.0;
+/// Tree panel width when expanded, matching the other tree sections.
+pub const TREE_W: f32 = 240.0;
+/// Collapsed rail width.
+pub const RAIL_W: f32 = 30.0;
 /// Smallest share a half may take, and the smallest gap the seams keep.
 const MIN_SPLIT: f32 = settings::MIN_SPLIT_PERMILLE as f32 / 1000.0;
 /// Largest share a seam may take.
@@ -102,9 +104,9 @@ pub struct WikiPagesState {
     pub error: Option<String>,
 }
 
-/// Wiki section state: the three tree states plus the merged tab order.
+/// Wiki section state: both tree states plus the merged tab order.
 pub struct WikiState {
-    /// Personal notes (`KANDRIUM_NOTES`).
+    /// Open page tabs (`KANDRIUM_WIKI` Markdown).
     pub notes: NotesState,
     /// Compiled wiki pages (`KANDRIUM_WIKI`).
     pub pages: WikiPagesState,
@@ -114,13 +116,14 @@ pub struct WikiState {
     pub order: Vec<TabKey>,
     /// The tab the detail column renders.
     pub active: Option<TabKey>,
-    /// Notes-half share of the tree split (0.15–0.85).
+    /// Wiki-half share of the tree split (0.15–0.85).
     pub split: f32,
-    /// Cumulative Notes + Wiki share: where the second seam sits.
-    pub pages_split: f32,
-    pub notes_collapsed: bool,
     pub pages_collapsed: bool,
     pub docs_collapsed: bool,
+    /// Whether the whole tree column is open (as opposed to the rail).
+    pub tree_open: bool,
+    /// Expanded tree width in points; persisted by the shell.
+    pub tree_w: f32,
     /// Status, lint, setup or history replaces the tab row until a tab is
     /// opened.
     pub panel: Option<WikiPanel>,
@@ -147,10 +150,10 @@ impl Default for WikiState {
             order: Vec::new(),
             active: None,
             split: settings::DEFAULT_SPLIT_PERMILLE as f32 / 1000.0,
-            pages_split: settings::DEFAULT_SPLIT_PAGES_PERMILLE as f32 / 1000.0,
-            notes_collapsed: false,
             pages_collapsed: false,
             docs_collapsed: false,
+            tree_open: true,
+            tree_w: TREE_W,
             panel: None,
             status: None,
             findings: Vec::new(),
@@ -254,46 +257,34 @@ impl WikiState {
         }
     }
 
-    /// Keep the two seams ordered after values arrive from settings or a drag.
-    pub fn settle_splits(&mut self) {
-        self.pages_split = self.pages_split.clamp(MIN_SPLIT, MAX_SPLIT);
-        self.split = self
-            .split
-            .clamp(MIN_SPLIT, (self.pages_split - MIN_SPLIT).max(MIN_SPLIT));
+    /// Keep the seam share in range after a value arrives from settings or a
+    /// drag.
+    pub fn settle_split(&mut self) {
+        self.split = self.split.clamp(MIN_SPLIT, MAX_SPLIT);
     }
 
-    /// Pixel heights of the Notes, Wiki and Sources halves for the column
-    /// height `total`. Collapsed halves take `HEADER_H`; the rest share the
-    /// remainder by the stored shares, falling back to equal parts whenever a
+    /// Pixel heights of the Wiki and Sources halves for the column height
+    /// `total`. Collapsed halves take `HEADER_H`; the expanded ones share the
+    /// remainder by the stored share, falling back to equal parts whenever the
     /// weight is not positive.
-    pub fn half_heights(&self, total: f32) -> (f32, f32, f32) {
-        let collapsed = [
-            self.notes_collapsed,
-            self.pages_collapsed,
-            self.docs_collapsed,
-        ];
-        let seams = usize::from(!self.notes_collapsed && !self.pages_collapsed)
-            + usize::from(!self.pages_collapsed && !self.docs_collapsed);
+    pub fn half_heights(&self, total: f32) -> (f32, f32) {
+        let collapsed = [self.pages_collapsed, self.docs_collapsed];
+        let seams = usize::from(!self.pages_collapsed && !self.docs_collapsed);
         let collapsed_count = collapsed.iter().filter(|flag| **flag).count();
-        let expanded_count = 3 - collapsed_count;
+        let expanded_count = 2 - collapsed_count;
         let available =
             (total - HEADER_H * collapsed_count as f32 - SPLITTER_H * seams as f32).max(0.0);
 
         let weights = [
-            if self.notes_collapsed {
+            if self.pages_collapsed {
                 0.0
             } else {
                 self.split.max(0.0)
             },
-            if self.pages_collapsed {
-                0.0
-            } else {
-                (self.pages_split - self.split).max(0.0)
-            },
             if self.docs_collapsed {
                 0.0
             } else {
-                (1.0 - self.pages_split).max(0.0)
+                (1.0 - self.split).max(0.0)
             },
         ];
         let ordered = weights
@@ -304,7 +295,6 @@ impl WikiState {
             weights
         } else {
             [
-                if self.notes_collapsed { 0.0 } else { 1.0 },
                 if self.pages_collapsed { 0.0 } else { 1.0 },
                 if self.docs_collapsed { 0.0 } else { 1.0 },
             ]
@@ -312,7 +302,7 @@ impl WikiState {
         let sum: f32 = shares.iter().sum();
         let min = MIN_HALF_H.min(available / expanded_count.max(1) as f32);
         let max = (available - min * expanded_count.saturating_sub(1) as f32).max(min);
-        let mut heights = [0.0f32; 3];
+        let mut heights = [0.0f32; 2];
         for (index, is_collapsed) in collapsed.iter().enumerate() {
             heights[index] = if *is_collapsed {
                 HEADER_H
@@ -324,7 +314,7 @@ impl WikiState {
                 0.0
             };
         }
-        (heights[0], heights[1], heights[2])
+        (heights[0], heights[1])
     }
 }
 
@@ -345,14 +335,14 @@ pub fn wiki_view(
         .flex()
         .child(tree_column(state, t, window, cx));
 
-    if state.notes.tree_open {
+    if state.tree_open {
         row = row.child(tree_splitter(t));
     }
     row = row
         .on_drag_move::<WikiTreeDrag>(cx.listener(
             |this, event: &DragMoveEvent<WikiTreeDrag>, _window, cx| {
                 let width = f32::from(event.event.position.x) - f32::from(event.bounds.origin.x);
-                this.set_notes_tree_width(width, cx);
+                this.set_wiki_tree_width(width, cx);
             },
         ))
         .on_drop::<WikiTreeDrag>(cx.listener(|this, _drag: &WikiTreeDrag, _window, cx| {
@@ -518,7 +508,7 @@ impl Render for TreeDragGhost {
     }
 }
 
-/// The three stacked halves with a draggable seam between each pair, or the
+/// The two stacked halves with a draggable seam between them, or the
 /// whole-tree rail.
 fn tree_column(
     state: &WikiState,
@@ -526,32 +516,25 @@ fn tree_column(
     window: &Window,
     cx: &mut Context<AppShell>,
 ) -> AnyElement {
-    if !state.notes.tree_open {
+    if !state.tree_open {
         return tree_rail(t, cx);
     }
 
     let total = (f32::from(window.bounds().size.height) - TITLEBAR_H - TOOLBAR_H).max(0.0);
-    let (notes_h, pages_h, sources_h) = state.half_heights(total);
-    let notes_seam = !state.notes_collapsed && !state.pages_collapsed;
-    let pages_seam = !state.pages_collapsed && !state.docs_collapsed;
+    let (pages_h, sources_h) = state.half_heights(total);
+    let seam_visible = !state.pages_collapsed && !state.docs_collapsed;
 
     let mut column = div()
         .id("wiki-tree")
         .test_support()
-        .w(px(state.notes.tree_w))
+        .w(px(state.tree_w))
         .h_full()
         .flex()
         .flex_col()
-        .child(notes_half(state, notes_h, t, cx));
+        .child(pages_half(state, pages_h, t, cx));
 
-    if notes_seam {
+    if seam_visible {
         column = column.child(seam("wiki-splitter", WikiSplitDrag, t));
-    }
-
-    column = column.child(pages_half(state, pages_h, t, cx));
-
-    if pages_seam {
-        column = column.child(seam("wiki-pages-splitter", WikiPagesSplitDrag, t));
     }
 
     column
@@ -566,16 +549,6 @@ fn tree_column(
         .on_drop::<WikiSplitDrag>(
             cx.listener(|this, _drag: &WikiSplitDrag, _window, cx| this.finish_wiki_split(cx)),
         )
-        .on_drag_move::<WikiPagesSplitDrag>(cx.listener(
-            |this, event: &DragMoveEvent<WikiPagesSplitDrag>, _window, cx| {
-                if let Some(share) = seam_share(event) {
-                    this.set_wiki_pages_split(share, cx);
-                }
-            },
-        ))
-        .on_drop::<WikiPagesSplitDrag>(
-            cx.listener(|this, _drag: &WikiPagesSplitDrag, _window, cx| this.finish_wiki_split(cx)),
-        )
         .into_any_element()
 }
 
@@ -584,29 +557,6 @@ fn seam_share<D>(event: &DragMoveEvent<D>) -> Option<f32> {
     let height = f32::from(event.bounds.size.height);
     (height > 0.0)
         .then(|| (f32::from(event.event.position.y) - f32::from(event.bounds.origin.y)) / height)
-}
-
-fn notes_half(
-    state: &WikiState,
-    height: f32,
-    t: &Tokens,
-    cx: &mut Context<AppShell>,
-) -> AnyElement {
-    let collapsed = state.notes_collapsed;
-    let toggle = half_toggle("wiki-notes", collapsed, WikiHalf::Notes, t, cx);
-    let mut half = div()
-        .id("wiki-notes-tree")
-        .test_support()
-        .h(px(height))
-        .flex_none()
-        .flex()
-        .flex_col()
-        .overflow_hidden()
-        .child(notes::tree_header(t, cx, "NOTES", Some(toggle), collapsed));
-    if !collapsed {
-        half = half.child(notes::tree_body(&state.notes, t, cx));
-    }
-    half.into_any_element()
 }
 
 fn pages_half(
@@ -625,9 +575,18 @@ fn pages_half(
         .flex()
         .flex_col()
         .overflow_hidden()
-        .child(pages_header(t, toggle, collapsed));
+        .child(pages_header(t, toggle, collapsed, cx));
     if !collapsed {
-        half = half.child(pages_body(&state.pages, t, cx));
+        half = half.child(pages_body(
+            &state.pages,
+            state
+                .notes
+                .error
+                .as_deref()
+                .or(state.pages.error.as_deref()),
+            t,
+            cx,
+        ));
     }
     half.into_any_element()
 }
@@ -655,9 +614,14 @@ fn documents_half(
     half.into_any_element()
 }
 
-/// The Wiki half's 38 px header: just the collapse toggle and its name. Pages
-/// are written through the wiki pipeline, not created from this tree.
-fn pages_header(t: &Tokens, toggle: AnyElement, separator: bool) -> AnyElement {
+/// The Wiki half's 38 px header: the half toggle, its name and the whole-tree
+/// collapse. Pages are written through the wiki pipeline, not created here.
+fn pages_header(
+    t: &Tokens,
+    toggle: AnyElement,
+    separator: bool,
+    cx: &mut Context<AppShell>,
+) -> AnyElement {
     div()
         .h(px(HEADER_H))
         .flex_none()
@@ -675,18 +639,37 @@ fn pages_header(t: &Tokens, toggle: AnyElement, separator: bool) -> AnyElement {
                 .text_color(t.text_muted)
                 .child("WIKI"),
         )
+        .child(
+            div()
+                .id("wiki-collapse")
+                .test_support()
+                .p(px(3.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .hover(|style| style.bg(t.hover))
+                .on_click(
+                    cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_wiki_tree(cx)),
+                )
+                .child(icon(Icon::ChevronLeft, 13., t.text_muted)),
+        )
         .into_any_element()
 }
 
-/// The page tree: folders and Markdown pages, with no inline drafts.
-fn pages_body(state: &WikiPagesState, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
+/// The page tree: folders and Markdown pages, with no inline drafts. `error`
+/// carries a scan failure or a failed page open/save.
+fn pages_body(
+    state: &WikiPagesState,
+    error: Option<&str>,
+    t: &Tokens,
+    cx: &mut Context<AppShell>,
+) -> AnyElement {
     let mut rows = div()
         .id("wiki-pages-rows")
         .test_support()
         .flex_1()
         .min_h_0()
         .overflow_y_scroll();
-    if let Some(error) = &state.error {
+    if let Some(error) = error {
         rows = rows.child(
             div()
                 .id("wiki-pages-error")
@@ -698,10 +681,10 @@ fn pages_body(state: &WikiPagesState, t: &Tokens, cx: &mut Context<AppShell>) ->
                 .bg(gpui_kit::rgba(0x5c1d1dcc))
                 .text(Text::Small)
                 .text_color(t.text)
-                .child(error.clone()),
+                .child(error.to_string()),
         );
     }
-    if state.entries.is_empty() && state.error.is_none() {
+    if state.entries.is_empty() && error.is_none() {
         rows = rows.child(
             div()
                 .px(px(12.))
@@ -822,13 +805,9 @@ where
         .into_any_element()
 }
 
-/// Payload for the Notes ↔ Wiki seam drag.
-#[derive(Clone, Copy)]
-pub struct WikiSplitDrag;
-
 /// Payload for the Wiki ↔ Sources seam drag.
 #[derive(Clone, Copy)]
-pub struct WikiPagesSplitDrag;
+pub struct WikiSplitDrag;
 
 struct SplitDragGhost;
 
@@ -877,7 +856,7 @@ fn tree_rail(t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
     div()
         .id("wiki-tree-rail")
         .test_support()
-        .w(px(notes::RAIL_W))
+        .w(px(RAIL_W))
         .h_full()
         .flex()
         .flex_col()
@@ -1069,9 +1048,6 @@ fn panel_body(
                     .child(kv_row("Concepts", &status.pages.concept.to_string(), t))
                     .child(kv_row("Hand-written", &status.pages.page.to_string(), t))
                     .child(kv_row("Index", &status.pages.index.to_string(), t));
-                if let Some(root) = &state.notes.root {
-                    body = body.child(kv_row("Notes root", &root.display().to_string(), t));
-                }
                 if let Some(root) = &state.pages.root {
                     body = body.child(kv_row("Wiki root", &root.display().to_string(), t));
                 }
@@ -1543,17 +1519,9 @@ fn body_text(text: &str, t: &Tokens) -> AnyElement {
 mod tests {
     use super::*;
 
-    fn state(
-        split: f32,
-        pages_split: f32,
-        notes_collapsed: bool,
-        pages_collapsed: bool,
-        docs_collapsed: bool,
-    ) -> WikiState {
+    fn state_with(split: f32, pages_collapsed: bool, docs_collapsed: bool) -> WikiState {
         WikiState {
             split,
-            pages_split,
-            notes_collapsed,
             pages_collapsed,
             docs_collapsed,
             ..WikiState::default()
@@ -1561,48 +1529,46 @@ mod tests {
     }
 
     #[test]
-    fn default_split_gives_each_half_a_third() {
-        let (notes, pages, sources) = WikiState::default().half_heights(600.0);
-        let expected = (600.0 - 2.0 * SPLITTER_H) / 3.0;
-        assert!((notes - expected).abs() < 0.5, "notes {notes}");
+    fn default_split_gives_each_half_equal_room() {
+        let (pages, sources) = WikiState::default().half_heights(600.0);
+        let expected = (600.0 - SPLITTER_H) / 2.0;
         assert!((pages - expected).abs() < 0.5, "pages {pages}");
         assert!((sources - expected).abs() < 0.5, "sources {sources}");
     }
 
     #[test]
     fn half_heights_clamp_tiny_shares_to_the_minimum() {
-        let (notes, pages, sources) = state(0.15, 0.85, false, false, false).half_heights(600.0);
-        assert_eq!(notes, MIN_HALF_H);
-        assert_eq!(sources, MIN_HALF_H);
+        let (pages, sources) = state_with(0.15, false, false).half_heights(600.0);
+        assert_eq!(pages, MIN_HALF_H);
         assert_eq!(
-            pages,
-            600.0 - 2.0 * SPLITTER_H - 2.0 * MIN_HALF_H,
-            "the middle half takes the room the clamped halves leave"
+            sources,
+            600.0 - SPLITTER_H - MIN_HALF_H,
+            "the other half takes the room the clamped half leaves"
         );
     }
 
     #[test]
     fn collapsed_halves_take_only_their_header() {
-        let (notes, pages, sources) = state(0.333, 0.667, true, false, false).half_heights(600.0);
-        assert_eq!(notes, HEADER_H);
-        let expanded = 600.0 - HEADER_H - SPLITTER_H;
-        assert!((pages - expanded / 2.0).abs() < 0.5, "pages {pages}");
-        assert!((sources - expanded / 2.0).abs() < 0.5, "sources {sources}");
-
-        let (notes, pages, sources) = state(0.333, 0.667, false, true, false).half_heights(600.0);
+        let (pages, sources) = state_with(0.5, true, false).half_heights(600.0);
         assert_eq!(pages, HEADER_H);
-        // A collapsed middle half removes both seams, so the outer halves
-        // share the whole remainder.
-        let expanded = 600.0 - HEADER_H;
-        assert!((notes - expanded / 2.0).abs() < 0.5, "notes {notes}");
-        assert!((sources - expanded / 2.0).abs() < 0.5, "sources {sources}");
+        assert!(
+            (sources - (600.0 - HEADER_H)).abs() < 0.5,
+            "a collapsed half removes the seam and gives its room away: {sources}"
+        );
+
+        let (pages, sources) = state_with(0.5, false, true).half_heights(600.0);
+        assert_eq!(sources, HEADER_H);
+        assert!((pages - (600.0 - HEADER_H)).abs() < 0.5, "pages {pages}");
     }
 
     #[test]
-    fn settle_splits_keeps_the_seams_ordered() {
-        let mut state = state(0.9, 0.2, false, false, false);
-        state.settle_splits();
-        assert_eq!(state.split, MIN_SPLIT);
-        assert_eq!(state.pages_split, 0.2);
+    fn settle_split_keeps_the_share_in_range() {
+        let mut wiki = state_with(0.9, false, false);
+        wiki.settle_split();
+        assert_eq!(wiki.split, MAX_SPLIT);
+
+        let mut wiki = state_with(0.01, false, false);
+        wiki.settle_split();
+        assert_eq!(wiki.split, MIN_SPLIT);
     }
 }
