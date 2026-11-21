@@ -39,7 +39,7 @@ use crate::views::archive;
 use crate::views::card_modal::{self, EditSession, ModalContext};
 use crate::views::clocks::{
     self, ClockDrag, ClockState, ConfirmKind, ConfirmState, DragState, FormKind, FormState,
-    InspectorState, PickerState, ProbeState,
+    InspectorState, NameParts, PersonFormState, PickerState, ProbeState, RenameState,
 };
 use crate::views::documents::{self, DocDraft, DocDraftKind, DocKind, DocTab};
 use crate::views::documents_pdf;
@@ -4064,11 +4064,15 @@ impl AppShell {
         if self.clocks.entry(clock_id).is_none() {
             return;
         }
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Add a person"));
-        input.update(cx, |state, cx| state.focus(window, cx));
+        let add_first = cx.new(|cx| InputState::new(window, cx).placeholder("First name"));
+        let add_middle = cx.new(|cx| InputState::new(window, cx).placeholder("Middle (optional)"));
+        let add_last = cx.new(|cx| InputState::new(window, cx).placeholder("Last name"));
+        add_first.update(cx, |state, cx| state.focus(window, cx));
         self.clocks.inspector = Some(InspectorState {
             clock_id: clock_id.to_string(),
-            add: input,
+            add_first,
+            add_middle,
+            add_last,
             rename: None,
             error: None,
         });
@@ -4079,6 +4083,105 @@ impl AppShell {
         if self.clocks.inspector.take().is_some() {
             cx.notify();
         }
+    }
+
+    /// Open the People tab's add-person modal. The city field is a search over
+    /// the IANA zones; picking one that has no clock card yet creates the card
+    /// on submit, so the roster can grow without a trip to the Cities tab.
+    pub(crate) fn open_person_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.clocks.ensure_zones();
+        let first = cx.new(|cx| InputState::new(window, cx).placeholder("First name"));
+        let middle = cx.new(|cx| InputState::new(window, cx).placeholder("Middle (optional)"));
+        let last = cx.new(|cx| InputState::new(window, cx).placeholder("Last name"));
+        let city =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search cities or time zones"));
+        first.update(cx, |state, cx| state.focus(window, cx));
+        self.clocks.person_form = Some(PersonFormState {
+            first,
+            middle,
+            last,
+            city,
+            zone: None,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn close_person_form(&mut self, cx: &mut Context<Self>) {
+        if self.clocks.person_form.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn choose_person_zone(&mut self, zone: &str, cx: &mut Context<Self>) {
+        if let Some(form) = &mut self.clocks.person_form {
+            form.zone = Some(zone.to_string());
+            form.error = None;
+            cx.notify();
+        }
+    }
+
+    /// Add the person from the People form. A zone without a clock card gets a
+    /// clock first, in the same run, so the person always has a home city.
+    pub(crate) fn add_person_from_form(&mut self, cx: &mut Context<Self>) {
+        let (parts, zone) = {
+            let Some(form) = self.clocks.person_form.as_ref() else {
+                return;
+            };
+            (
+                self.name_parts(cx, &form.first, &form.middle, &form.last),
+                form.zone.clone(),
+            )
+        };
+        if !parts.is_complete() {
+            self.set_person_form_error("First and last names are required", cx);
+            return;
+        }
+        let Some(zone) = zone else {
+            self.set_person_form_error("Choose the person's city", cx);
+            return;
+        };
+        let clock_id = if let Some(entry) = self
+            .clocks
+            .entries
+            .iter()
+            .find(|entry| entry.tz_identifier == zone)
+        {
+            entry.id.clone()
+        } else {
+            if let Err(error) = self.store.add_clock(&zone) {
+                self.set_person_form_error(error, cx);
+                return;
+            }
+            self.load_clocks();
+            match self
+                .clocks
+                .entries
+                .iter()
+                .find(|entry| entry.tz_identifier == zone)
+            {
+                Some(entry) => entry.id.clone(),
+                None => {
+                    self.set_person_form_error(format!("Could not add {zone}"), cx);
+                    return;
+                }
+            }
+        };
+        match self.store.add_person(&clock_id, &parts.display()) {
+            Ok(()) => {
+                self.clocks.person_form = None;
+                self.load_clocks();
+            }
+            Err(error) => self.set_person_form_error(error, cx),
+        }
+        cx.notify();
+    }
+
+    fn set_person_form_error(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        if let Some(form) = &mut self.clocks.person_form {
+            form.error = Some(message.into());
+        }
+        cx.notify();
     }
 
     pub(crate) fn handle_inspector_key(
@@ -4108,6 +4211,22 @@ impl AppShell {
         }
     }
 
+    /// Read the three name fields as one value. Trimming happens in
+    /// [`NameParts::display`] / [`NameParts::is_complete`].
+    fn name_parts(
+        &self,
+        cx: &Context<Self>,
+        first: &Entity<InputState>,
+        middle: &Entity<InputState>,
+        last: &Entity<InputState>,
+    ) -> NameParts {
+        NameParts {
+            first: first.read(cx).value().to_string(),
+            middle: middle.read(cx).value().to_string(),
+            last: last.read(cx).value().to_string(),
+        }
+    }
+
     pub(crate) fn add_person_from_inspector(
         &mut self,
         window: &mut Window,
@@ -4117,10 +4236,16 @@ impl AppShell {
             return;
         };
         let clock_id = inspector.clock_id.clone();
-        let name = inspector.add.read(cx).value().trim().to_string();
-        if name.is_empty() {
+        let parts = self.name_parts(
+            cx,
+            &inspector.add_first,
+            &inspector.add_middle,
+            &inspector.add_last,
+        );
+        let name = parts.display();
+        if !parts.is_complete() {
             if let Some(inspector) = &mut self.clocks.inspector {
-                inspector.error = Some("A name is required".to_string());
+                inspector.error = Some("First and last names are required".to_string());
             }
             cx.notify();
             return;
@@ -4129,11 +4254,17 @@ impl AppShell {
             Ok(()) => {
                 self.load_clocks();
                 if let Some(inspector) = &self.clocks.inspector {
-                    let input = inspector.add.clone();
-                    input.update(cx, |state, cx| {
-                        state.set_value("", window, cx);
-                        state.focus(window, cx);
-                    });
+                    let fields = [
+                        inspector.add_first.clone(),
+                        inspector.add_middle.clone(),
+                        inspector.add_last.clone(),
+                    ];
+                    for input in &fields {
+                        input.update(cx, |state, cx| {
+                            state.set_value("", window, cx);
+                        });
+                    }
+                    fields[0].update(cx, |state, cx| state.focus(window, cx));
                     if let Some(inspector) = &mut self.clocks.inspector {
                         inspector.error = None;
                     }
@@ -4157,10 +4288,30 @@ impl AppShell {
         let Some(person) = self.clock_person(person_id).cloned() else {
             return;
         };
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(person.name));
-        input.update(cx, |state, cx| state.focus(window, cx));
+        let parts = NameParts::parse(&person.name);
+        let first = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("First name")
+                .default_value(parts.first)
+        });
+        let middle = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Middle (optional)")
+                .default_value(parts.middle)
+        });
+        let last = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Last name")
+                .default_value(parts.last)
+        });
+        first.update(cx, |state, cx| state.focus(window, cx));
         if let Some(inspector) = &mut self.clocks.inspector {
-            inspector.rename = Some((person_id.to_string(), input));
+            inspector.rename = Some(RenameState {
+                person_id: person_id.to_string(),
+                first,
+                middle,
+                last,
+            });
         }
         cx.notify();
     }
@@ -4169,11 +4320,14 @@ impl AppShell {
         let Some(inspector) = &self.clocks.inspector else {
             return;
         };
-        let Some((person_id, input)) = &inspector.rename else {
+        let Some(rename) = &inspector.rename else {
             return;
         };
-        let person_id = person_id.clone();
-        let name = input.read(cx).value().trim().to_string();
+        let person_id = rename.person_id.clone();
+        let parts = self.name_parts(cx, &rename.first, &rename.middle, &rename.last);
+        let name = parts.display();
+        // A rename may keep a single name part: legacy rows can hold one word,
+        // and opening then saving them must not force a surname.
         if name.is_empty() {
             if let Some(inspector) = &mut self.clocks.inspector {
                 inspector.error = Some("A name is required".to_string());

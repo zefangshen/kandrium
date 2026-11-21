@@ -479,3 +479,242 @@ fn probe_zone_menu_blocks_the_page_and_closes(cx: &mut TestAppContext) {
         "the local row must still activate after a city was picked"
     );
 }
+/// The add and rename forms split a name into first, middle (optional) and
+/// last fields, while the stored person keeps a single display name.
+#[gpui::test]
+fn inspector_forms_take_three_name_fields(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open_path(seeded(dir.path()));
+    let clock_id = store.clock_data().expect("clocks").clocks[0].id.clone();
+    store.add_person(&clock_id, "Ada Lovelace").expect("person");
+    let person_id = store.clock_data().expect("clocks").people[0].id.clone();
+    cx.update(gpui_kit::init);
+    let (_shell, cx) = cx.add_window_view(|_window, _cx| AppShell::with_store(store));
+    open_clocks(cx);
+    open_inspector(cx, &clock_id);
+
+    for id in [
+        "clock-inspector-add-first",
+        "clock-inspector-add-middle",
+        "clock-inspector-add-last",
+    ] {
+        assert!(
+            cx.update(|window, _cx| window.try_find(id).is_some()),
+            "the add form is missing {id}"
+        );
+    }
+
+    let rename = format!("clock-person-rename-{person_id}");
+    cx.update(move |window, cx| window.click(rename, cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    for id in [
+        "clock-person-rename-first",
+        "clock-person-rename-middle",
+        "clock-person-rename-last",
+    ] {
+        assert!(
+            cx.update(|window, _cx| window.try_find(id).is_some()),
+            "the rename form is missing {id}"
+        );
+    }
+}
+
+fn person_form_open(cx: ClocksUi) -> bool {
+    cx.update(|window, _cx| window.try_find("person-form").is_some())
+}
+
+/// The People tab's action adds a person to a city that has no clock card
+/// yet: the modal creates that city on submit and the roster picks the person
+/// up straight away.
+#[gpui::test]
+fn people_tab_adds_a_person_to_a_new_city(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(gpui_kit::init);
+    let (_shell, cx) = cx
+        .add_window_view(|_window, _cx| AppShell::with_store(Store::open_path(seeded(dir.path()))));
+    open_clocks(cx);
+    open_people_tab(cx);
+    assert!(
+        cx.update(|window, _cx| window.try_find("clocks-add-person").is_some()),
+        "the People tab needs its own add action"
+    );
+
+    cx.update(|window, cx| window.click("clocks-add-person", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    assert!(person_form_open(cx), "the add-person modal should open");
+    for id in [
+        "person-form-first",
+        "person-form-middle",
+        "person-form-last",
+        "person-form-city",
+    ] {
+        assert!(
+            cx.update(|window, _cx| window.try_find(id).is_some()),
+            "the person form is missing {id}"
+        );
+    }
+
+    cx.update(|window, cx| window.click("person-form-first", cx));
+    cx.update(|window, cx| window.input("Ada", cx));
+    cx.update(|window, cx| window.click("person-form-last", cx));
+    cx.update(|window, cx| window.input("Lovelace", cx));
+    cx.update(|window, cx| window.click("person-form-city", cx));
+    cx.update(|window, cx| window.input("Seoul", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    cx.update(|window, cx| window.click("person-form-zone-0", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, cx| window.click("person-form-submit", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    assert!(!person_form_open(cx), "submitting closes the modal");
+    assert!(
+        cx.update(|window, _cx| window.try_find("clocks-people").is_some()),
+        "the roster should list the new person"
+    );
+    assert!(
+        cx.update(|window, _cx| window.try_find("clocks-people-empty").is_none()),
+        "the empty state should be gone once someone exists"
+    );
+}
+
+/// The toolbar search filters the People roster by name and by city, and
+/// clearing it brings every row back.
+#[gpui::test]
+fn people_search_filters_the_roster(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open_path(seeded(dir.path()));
+    let data = store.clock_data().expect("clocks");
+    // The seed holds Kyiv, Tokyo and Los Angeles.
+    let kyiv = data.clocks[0].id.clone();
+    let tokyo = data.clocks[1].id.clone();
+    store.add_person(&kyiv, "Grace Hopper").expect("grace");
+    store.add_person(&tokyo, "Ada Lovelace").expect("ada");
+    let people = store.clock_data().expect("clocks").people;
+    let grace = people
+        .iter()
+        .find(|person| person.name == "Grace Hopper")
+        .expect("grace")
+        .id
+        .clone();
+    let ada = people
+        .iter()
+        .find(|person| person.name == "Ada Lovelace")
+        .expect("ada")
+        .id
+        .clone();
+    let grace_row = format!("clock-person-{grace}-{kyiv}");
+    let ada_row = format!("clock-person-{ada}-{tokyo}");
+
+    cx.update(gpui_kit::init);
+    let (_shell, cx) = cx.add_window_view(|_window, _cx| AppShell::with_store(store));
+    open_clocks(cx);
+    open_people_tab(cx);
+    assert!(cx.update(|window, _cx| window.try_find(grace_row.clone()).is_some()));
+    assert!(cx.update(|window, _cx| window.try_find(ada_row.clone()).is_some()));
+
+    cx.update(|window, cx| window.click("clocks-search", cx));
+    cx.update(|window, cx| window.input("grace", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    assert!(
+        cx.update(|window, _cx| window.try_find(grace_row.clone()).is_some()),
+        "a name match keeps its row"
+    );
+    assert!(
+        cx.update(|window, _cx| window.try_find(ada_row.clone()).is_none()),
+        "a non-matching row is filtered out"
+    );
+
+    for _ in 0..5 {
+        cx.update(|window, cx| window.press("backspace", cx));
+    }
+    cx.update(|window, cx| window.input("kyiv", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    assert!(
+        cx.update(|window, _cx| window.try_find(grace_row.clone()).is_some()),
+        "a city match keeps its row"
+    );
+    assert!(
+        cx.update(|window, _cx| window.try_find(ada_row.clone()).is_none()),
+        "a different city is filtered out"
+    );
+
+    for _ in 0..4 {
+        cx.update(|window, cx| window.press("backspace", cx));
+    }
+    cx.update(|window, cx| window.render_frame(cx));
+    assert!(cx.update(|window, _cx| window.try_find(grace_row.clone()).is_some()));
+    assert!(cx.update(|window, _cx| window.try_find(ada_row.clone()).is_some()));
+}
+
+/// A legacy single-word name can be opened and saved through the rename form;
+/// the add-person form still demands a first and a last name.
+#[gpui::test]
+fn rename_accepts_a_single_word_name(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open_path(seeded(dir.path()));
+    let clock_id = store.clock_data().expect("clocks").clocks[0].id.clone();
+    store.add_person(&clock_id, "Ada").expect("person");
+    let person_id = store.clock_data().expect("clocks").people[0].id.clone();
+
+    cx.update(gpui_kit::init);
+    let (_shell, cx) = cx.add_window_view(|_window, _cx| AppShell::with_store(store));
+    open_clocks(cx);
+    open_inspector(cx, &clock_id);
+
+    let rename = format!("clock-person-rename-{person_id}");
+    cx.update(move |window, cx| window.click(rename, cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    assert!(cx.update(|window, _cx| window.try_find("clock-person-rename-first").is_some()));
+
+    cx.update(|window, cx| window.press("enter", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    assert!(
+        cx.update(|window, _cx| window.try_find("clock-person-rename-first").is_none()),
+        "Enter saves the split name instead of holding the form open"
+    );
+}
+
+/// The People tab is a cross-city roster; with nobody attached to a clock it
+/// explains itself rather than showing an empty table.
+#[gpui::test]
+fn people_tab_shows_its_empty_state(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(gpui_kit::init);
+    let (_shell, cx) = cx
+        .add_window_view(|_window, _cx| AppShell::with_store(Store::open_path(seeded(dir.path()))));
+    open_clocks(cx);
+    assert!(
+        cx.update(|window, _cx| window.try_find("clocks-grid").is_some()),
+        "the city grid stays the default view"
+    );
+
+    open_people_tab(cx);
+    assert!(
+        cx.update(|window, _cx| window.try_find("clocks-people-empty").is_some()),
+        "an empty roster needs its own empty state"
+    );
+    assert!(cx.update(|window, _cx| window.try_find("clocks-grid").is_none()));
+}
+
+/// A person attached to a city appears in the roster with that city's time;
+/// the row id pairs the person and the clock so duplicates stay distinct.
+#[gpui::test]
+fn people_tab_lists_every_person_with_their_city(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open_path(seeded(dir.path()));
+    let clock_id = store.clock_data().expect("clocks").clocks[0].id.clone();
+    store.add_person(&clock_id, "Ada Lovelace").expect("person");
+    let person_id = store.clock_data().expect("clocks").people[0].id.clone();
+    cx.update(gpui_kit::init);
+    let (_shell, cx) = cx.add_window_view(|_window, _cx| AppShell::with_store(store));
+    open_clocks(cx);
+
+    open_people_tab(cx);
+    let row = format!("clock-person-{person_id}-{clock_id}");
+    let found = cx.update({
+        let row = row.clone();
+        move |window, _cx| window.try_find(row).is_some()
+    });
+    assert!(found, "the roster needs a row for {row}");
+}

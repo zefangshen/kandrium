@@ -4,11 +4,11 @@
 //! Every panel renders from [`ClockState`] and sends actions back to
 //! [`AppShell`], which owns the [`crate::store::Store`]. No SQL here.
 
-use gpui_kit::component::input::Input;
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, App, ClickEvent, Context, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    TestSupportExt, Window, div, px, rgba,
+    AnyElement, App, ClickEvent, Context, Entity, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, TestSupportExt, Window, div, px, rgba,
 };
 
 use kandrium_core::{Travel, format_offset, resolve_zone};
@@ -564,6 +564,228 @@ fn probe_zone_row(
 }
 
 // ---------------------------------------------------------------------------
+// Add-person form (People tab)
+// ---------------------------------------------------------------------------
+
+/// Add a person from the People tab: three name fields plus a searchable city.
+/// The city may be one that has no clock card yet; submitting creates that
+/// clock first, so the person always lands on a real city.
+pub fn person_form(
+    state: &ClockState,
+    t: &Tokens,
+    _window: &mut Window,
+    cx: &mut Context<AppShell>,
+) -> Option<AnyElement> {
+    let form = state.person_form.as_ref()?;
+    let query = form.city.read(cx).value().to_string();
+    let rows = picker_rows(&state.zones, &query);
+
+    let mut list = div()
+        .id("person-form-city-list")
+        .test_support()
+        .h(px(180.))
+        .overflow_y_scroll()
+        .flex()
+        .flex_col();
+    if rows.is_empty() {
+        list = list.child(
+            div()
+                .p(px(12.))
+                .text(Text::Small)
+                .text_color(t.text_muted)
+                .child(format!("No time zones match \u{201c}{query}\u{201d}.")),
+        );
+    } else {
+        for (index, zone) in rows.iter().enumerate() {
+            let saved = zone_is_added(&state.entries, zone);
+            let chosen = form.zone.as_deref() == Some(zone.as_str());
+            let row = div()
+                .id(format!("person-form-zone-{index}"))
+                .test_support()
+                .mx(px(6.))
+                .px(px(10.))
+                .py(px(6.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .when(chosen, |el| el.bg(t.selected))
+                .hover(|style| style.bg(t.hover))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text(Text::Body)
+                                .text_color(t.text)
+                                .child(kandrium_core::city_name(zone)),
+                        )
+                        .child(
+                            div()
+                                .text(Text::Small)
+                                .text_color(t.text_faint)
+                                .child(zone.clone()),
+                        ),
+                )
+                .when(saved, |el| {
+                    el.child(
+                        div()
+                            .px(px(6.))
+                            .h(px(18.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(4.))
+                            .bg(t.field)
+                            .text(Text::SmallStrong)
+                            .text_color(t.text_faint)
+                            .child("Saved"),
+                    )
+                });
+            let zone = zone.clone();
+            list = list.child(row.on_click(cx.listener(
+                move |this, _: &ClickEvent, _window, cx| this.choose_person_zone(&zone, cx),
+            )));
+        }
+    }
+
+    let panel = panel_shell("person-form", 520., t)
+        .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+            if event.keystroke.key == "escape" {
+                cx.stop_propagation();
+                this.close_person_form(cx);
+            }
+        }))
+        .child(panel_header("Add a person", t))
+        .child(
+            div()
+                .w_full()
+                .px(px(16.))
+                .pt(px(12.))
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(name_field("person-form-first", &form.first))
+                        .child(name_field("person-form-middle", &form.middle))
+                        .child(name_field("person-form-last", &form.last)),
+                )
+                .child(section_label("City", t))
+                .child(
+                    div()
+                        .id("person-form-city")
+                        .test_support()
+                        .child(Input::new(&form.city)),
+                )
+                .when_some(form.zone.clone(), |el, zone| {
+                    el.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .text(Text::Small)
+                            .text_color(t.text_muted)
+                            .child("Home city:")
+                            .child(
+                                div()
+                                    .text(Text::SmallStrong)
+                                    .text_color(t.accent_text)
+                                    .child(kandrium_core::city_name(&zone)),
+                            ),
+                    )
+                })
+                // Actions sit with the form, above the city list, so they stay
+                // put while the list scrolls and the panel never needs a
+                // clipped footer.
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .id("person-form-cancel")
+                                .test_support()
+                                .h(px(28.))
+                                .px(px(10.))
+                                .flex()
+                                .items_center()
+                                .rounded(px(t.radius))
+                                .cursor_pointer()
+                                .text(Text::Button)
+                                .text_color(t.text_muted)
+                                .hover(|style| style.bg(t.hover))
+                                .child("Cancel")
+                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                    this.close_person_form(cx)
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("person-form-submit")
+                                .test_support()
+                                .h(px(28.))
+                                .px(px(10.))
+                                .flex()
+                                .items_center()
+                                .gap(px(5.))
+                                .rounded(px(t.radius))
+                                .bg(t.accent_soft)
+                                .cursor_pointer()
+                                .text(Text::Button)
+                                .text_color(t.accent_text)
+                                .child(icon(Icon::Plus, 13., t.accent_text))
+                                .child("Add person")
+                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                    this.add_person_from_form(cx)
+                                })),
+                        ),
+                )
+                .child(list),
+        )
+        .when_some(form.error.clone(), |el, message| {
+            el.child(
+                div()
+                    .px(px(16.))
+                    .pb(px(8.))
+                    .child(error_banner(&message, t)),
+            )
+        });
+
+    let layer = div()
+        .id("person-form-layer")
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .id("person-form-backdrop")
+                .occlude()
+                .test_support()
+                .absolute()
+                .inset_0()
+                .bg(rgba(0x00000080))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _window, cx| this.close_person_form(cx)),
+                ),
+        )
+        .child(div().occlude().child(panel));
+
+    Some(layer.into_any_element())
+}
+
+// ---------------------------------------------------------------------------
 // People inspector
 // ---------------------------------------------------------------------------
 
@@ -630,8 +852,16 @@ pub fn inspector(
             div()
                 .flex()
                 .items_center()
-                .gap(px(8.))
-                .child(div().flex_1().child(Input::new(&inspector.add)))
+                .gap(px(6.))
+                .child(name_field(
+                    "clock-inspector-add-first",
+                    &inspector.add_first,
+                ))
+                .child(name_field(
+                    "clock-inspector-add-middle",
+                    &inspector.add_middle,
+                ))
+                .child(name_field("clock-inspector-add-last", &inspector.add_last))
                 .child(
                     div()
                         .id("clock-inspector-add")
@@ -756,6 +986,19 @@ fn section_label(label: &str, t: &Tokens) -> AnyElement {
         .into_any_element()
 }
 
+/// One name field in the add or rename form. The three share the row equally
+/// and never shrink below zero, so a long typed name scrolls inside its box
+/// instead of squeezing its siblings.
+fn name_field(id: &'static str, input: &Entity<InputState>) -> AnyElement {
+    div()
+        .id(id)
+        .test_support()
+        .flex_1()
+        .min_w(px(0.))
+        .child(Input::new(input))
+        .into_any_element()
+}
+
 fn resident_row(
     state: &ClockState,
     status: &PersonStatus,
@@ -768,8 +1011,8 @@ fn resident_row(
         .inspector
         .as_ref()
         .and_then(|inspector| inspector.rename.as_ref())
-        .filter(|(id, _)| *id == person_id)
-        .map(|(_, input)| input.clone());
+        .filter(|rename| rename.person_id == person_id)
+        .cloned();
 
     let mut row = div()
         .id(format!("clock-resident-{person_id}"))
@@ -808,8 +1051,17 @@ fn resident_row(
                         })
                         .child(crate::views::clocks::initials(&name)),
                 )
-                .child(if let Some(input) = renaming {
-                    div().flex_1().child(Input::new(&input)).into_any_element()
+                .child(if let Some(rename) = renaming {
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .child(name_field("clock-person-rename-first", &rename.first))
+                        .child(name_field("clock-person-rename-middle", &rename.middle))
+                        .child(name_field("clock-person-rename-last", &rename.last))
+                        .into_any_element()
                 } else {
                     div()
                         .flex_1()
