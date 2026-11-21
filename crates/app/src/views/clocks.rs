@@ -29,8 +29,8 @@ use std::time::Duration;
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    Animation, AnimationExt, AnyElement, ClickEvent, Context, DragMoveEvent, Entity, IntoElement,
-    KeyDownEvent, Render, TestSupportExt, Window, div, px,
+    Animation, AnimationExt, AnyElement, ClickEvent, Context, DragMoveEvent, Entity, FocusHandle,
+    IntoElement, KeyDownEvent, Render, TestSupportExt, Window, div, px,
 };
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -196,6 +196,9 @@ pub struct ClockState {
     pub probe_placeholder: String,
     /// Whether the probe-zone menu is open.
     pub probe_menu: bool,
+    /// Focus parked on the probe-zone menu while it is open, so `Esc` reaches
+    /// the panel even though it holds no text field.
+    pub probe_menu_focus: Option<FocusHandle>,
     /// Last commit failure, shown on the control and in its `aria_label`.
     pub probe_error: Option<String>,
     /// DST note for the active probe ("02:30 does not exist here").
@@ -224,6 +227,7 @@ impl ClockState {
             probe_input: None,
             probe_placeholder: String::new(),
             probe_menu: false,
+            probe_menu_focus: None,
             probe_error: None,
             probe_hint: None,
             search: String::new(),
@@ -1033,8 +1037,8 @@ fn probe_control(
                     10.,
                     if probing { t.accent_text } else { t.text_muted },
                 ))
-                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                    this.toggle_clock_probe_menu(cx)
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.toggle_clock_probe_menu(window, cx)
                 })),
         )
         .when(probing, |el| {

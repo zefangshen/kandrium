@@ -3729,6 +3729,7 @@ impl AppShell {
                 });
                 self.clocks.probe_error = None;
                 self.clocks.probe_menu = false;
+                self.clocks.probe_menu_focus = None;
             }
             Err(error) => {
                 // Keep the previous probe and the typed text so the field can
@@ -3750,6 +3751,7 @@ impl AppShell {
         self.clocks.probe_error = None;
         self.clocks.probe_hint = None;
         self.clocks.probe_menu = false;
+        self.clocks.probe_menu_focus = None;
         cx.notify();
     }
 
@@ -3772,9 +3774,26 @@ impl AppShell {
         }
     }
 
-    pub(crate) fn toggle_clock_probe_menu(&mut self, cx: &mut Context<Self>) {
-        self.clocks.probe_menu = !self.clocks.probe_menu;
+    pub(crate) fn toggle_clock_probe_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.clocks.probe_menu {
+            self.close_clock_probe_menu(cx);
+            return;
+        }
+        // Park focus on the menu so `Esc` reaches its key handler; the panel
+        // holds no text field of its own to focus.
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+        self.clocks.probe_menu_focus = Some(focus);
+        self.clocks.probe_menu = true;
         cx.notify();
+    }
+
+    pub(crate) fn close_clock_probe_menu(&mut self, cx: &mut Context<Self>) {
+        if self.clocks.probe_menu {
+            self.clocks.probe_menu = false;
+            self.clocks.probe_menu_focus = None;
+            cx.notify();
+        }
     }
 
     /// Pick the zone the probe reads in and re-read the typed wall clock in
@@ -3787,6 +3806,7 @@ impl AppShell {
     ) {
         self.clocks.probe_zone = zone.map(str::to_string);
         self.clocks.probe_menu = false;
+        self.clocks.probe_menu_focus = None;
         self.commit_clock_probe(window, cx);
     }
 
@@ -3817,6 +3837,7 @@ impl AppShell {
             target,
         });
         self.clocks.probe_menu = false;
+        self.clocks.probe_menu_focus = None;
         cx.notify();
     }
 

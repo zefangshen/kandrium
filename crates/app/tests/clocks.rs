@@ -7,6 +7,10 @@
 
 use std::path::{Path, PathBuf};
 
+use gpui::TestAppContext;
+use gpui_kit::test::TestWindowExt;
+
+use kandrium_app::app::AppShell;
 use kandrium_app::store::Store;
 use kandrium_core::clocks::{day_end_seconds, day_start_seconds, resolve_zone};
 
@@ -271,5 +275,207 @@ fn relocation_cancels_trips_to_both_homes() {
     assert_eq!(
         store.clock_data().expect("clocks").people[0].home_clock_id,
         new_home.id
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Overlay behaviour
+// ---------------------------------------------------------------------------
+
+type ClocksUi<'a> = &'a mut gpui::VisualTestContext;
+
+fn open_clocks(cx: ClocksUi) {
+    cx.update(|window, cx| window.click("nav-clocks", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+}
+
+fn open_picker(cx: ClocksUi) {
+    cx.update(|window, cx| window.click("clocks-add-city", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+}
+
+fn picker_open(cx: ClocksUi) -> bool {
+    cx.update(|window, _cx| window.try_find("clock-picker").is_some())
+}
+
+/// The add-city overlay must behave like every other modal in the app: it
+/// covers the page so clicks cannot reach the cards behind it, `Esc` closes
+/// it, and so does a press outside the panel.
+#[gpui::test]
+fn add_city_picker_blocks_the_page_and_closes(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = seeded(dir.path());
+    cx.update(gpui_kit::init);
+    let (_shell, cx) =
+        cx.add_window_view(|_window, _cx| AppShell::with_store(Store::open_path(db)));
+    open_clocks(cx);
+
+    open_picker(cx);
+    assert!(picker_open(cx), "the add-city picker should open");
+    let backdrop = cx.update(|window, _cx| window.try_find("clock-picker-backdrop"));
+    let backdrop = backdrop.expect("the picker needs a full-size backdrop");
+    let page = cx.update(|window, _cx| window.find("clocks-view").bounds().size);
+    let size = backdrop.bounds().size;
+    assert_eq!(
+        (size.width, size.height),
+        (page.width, page.height),
+        "the backdrop must cover the page"
+    );
+
+    cx.update(|window, cx| window.press("escape", cx));
+    assert!(!picker_open(cx), "Esc should close the picker");
+
+    open_picker(cx);
+    assert!(picker_open(cx));
+    // The panel is centred, so a click near the top-left corner lands on the
+    // backdrop rather than on the panel.
+    cx.update(|window, cx| {
+        window.click_at(
+            "clock-picker-backdrop",
+            gpui::point(gpui::px(4.), gpui::px(4.)),
+            cx,
+        );
+    });
+    assert!(
+        !picker_open(cx),
+        "a press outside the panel should close it"
+    );
+}
+
+fn open_inspector(cx: ClocksUi, clock_id: &str) {
+    let card = format!("clock-card-{clock_id}");
+    cx.update(|window, cx| window.click(card, cx));
+    cx.update(|window, cx| window.render_frame(cx));
+}
+
+fn inspector_open(cx: ClocksUi) -> bool {
+    cx.update(|window, _cx| window.try_find("clock-inspector").is_some())
+}
+
+/// The per-city inspector opened from a card is a modal too: the cards behind
+/// it must neither hover nor activate, `Esc` closes it, and so does a press
+/// outside the panel.
+#[gpui::test]
+fn clock_inspector_blocks_the_page_and_closes(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open_path(seeded(dir.path()));
+    let clock_id = store.clock_data().expect("clocks").clocks[0].id.clone();
+    cx.update(gpui_kit::init);
+    let (_shell, cx) = cx.add_window_view(|_window, _cx| AppShell::with_store(store));
+    open_clocks(cx);
+
+    open_inspector(cx, &clock_id);
+    assert!(inspector_open(cx), "the inspector should open");
+    let backdrop = cx.update(|window, _cx| window.try_find("clock-inspector-backdrop"));
+    let backdrop = backdrop.expect("the inspector needs a full-size backdrop");
+    let page = cx.update(|window, _cx| window.find("clocks-view").bounds().size);
+    let size = backdrop.bounds().size;
+    assert_eq!(
+        (size.width, size.height),
+        (page.width, page.height),
+        "the backdrop must cover the page"
+    );
+
+    cx.update(|window, cx| window.press("escape", cx));
+    assert!(!inspector_open(cx), "Esc should close the inspector");
+
+    open_inspector(cx, &clock_id);
+    assert!(inspector_open(cx));
+    // The panel is centred, so a click near the top-left corner lands on the
+    // backdrop rather than on the panel.
+    cx.update(|window, cx| {
+        window.click_at(
+            "clock-inspector-backdrop",
+            gpui::point(gpui::px(4.), gpui::px(4.)),
+            cx,
+        );
+    });
+    assert!(
+        !inspector_open(cx),
+        "a press outside the panel should close it"
+    );
+}
+
+fn open_people_tab(cx: ClocksUi) {
+    cx.update(|window, cx| window.click("clocks-tab-people", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+}
+
+fn open_probe_menu(cx: ClocksUi) {
+    cx.update(|window, cx| window.click("clocks-probe-zone", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+}
+
+fn probe_menu_open(cx: ClocksUi) -> bool {
+    cx.update(|window, _cx| window.try_find("clock-probe-zone-menu").is_some())
+}
+
+/// The probe-zone menu is modal like the picker and the city inspector: the
+/// content behind it must neither hover nor activate, `Esc` closes it, and so
+/// does a press outside the panel.
+#[gpui::test]
+fn probe_zone_menu_blocks_the_page_and_closes(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    cx.update(gpui_kit::init);
+    let (_shell, cx) = cx
+        .add_window_view(|_window, _cx| AppShell::with_store(Store::open_path(seeded(dir.path()))));
+    open_clocks(cx);
+
+    open_probe_menu(cx);
+    assert!(probe_menu_open(cx), "the probe menu should open");
+    let backdrop = cx
+        .update(|window, _cx| window.try_find("clock-probe-zone-backdrop"))
+        .expect("the menu needs a full-size backdrop");
+    let page = cx.update(|window, _cx| window.find("clocks-view").bounds().size);
+    let size = backdrop.bounds().size;
+    assert_eq!(
+        (size.width, size.height),
+        (page.width, page.height),
+        "the backdrop must cover the page"
+    );
+
+    cx.update(|window, cx| window.press("escape", cx));
+    assert!(!probe_menu_open(cx), "Esc should close the menu");
+
+    open_probe_menu(cx);
+    assert!(probe_menu_open(cx));
+    // The panel is centred, so a click near the top-left corner lands on the
+    // backdrop rather than on the panel.
+    cx.update(|window, cx| {
+        window.click_at(
+            "clock-probe-zone-backdrop",
+            gpui::point(gpui::px(4.), gpui::px(4.)),
+            cx,
+        );
+    });
+    assert!(
+        !probe_menu_open(cx),
+        "a press outside the panel should close it"
+    );
+
+    // A row still works: the local zone closes the menu and re-reads the
+    // probe in it.
+    open_probe_menu(cx);
+    assert!(probe_menu_open(cx));
+    cx.update(|window, cx| window.click("clock-probe-zone-local", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    assert!(
+        !probe_menu_open(cx),
+        "picking the local zone should close the menu"
+    );
+
+    // Same again after picking a city, which is the state the menu is usually
+    // reopened from.
+    open_probe_menu(cx);
+    cx.update(|window, cx| window.click("clock-probe-zone-1", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    assert!(!probe_menu_open(cx), "picking a city should close the menu");
+    open_probe_menu(cx);
+    assert!(probe_menu_open(cx));
+    cx.update(|window, cx| window.click("clock-probe-zone-local", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    assert!(
+        !probe_menu_open(cx),
+        "the local row must still activate after a city was picked"
     );
 }

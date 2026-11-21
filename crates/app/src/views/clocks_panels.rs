@@ -7,8 +7,8 @@
 use gpui_kit::component::input::Input;
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, App, ClickEvent, Context, IntoElement, KeyDownEvent, TestSupportExt, Window, div,
-    px, rgba,
+    AnyElement, App, ClickEvent, Context, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    TestSupportExt, Window, div, px, rgba,
 };
 
 use kandrium_core::{Travel, format_offset, resolve_zone};
@@ -310,7 +310,35 @@ pub fn picker(
                 ),
         );
 
-    Some(overlay("clock-picker-overlay", panel.into_any_element()))
+    // Same shape as the app's other modal layers: a press-catching backdrop
+    // sits behind a sibling panel layer. Both occlude the pointer so the cards
+    // underneath stop being hovered too — a plain scrim only blocks clicks,
+    // while occlude() also clears their hover styles and tooltips.
+    let layer = div()
+        .id("clock-picker-layer")
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .id("clock-picker-backdrop")
+                .occlude()
+                .test_support()
+                .absolute()
+                .inset_0()
+                .bg(rgba(0x00000080))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                        this.close_clock_picker(cx)
+                    }),
+                ),
+        )
+        .child(div().occlude().child(panel));
+
+    Some(layer.into_any_element())
 }
 
 // ---------------------------------------------------------------------------
@@ -379,7 +407,17 @@ pub fn probe_zone_menu(
         ));
     }
 
-    let panel = panel_shell("clock-probe-zone-menu", 360., t)
+    let mut panel = panel_shell("clock-probe-zone-menu", 360., t);
+    if let Some(focus) = state.probe_menu_focus.clone() {
+        panel = panel.track_focus(&focus);
+    }
+    let panel = panel
+        .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+            if event.keystroke.key == "escape" {
+                cx.stop_propagation();
+                this.close_clock_probe_menu(cx);
+            }
+        }))
         .child(panel_header("Probe time zone", t))
         .child(list)
         .child(
@@ -429,16 +467,40 @@ pub fn probe_zone_menu(
                         .text(Text::Button)
                         .text_color(t.text_muted)
                         .child("Cancel")
-                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                            this.toggle_clock_probe_menu(cx)
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.toggle_clock_probe_menu(window, cx)
                         })),
                 ),
         );
 
-    Some(overlay(
-        "clock-probe-zone-overlay",
-        panel.into_any_element(),
-    ))
+    // Same modal layer as the picker and inspector: a press-catching backdrop
+    // behind a sibling panel layer, both occluding the pointer so the toolbar
+    // and cards under them stop hovering as well as stop taking clicks.
+    let layer = div()
+        .id("clock-probe-zone-layer")
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .id("clock-probe-zone-backdrop")
+                .occlude()
+                .test_support()
+                .absolute()
+                .inset_0()
+                .bg(rgba(0x00000080))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                        this.close_clock_probe_menu(cx)
+                    }),
+                ),
+        )
+        .child(div().occlude().child(panel));
+
+    Some(layer.into_any_element())
 }
 
 fn probe_zone_row(
@@ -658,7 +720,32 @@ pub fn inspector(
                 }),
         );
 
-    Some(overlay("clock-inspector-overlay", panel.into_any_element()))
+    // Same modal layer as the picker: a press-catching backdrop sits behind a
+    // sibling panel layer, and both occlude the pointer so the cards under
+    // them stop hovering as well as stop taking clicks.
+    let layer = div()
+        .id("clock-inspector-layer")
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .id("clock-inspector-backdrop")
+                .occlude()
+                .test_support()
+                .absolute()
+                .inset_0()
+                .bg(rgba(0x00000080))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _window, cx| this.close_inspector(cx)),
+                ),
+        )
+        .child(div().occlude().child(panel));
+
+    Some(layer.into_any_element())
 }
 
 fn section_label(label: &str, t: &Tokens) -> AnyElement {
