@@ -8,3 +8,6 @@ Planly.app/
 
 # Planning docs and editor state stay local; nothing under .trae is tracked.
 .trae/
+
+# Code-review plugin scratch space.
+.review-tmp/
