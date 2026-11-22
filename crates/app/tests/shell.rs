@@ -2357,6 +2357,10 @@ fn archived_tab_lists_and_restores(cx: &mut TestAppContext) {
             "Archived must share the board tabs' height"
         );
         assert!(
+            window.try_find("board-task-count").is_none(),
+            "no board is selected on the archive page, so there is no task count"
+        );
+        assert!(
             window.find(format!("archive-row-{}", card.id)).visible(),
             "the archived card is listed"
         );
@@ -2372,6 +2376,25 @@ fn archived_tab_lists_and_restores(cx: &mut TestAppContext) {
         assert!(
             window.find("archive-board-filter-menu").visible(),
             "the filter opens its list"
+        );
+    });
+    // The trigger toggles: a second click closes the menu instead of
+    // reopening it.
+    cx.update(|window, cx| window.click("archive-board-filter", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, _cx| {
+        assert!(
+            window.try_find("archive-board-filter-menu").is_none(),
+            "a second click on the trigger closes the filter menu"
+        );
+    });
+    // Reopen it for the overlay checks below.
+    cx.update(|window, cx| window.click("archive-board-filter", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, _cx| {
+        assert!(
+            window.find("archive-board-filter-menu").visible(),
+            "the trigger reopens the filter menu"
         );
     });
     // The menu overlays: the table must stay where it is while it is open.
@@ -2408,6 +2431,63 @@ fn archived_tab_lists_and_restores(cx: &mut TestAppContext) {
         assert!(
             window.find("archive-empty").visible(),
             "an empty archive shows its empty state"
+        );
+    });
+}
+
+/// Clicking Archived while the page is showing returns to the board tab that
+/// was selected when it was opened, and board tabs keep switching normally.
+#[gpui::test]
+fn archived_tab_toggles_back_to_the_previous_board(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded_db(dir.path());
+    cx.update(gpui_kit::init);
+
+    let (_view, cx) =
+        cx.add_window_view(|_window, _cx| AppShell::with_store(Store::open_path(path.clone())));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    // Select Work so the round trip cannot pass by landing on the default.
+    cx.update(|window, cx| window.click("board-tab-board_work", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, _cx| {
+        assert!(
+            window.find("board-column-col_work_todo").visible(),
+            "the Work board is open"
+        );
+    });
+
+    cx.update(|window, cx| window.click("board-tab-archived", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, _cx| {
+        assert!(window.find("archive-view").visible(), "Archived is showing");
+    });
+
+    // A second click returns to Work, not the first board.
+    cx.update(|window, cx| window.click("board-tab-archived", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, _cx| {
+        assert!(
+            window.try_find("archive-view").is_none(),
+            "a second click leaves Archived"
+        );
+        assert!(
+            window.find("board-column-col_work_todo").visible(),
+            "the previous board tab is restored"
+        );
+        assert!(
+            window.try_find("board-column-col_career_todo").is_none(),
+            "the restored tab is not the default board"
+        );
+    });
+
+    // Plain navigation between boards still works after the round trip.
+    cx.update(|window, cx| window.click("board-tab-board_life", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, _cx| {
+        assert!(
+            window.find("board-column-col_life_todo").visible(),
+            "board tabs still switch boards"
         );
     });
 }
@@ -2717,12 +2797,17 @@ fn board_strip_keeps_the_search_and_archived_at_minimum_width(cx: &mut TestAppCo
     cx.update(|window, _cx| {
         let strip = window.find("board-tabs").bounds();
         let tabs = window.find("board-tab-list").bounds();
+        let count = window.find("board-task-count").bounds();
         let search = window.find("board-search").bounds();
         let divider = window.find("board-tab-divider").bounds();
         let archived = window.find("board-tab-archived").bounds();
-        assert_eq!(strip.size.height, px(40.), "the strip height is fixed");
-        // The right group reads left to right: tabs | search | divider |
-        // Archived, with the search anchored to the right edge.
+        assert_eq!(strip.size.height, px(38.), "the strip height is fixed");
+        assert!(
+            count.right() <= search.left(),
+            "the task count sits immediately left of the search: count {count:?}, search {search:?}"
+        );
+        // The right group reads left to right: tabs | count | search | divider
+        // | Archived, with the search anchored to the right edge.
         assert!(
             tabs.right() <= search.left(),
             "the search sits right of the tabs: tabs {tabs:?}, search {search:?}"

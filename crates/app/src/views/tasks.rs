@@ -130,6 +130,13 @@ pub struct Search<'a> {
     pub query: &'a str,
 }
 
+/// The Archived page's presence in the strip: whether it is selected, and the
+/// controls it contributes to the row (count, board filter, search).
+pub struct StripArchive {
+    pub selected: bool,
+    pub controls: Option<AnyElement>,
+}
+
 /// The board tab strip. The active board carries its card count, the tabs own
 /// the left, and the right edge is a fixed group of search, divider and
 /// Archived so the entry never reads as another board.
@@ -141,13 +148,15 @@ pub fn tabs_strip(
     tabs: &[Board],
     active_id: Option<&str>,
     active_cards: usize,
-    archive_selected: bool,
+    archive: StripArchive,
     search: Search<'_>,
     t: &Tokens,
     cx: &mut Context<AppShell>,
 ) -> impl IntoElement {
     let tokens = *t;
     let query = search.query;
+    let archive_selected = archive.selected;
+    let archive_controls = archive.controls;
     // The card search belongs to boards only; the Archived page hides it.
     let search_field = (!archive_selected).then(|| {
         div()
@@ -187,7 +196,7 @@ pub fn tabs_strip(
         .id("board-tabs")
         .test_support()
         .w_full()
-        .h(px(40.))
+        .h(px(38.))
         .px(px(14.))
         .flex()
         .items_center()
@@ -229,23 +238,32 @@ pub fn tabs_strip(
                             el.hover(move |style| style.bg(tokens.hover))
                         })
                         .child(board.title.clone())
-                        .when(selected, |el| {
-                            el.child(
-                                div()
-                                    .text(Text::Micro)
-                                    .text_color(t.text_faint)
-                                    .child(active_cards.to_string()),
-                            )
-                        })
                         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                             this.open_board(&id, window, cx);
                         }))
                 })),
         )
-        // The right group is fixed: search, divider, Archived. The tab
-        // cluster above gives up width instead, so this group always reads
-        // right-aligned and never gets pushed past the strip's edge.
+        // The flexible gap owns every spare pixel: the tab cluster keeps the
+        // left, and the right group hugs the right edge.
         .child(div().flex_1())
+        // Archived shares this row: its controls (count, board filter, search)
+        // sit as one group immediately left of the divider and the Archived
+        // entry, so the left half of the row is empty space.
+        .children(archive_controls)
+        .children((!archive_selected).then(|| {
+            div()
+                .id("board-task-count")
+                .test_support()
+                .flex_shrink_0()
+                .mr(px(10.))
+                .text(Text::Small)
+                .text_color(t.text_muted)
+                .child(match active_cards {
+                    1 => "1 task".to_string(),
+                    count => format!("{count} tasks"),
+                })
+                .into_any_element()
+        }))
         .children(search_field)
         .child(
             div()

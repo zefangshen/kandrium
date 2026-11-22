@@ -227,6 +227,9 @@ pub struct AppShell {
     card_confirm_focus: Option<FocusHandle>,
     /// Archived tab selection and the page rows.
     showing_archive: bool,
+    /// Board tab that was selected when Archived was opened, restored when the
+    /// Archived entry is clicked again.
+    archive_return_board: Option<String>,
     archive: Option<archive::ArchiveState>,
     archive_cards: Option<Vec<ArchivedCard>>,
     archive_error: Option<String>,
@@ -372,6 +375,7 @@ impl AppShell {
             card_confirm: None,
             card_confirm_focus: None,
             showing_archive: settings.tasks_archive(),
+            archive_return_board: None,
             archive: None,
             archive_cards: None,
             archive_error: None,
@@ -1353,9 +1357,17 @@ impl AppShell {
         }
     }
 
-    /// Show the Archived page instead of a board.
+    /// Show the Archived page instead of a board. The entry toggles: clicking
+    /// it while the page is showing returns to the board tab that was selected
+    /// when Archived was opened.
     pub(crate) fn open_archive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.showing_archive {
+            let board = self
+                .archive_return_board
+                .clone()
+                .or_else(|| self.active_board_id.clone())
+                .unwrap_or_else(|| ALL_BOARD_ID.to_string());
+            self.open_board(&board, window, cx);
             return;
         }
         // The board strip and its search unmount here; leaving focus on them
@@ -1365,6 +1377,11 @@ impl AppShell {
         self.cancel_add_card(cx);
         self.clear_drag_state();
         self.card_menu = None;
+        self.archive_return_board = Some(
+            self.active_board_id
+                .clone()
+                .unwrap_or_else(|| ALL_BOARD_ID.to_string()),
+        );
         self.showing_archive = true;
         self.ensure_archive(window, cx);
         self.persist_settings();
@@ -6417,7 +6434,10 @@ impl AppShell {
             let tabs = tasks::task_tabs(&self.boards, None);
             let state = self.archive.as_ref().expect("archive state");
             let cards = self.archive_cards.as_deref().unwrap_or(&[]);
-            let page = archive::archive_view(
+            let page = archive::archive_view(cards, state, &t, cx);
+            // The archive's count, board filter and search ride in the tab
+            // strip so Archived shares the 38 px toolbar with the boards.
+            let controls = archive::archive_controls(
                 cards,
                 &self.boards,
                 state,
@@ -6435,7 +6455,10 @@ impl AppShell {
                     &tabs,
                     None,
                     0,
-                    true,
+                    tasks::StripArchive {
+                        selected: true,
+                        controls: Some(controls),
+                    },
                     tasks::Search {
                         input: &search,
                         query: "",
@@ -6505,7 +6528,10 @@ impl AppShell {
                 &tabs,
                 self.active_board_id.as_deref(),
                 active_cards,
-                false,
+                tasks::StripArchive {
+                    selected: false,
+                    controls: None,
+                },
                 tasks::Search {
                     input: &search,
                     query: &query,
@@ -6644,6 +6670,11 @@ fn now_unix() -> u64 {
 
 impl AppShell {
     /// The archive board-filter menu, floated at the root over the table.
+    ///
+    /// The dismiss catcher is four strips around the trigger rather than one
+    /// full-window backdrop, so presses on the trigger itself still reach it:
+    /// the control toggles the menu closed instead of closing it here and
+    /// immediately reopening it on release.
     fn archive_filter_layer(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.showing_archive {
             return None;
@@ -6654,6 +6685,8 @@ impl AppShell {
         }
         let anchor = (*self.archive_filter_anchor.borrow())?;
         let viewport = window.viewport_size();
+        let anchor_right = anchor.origin.x + anchor.size.width;
+        let anchor_bottom = anchor.origin.y + anchor.size.height;
         let panel = archive::filter_menu_panel(
             anchor,
             &self.boards,
@@ -6678,15 +6711,46 @@ impl AppShell {
                 }))
                 .child(
                     div()
-                        .id("archive-board-filter-catcher")
-                        .test_support()
+                        .id("archive-board-filter-catchers")
                         .absolute()
                         .inset_0()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                this.close_archive_filter(cx)
-                            }),
+                        .children(
+                            [
+                                (px(0.), px(0.), viewport.width, anchor.origin.y),
+                                (
+                                    px(0.),
+                                    anchor_bottom,
+                                    viewport.width,
+                                    viewport.height - anchor_bottom,
+                                ),
+                                (px(0.), anchor.origin.y, anchor.origin.x, anchor.size.height),
+                                (
+                                    anchor_right,
+                                    anchor.origin.y,
+                                    viewport.width - anchor_right,
+                                    anchor.size.height,
+                                ),
+                            ]
+                            .into_iter()
+                            .enumerate()
+                            .map(
+                                |(index, (left, top, width, height))| {
+                                    div()
+                                        .id(("archive-board-filter-catcher", index))
+                                        .test_support()
+                                        .absolute()
+                                        .left(left)
+                                        .top(top)
+                                        .w(width)
+                                        .h(height)
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                this.close_archive_filter(cx)
+                                            }),
+                                        )
+                                },
+                            ),
                         ),
                 )
                 .child(panel)

@@ -28,6 +28,10 @@ const W_COLUMN: f32 = 120.0;
 const W_ARCHIVED: f32 = 170.0;
 const W_DUE: f32 = 100.0;
 const W_ACTIONS: f32 = 76.0;
+/// Width of the board-filter trigger in the Archived row. It fits the longest
+/// label the control can show ("All Boards") plus the chevron at 13 px, with a
+/// little room spare; longer board names are ellipsised.
+const W_BOARD_FILTER: f32 = 110.0;
 /// Every column, its gaps and the scrollbar lane.
 const MIN_TABLE_W: f32 =
     CARD_MIN_W + W_LABELS + W_BOARD + W_COLUMN + W_ARCHIVED + W_DUE + W_ACTIONS + 7.0 * 8.0 + 16.0;
@@ -53,9 +57,41 @@ impl ArchiveState {
     }
 }
 
-/// The archive page body. `anchor` receives the board-filter trigger's window
-/// bounds, which the root-level overlay uses to float the filter menu.
-pub fn archive_view(
+/// Cards matching the archive query and board filter, before sorting.
+fn matched<'a>(
+    cards: &'a [ArchivedCard],
+    board_filter: &str,
+    query: &str,
+) -> Vec<&'a ArchivedCard> {
+    cards
+        .iter()
+        .filter(|card| {
+            (query.is_empty() || card.title.to_lowercase().contains(query))
+                && (board_filter == "all" || card.board_id == board_filter)
+        })
+        .collect()
+}
+
+fn filter_label(boards: &[Board], board_filter: &str) -> String {
+    if board_filter == "all" {
+        "All Boards".to_string()
+    } else {
+        boards
+            .iter()
+            .find(|board| board.id == board_filter)
+            .map(|board| board.title.clone())
+            .unwrap_or_else(|| board_filter.to_string())
+    }
+}
+
+/// The archive controls, rendered into the Tasks tab strip so Archived shares
+/// the toolbar with the boards. Left to right: the filtered count, the board
+/// filter trigger, then the search field. They sit before the strip's flexible
+/// gap, so the Archived entry keeps the right end of the row.
+///
+/// `anchor` receives the trigger's window bounds, which the root-level overlay
+/// uses to float the filter menu.
+pub fn archive_controls(
     cards: &[ArchivedCard],
     boards: &[Board],
     state: &ArchiveState,
@@ -64,14 +100,88 @@ pub fn archive_view(
     cx: &mut Context<AppShell>,
 ) -> AnyElement {
     let query = state.search.read(cx).value().trim().to_lowercase();
-    let filter = state.board_filter.clone();
-    let mut filtered: Vec<&ArchivedCard> = cards
-        .iter()
-        .filter(|card| {
-            (query.is_empty() || card.title.to_lowercase().contains(&query))
-                && (filter == "all" || card.board_id == filter)
-        })
-        .collect();
+    let count = matched(cards, &state.board_filter, &query).len();
+
+    div()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .child(
+            div()
+                .id("archive-count")
+                .test_support()
+                .flex_shrink_0()
+                .text(Text::Small)
+                .text_color(t.text_muted)
+                .child(format!("{count} card{}", if count == 1 { "" } else { "s" })),
+        )
+        .child(
+            div()
+                .id("archive-board-filter")
+                .test_support()
+                .relative()
+                .h(px(26.))
+                .w(px(W_BOARD_FILTER))
+                .flex_shrink_0()
+                .overflow_hidden()
+                .px(px(8.))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.))
+                .rounded(px(5.))
+                .bg(t.field)
+                .border_1()
+                .border_color(t.border)
+                .cursor_pointer()
+                .text(Text::Body)
+                .text_color(t.text)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .truncate()
+                        .child(filter_label(boards, &state.board_filter)),
+                )
+                .child(icon(Icon::ChevronDown, 12., t.text_muted))
+                .child({
+                    // The menu is an overlay at the app root, so the trigger
+                    // publishes its window bounds for anchoring.
+                    let anchor = anchor.clone();
+                    canvas(
+                        move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| {
+                            *anchor.borrow_mut() = Some(bounds);
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .inset_0()
+                })
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.toggle_archive_filter(window, cx)
+                })),
+        )
+        .child(div().w(px(200.)).flex_shrink_0().child(
+            crate::views::field_input(&state.search, t).prefix(icon(
+                Icon::Search,
+                11.,
+                t.text_faint,
+            )),
+        ))
+        .into_any_element()
+}
+
+/// The archive page body: the sticky table header and the filtered rows. The
+/// toolbar controls live in the Tasks tab strip above this view, so the table
+/// starts directly under it.
+pub fn archive_view(
+    cards: &[ArchivedCard],
+    state: &ArchiveState,
+    t: &Tokens,
+    cx: &mut Context<AppShell>,
+) -> AnyElement {
+    let query = state.search.read(cx).value().trim().to_lowercase();
+    let mut filtered = matched(cards, &state.board_filter, &query);
     filtered.sort_by(|a, b| {
         let order = a.archived_at.cmp(&b.archived_at);
         if state.sort_newest {
@@ -80,81 +190,6 @@ pub fn archive_view(
             order
         }
     });
-    let count = filtered.len();
-
-    let filter_label = if filter == "all" {
-        "All Boards".to_string()
-    } else {
-        boards
-            .iter()
-            .find(|board| board.id == filter)
-            .map(|board| board.title.clone())
-            .unwrap_or_else(|| filter.clone())
-    };
-
-    let toolbar =
-        div()
-            .id("archive-toolbar")
-            .test_support()
-            .h(px(40.))
-            .px(px(30.))
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .border_b_1()
-            .border_color(t.border)
-            .child(div().w(px(260.)).child(
-                crate::views::field_input(&state.search, t).prefix(icon(
-                    Icon::Search,
-                    12.,
-                    t.text_faint,
-                )),
-            ))
-            .child(
-                div()
-                    .id("archive-board-filter")
-                    .test_support()
-                    .relative()
-                    .h(px(26.))
-                    .min_w(px(140.))
-                    .px(px(8.))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(8.))
-                    .rounded(px(5.))
-                    .bg(t.field)
-                    .border_1()
-                    .border_color(t.border)
-                    .cursor_pointer()
-                    .text(Text::Body)
-                    .text_color(t.text)
-                    .child(filter_label)
-                    .child(icon(Icon::ChevronDown, 12., t.text_muted))
-                    .child({
-                        // The menu is an overlay at the app root, so the trigger
-                        // publishes its window bounds for anchoring.
-                        let anchor = anchor.clone();
-                        canvas(
-                            move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| {
-                                *anchor.borrow_mut() = Some(bounds);
-                            },
-                            |_, _, _, _| {},
-                        )
-                        .absolute()
-                        .inset_0()
-                    })
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.toggle_archive_filter(window, cx)
-                    })),
-            )
-            .child(div().flex_1())
-            .child(
-                div()
-                    .text(Text::SmallStrong)
-                    .text_color(t.text_faint)
-                    .child(format!("{count} card{}", if count == 1 { "" } else { "s" })),
-            );
 
     let table_header = div()
         .h(px(HEADER_H))
@@ -206,7 +241,6 @@ pub fn archive_view(
         .size_full()
         .flex()
         .flex_col()
-        .child(toolbar)
         // One inset for the sticky header and the rows, matching the 30 px
         // page gutters of Notes and Documents.
         .child(
