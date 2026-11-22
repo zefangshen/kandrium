@@ -24,13 +24,15 @@
 //! behave identically. The egui snap-back flight has no gpui counterpart and
 //! is deliberately omitted.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    Animation, AnimationExt, AnyElement, ClickEvent, Context, DragMoveEvent, Entity, FocusHandle,
-    IntoElement, KeyDownEvent, Render, TestSupportExt, Window, div, px,
+    Animation, AnimationExt, AnyElement, Bounds, ClickEvent, Context, DragMoveEvent, Entity,
+    FocusHandle, IntoElement, KeyDownEvent, Pixels, Render, TestSupportExt, Window, div, px,
 };
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -94,16 +96,16 @@ pub struct CityPeople {
 
 /// Which sub-view the Clocks body shows.
 ///
-/// The People tab is a cross-city roster; Cities is the card grid that has
+/// The Colleagues tab is a cross-city roster; Cities is the card grid that has
 /// always been the section's default, so the grid stays the landing view.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ClocksTab {
-    People,
+    Colleagues,
     #[default]
     Cities,
 }
 
-/// One row of the People tab: a person's tie to one saved city.
+/// One row of the Colleagues tab: a person's tie to one saved city.
 ///
 /// A person is tied to their home city and, while a trip is active, to the
 /// destination city too. Every tie is its own row, so the same name can occur
@@ -162,7 +164,7 @@ pub struct RenameState {
     pub last: Entity<InputState>,
 }
 
-/// Add-person form opened from the People tab: a name split into three fields
+/// Add-colleague form opened from the Colleagues tab: a name split into three fields
 /// and one city, which becomes the person's home clock.
 pub struct PersonFormState {
     pub first: Entity<InputState>,
@@ -175,11 +177,48 @@ pub struct PersonFormState {
     pub error: Option<String>,
 }
 
+/// Edit-colleague modal opened by clicking a name on the Colleagues tab. The
+/// three name fields are pre-filled from the stored display name and the city
+/// from the person's home clock. The modal can also move the home city and
+/// start a trip in the same save.
+pub struct PersonEditState {
+    pub person_id: String,
+    /// Focus target for the panel itself, so Esc works before any field is
+    /// clicked and after a floating list closes.
+    pub focus: FocusHandle,
+    pub first: Entity<InputState>,
+    pub middle: Entity<InputState>,
+    pub last: Entity<InputState>,
+    /// Search value of the home-city dropdown, seeded with the home city's
+    /// name so the list opens on the current pick.
+    pub city: Entity<InputState>,
+    /// Zone picked from the home dropdown, pre-filled from the home clock.
+    pub zone: Option<String>,
+    /// Whether the home-city dropdown list is expanded.
+    pub home_open: bool,
+    /// Whether the trip-destination dropdown list is expanded.
+    pub travel_open: bool,
+    /// Window bounds of each dropdown trigger, published by the modal and read
+    /// by the root-level floating list so it can sit under the trigger.
+    pub home_anchor: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    pub travel_anchor: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    /// Search value of the trip-destination dropdown.
+    pub travel_search: Entity<InputState>,
+    /// Zone picked for a new trip; `None` means the save only edits the person.
+    pub travel: Option<String>,
+    /// First day in the trip destination (`YYYY-MM-DD`, destination local).
+    pub trip_start: Entity<InputState>,
+    /// Return day; ignored when the trip is open-ended.
+    pub trip_end: Entity<InputState>,
+    pub trip_open_ended: bool,
+    pub error: Option<String>,
+}
+
 /// A person's name as the inspector edits it: first and last are required,
 /// middle is optional.
 ///
 /// Only [`NameParts::display`] is stored (`persons.name`), so the database,
-/// core APIs, MCP output, avatars, the card people row and the People tab all
+/// core APIs, MCP output, avatars, the card people row and the Colleagues tab all
 /// keep reading one display string; the split is an input model, not a schema
 /// change.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -322,8 +361,10 @@ pub struct ClockState {
     pub zones: Vec<String>,
     pub picker: Option<PickerState>,
     pub inspector: Option<InspectorState>,
-    /// Add-person modal opened from the People tab's action button.
+    /// Add-colleague modal opened from the Colleagues tab's action button.
     pub person_form: Option<PersonFormState>,
+    /// Edit-colleague modal opened by clicking a name on the roster.
+    pub person_edit: Option<PersonEditState>,
     pub form: Option<FormState>,
     pub confirm: Option<ConfirmState>,
     pub drag: Option<DragState>,
@@ -354,6 +395,7 @@ impl ClockState {
             picker: None,
             inspector: None,
             person_form: None,
+            person_edit: None,
             form: None,
             confirm: None,
             drag: None,
@@ -697,9 +739,9 @@ pub fn city_people(
     }
 }
 
-/// Every person's tie to every saved city at `instant`, ready for the People
-/// tab. A resident is one row for their home city; a running trip adds a
-/// second row for the destination, marked `visiting`.
+/// Every person's tie to every saved city at `instant`, ready for the
+/// Colleagues tab. A resident is one row for their home city; a running trip
+/// adds a second row for the destination, marked `visiting`.
 pub fn roster_rows(
     clocks: &[ClockEntry],
     travels: &[Travel],
@@ -876,6 +918,18 @@ pub fn picker_rows(zones: &[String], query: &str) -> Vec<String> {
         .collect()
 }
 
+/// Picker rows for the add-colleague form: the zones already on the page come
+/// first, then the rest, and each group keeps `zones` order. Grouping happens
+/// before the 200-row cap so a saved zone can never be cut off, and the query
+/// still filters both groups.
+pub fn saved_first_rows(entries: &[ClockEntry], zones: &[String], query: &str) -> Vec<String> {
+    let (saved, rest): (Vec<&String>, Vec<&String>) = zones
+        .iter()
+        .filter(|zone| zone_matches(zone, query))
+        .partition(|zone| zone_is_added(entries, zone));
+    saved.into_iter().chain(rest).take(200).cloned().collect()
+}
+
 pub fn zone_is_added(entries: &[ClockEntry], zone: &str) -> bool {
     entries.iter().any(|entry| entry.tz_identifier == zone)
 }
@@ -970,7 +1024,7 @@ pub fn clocks_view(
     }
 
     let body = match state.tab {
-        ClocksTab::People => people_panel(state, use_24h, t),
+        ClocksTab::Colleagues => people_panel(state, use_24h, t, cx),
         ClocksTab::Cities => {
             if state.entries.is_empty() {
                 empty_state(t, cx)
@@ -990,6 +1044,9 @@ pub fn clocks_view(
         page = page.child(panel);
     }
     if let Some(panel) = clocks_panels::person_form(state, t, window, cx) {
+        page = page.child(panel);
+    }
+    if let Some(panel) = clocks_panels::person_edit(state, t, cx) {
         page = page.child(panel);
     }
     if let Some(panel) = clocks_panels::form(state, t, window, cx) {
@@ -1012,8 +1069,7 @@ fn ensure_search_input(
     if let Some(input) = &state.search_input {
         return input.clone();
     }
-    let input =
-        cx.new(|cx| InputState::new(window, cx).placeholder("Search cities, zones or people"));
+    let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search cities or colleagues"));
     // The grid filters from `ClockState::search`, so mirror every keystroke.
     cx.observe(&input, |this: &mut AppShell, input, cx| {
         let value = input.read(cx).value().to_string();
@@ -1054,7 +1110,7 @@ fn ensure_probe_input(
 }
 
 /// The toolbar search names what the active tab filters: cities and people on
-/// the grid, people and their cities on the roster.
+/// the grid, colleagues and their cities on the roster.
 fn sync_search_placeholder(
     state: &mut ClockState,
     input: &Entity<InputState>,
@@ -1062,8 +1118,8 @@ fn sync_search_placeholder(
     cx: &mut Context<AppShell>,
 ) {
     let desired = match state.tab {
-        ClocksTab::People => "Search people or cities",
-        ClocksTab::Cities => "Search cities, zones or people",
+        ClocksTab::Colleagues => "Search colleagues or cities",
+        ClocksTab::Cities => "Search cities or colleagues",
     };
     if state.search_placeholder == desired {
         return;
@@ -1109,24 +1165,51 @@ fn toolbar(
         .test_support()
         .w_full()
         .flex_shrink_0()
-        .h(px(46.))
+        // Matches the section tab strips elsewhere (Projects, Knowledge,
+        // Tasks) so the second nav row is one height across sections.
+        .h(px(38.))
         .px(px(20.))
         .flex()
         .items_center()
         .gap(px(10.))
         .border_b_1()
         .border_color(t.border)
-        // The People/Cities tabs replace the old title and saved count: the
-        // section nav already says "Clocks", and the active tab carries the
-        // count, exactly like the Tasks board strip.
+        // The Colleagues/Cities tabs replace the old title and saved count: the
+        // section nav already says "Clocks", and the active tab's total sits
+        // left of the search, exactly like the Tasks board strip.
         .child(header_tabs(state, t, cx))
         .child(probe_control(state, probe_input, compact, t, cx))
         .child(div().flex_1())
+        .child({
+            let (count, singular, plural) = match state.tab {
+                ClocksTab::Colleagues => (
+                    state
+                        .entries
+                        .iter()
+                        .map(|entry| entry.people.len())
+                        .sum::<usize>(),
+                    "colleague",
+                    "colleagues",
+                ),
+                ClocksTab::Cities => (state.entries.len(), "city", "cities"),
+            };
+            div()
+                .id("clocks-tab-count")
+                .test_support()
+                .flex_shrink_0()
+                .text(Text::Small)
+                .text_color(t.text_muted)
+                .child(if count == 1 {
+                    format!("1 {singular}")
+                } else {
+                    format!("{count} {plural}")
+                })
+        })
         .child(
             div()
                 .id("clocks-search")
                 .test_support()
-                .w(px(if compact { 150. } else { 200. }))
+                .w(px(if compact { 168. } else { 224. }))
                 .child(crate::views::field_input(search_input, t).prefix(icon(
                     Icon::Search,
                     11.,
@@ -1138,11 +1221,11 @@ fn toolbar(
         .into_any_element()
 }
 
-/// The header action follows the tab: the People roster adds a person, the
-/// city grid keeps adding a city.
+/// The header action follows the tab: the Colleagues roster adds a colleague,
+/// the city grid keeps adding a city.
 fn primary_action(tab: ClocksTab, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
     let (id, label) = match tab {
-        ClocksTab::People => ("clocks-add-person", "Add person"),
+        ClocksTab::Colleagues => ("clocks-add-colleague", "Add colleague"),
         ClocksTab::Cities => ("clocks-add-city", "Add city"),
     };
     div()
@@ -1170,7 +1253,7 @@ fn primary_action(tab: ClocksTab, t: &Tokens, cx: &mut Context<AppShell>) -> Any
         .child(label)
         .on_click(
             cx.listener(move |this, _: &ClickEvent, window, cx| match tab {
-                ClocksTab::People => this.open_person_form(window, cx),
+                ClocksTab::Colleagues => this.open_person_form(window, cx),
                 ClocksTab::Cities => this.open_clock_picker(window, cx),
             }),
         )
@@ -1329,12 +1412,11 @@ fn unit_chip(label: &'static str, selected: bool, t: &Tokens) -> AnyElement {
         .into_any_element()
 }
 
-/// The People/Cities tabs that now open the Clocks header row. Mirrors the
+/// The Colleagues/Cities tabs that now open the Clocks header row. Mirrors the
 /// Tasks board strip (`tasks::tabs_strip`): same 26 px tabs, shrinking
-/// scrollable cluster, count on the selected tab only, and a hover wash on
-/// the others.
+/// scrollable cluster, and a hover wash on the unselected tab. Counts live in
+/// the toolbar, not in the pills.
 fn header_tabs(state: &ClockState, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
-    let people: usize = state.entries.iter().map(|entry| entry.people.len()).sum();
     div()
         .id("clocks-tabs")
         .test_support()
@@ -1346,18 +1428,16 @@ fn header_tabs(state: &ClockState, t: &Tokens, cx: &mut Context<AppShell>) -> An
         .min_w(px(0.))
         .overflow_x_scroll()
         .child(clocks_tab(
-            "clocks-tab-people",
-            "People",
-            people,
-            state.tab == ClocksTab::People,
-            ClocksTab::People,
+            "clocks-tab-colleagues",
+            "Colleagues",
+            state.tab == ClocksTab::Colleagues,
+            ClocksTab::Colleagues,
             t,
             cx,
         ))
         .child(clocks_tab(
             "clocks-tab-cities",
             "Cities",
-            state.entries.len(),
             state.tab == ClocksTab::Cities,
             ClocksTab::Cities,
             t,
@@ -1369,7 +1449,6 @@ fn header_tabs(state: &ClockState, t: &Tokens, cx: &mut Context<AppShell>) -> An
 fn clocks_tab(
     id: &'static str,
     label: &'static str,
-    count: usize,
     selected: bool,
     tab: ClocksTab,
     t: &Tokens,
@@ -1394,14 +1473,6 @@ fn clocks_tab(
             el.hover(move |style| style.bg(tokens.hover))
         })
         .child(label)
-        .when(selected, |el| {
-            el.child(
-                div()
-                    .text(Text::Micro)
-                    .text_color(t.text_faint)
-                    .child(count.to_string()),
-            )
-        })
         .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
             this.clocks.tab = tab;
             this.clocks.clear_drag();
@@ -1410,26 +1481,14 @@ fn clocks_tab(
         .into_any_element()
 }
 
-/// Distinct people and distinct cities among the roster rows, so the summary
-/// always matches what the table lists (a traveller appears twice, in two
-/// cities, and counts once as a person).
-fn roster_summary(rows: &[RosterRow]) -> (usize, usize) {
-    let people = rows
-        .iter()
-        .map(|row| row.person_id.as_str())
-        .collect::<std::collections::BTreeSet<_>>()
-        .len();
-    let cities = rows
-        .iter()
-        .map(|row| row.city.as_str())
-        .collect::<std::collections::BTreeSet<_>>()
-        .len();
-    (people, cities)
-}
-
 /// Everyone attached to a saved city, one row per tie, with the local clock
 /// and the difference from the viewer's zone.
-fn people_panel(state: &ClockState, use_24h: bool, t: &Tokens) -> AnyElement {
+fn people_panel(
+    state: &ClockState,
+    use_24h: bool,
+    t: &Tokens,
+    cx: &mut Context<AppShell>,
+) -> AnyElement {
     let all = roster_rows(
         &state.entries,
         &state.travels,
@@ -1457,13 +1516,8 @@ fn people_panel(state: &ClockState, use_24h: bool, t: &Tokens) -> AnyElement {
         return no_people_match(&state.search, t);
     }
 
-    // Both totals describe the rows on screen: a person home and travelling
-    // occupies two rows and two cities, and a filtered list reports only what
-    // it shows.
-    let (people, cities) = roster_summary(&rows);
-
     let mut list = div()
-        .id("clocks-people-list")
+        .id("clocks-colleagues-list")
         .test_support()
         .flex()
         .flex_col()
@@ -1475,11 +1529,11 @@ fn people_panel(state: &ClockState, use_24h: bool, t: &Tokens) -> AnyElement {
         if index > 0 {
             list = list.child(div().h(px(1.)).bg(t.divider));
         }
-        list = list.child(roster_row(row, t));
+        list = list.child(roster_row(row, t, cx));
     }
 
     div()
-        .id("clocks-people")
+        .id("clocks-colleagues")
         .test_support()
         .flex_1()
         .min_h_0()
@@ -1494,26 +1548,13 @@ fn people_panel(state: &ClockState, use_24h: bool, t: &Tokens) -> AnyElement {
             div()
                 .flex()
                 .items_center()
-                .gap(px(6.))
-                .text(Text::Small)
-                .text_color(t.text_faint)
-                .child(format!(
-                    "{people} {} across {cities} {}",
-                    if people == 1 { "person" } else { "people" },
-                    if cities == 1 { "city" } else { "cities" },
-                )),
-        )
-        .child(
-            div()
-                .flex()
-                .items_center()
                 .gap(px(12.))
                 .px(px(12.))
                 .pb(px(6.))
                 .text(Text::Label)
                 .text_color(t.text_faint)
                 .child(div().w(px(24.)))
-                .child(div().flex_1().child("PERSON"))
+                .child(div().flex_1().child("COLLEAGUE"))
                 .child(div().w(px(130.)).child("CITY"))
                 .child(div().w(px(84.)).child("LOCAL TIME"))
                 .child(div().w(px(84.)).child("VS LOCAL")),
@@ -1522,11 +1563,13 @@ fn people_panel(state: &ClockState, use_24h: bool, t: &Tokens) -> AnyElement {
         .into_any_element()
 }
 
-fn roster_row(row: &RosterRow, t: &Tokens) -> AnyElement {
+fn roster_row(row: &RosterRow, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
     let clock = match row.text.period.as_ref() {
         Some(period) => format!("{} {}", row.text.time, period),
         None => row.text.time.clone(),
     };
+    let tokens = *t;
+    let person_id = row.person_id.clone();
     div()
         .id(format!("clock-person-{}-{}", row.person_id, row.clock_id))
         .test_support()
@@ -1535,56 +1578,76 @@ fn roster_row(row: &RosterRow, t: &Tokens) -> AnyElement {
         .flex()
         .items_center()
         .gap(px(12.))
+        // The avatar and name are one hit area: clicking a colleague opens the
+        // edit modal, so the name reads as an editable row rather than plain
+        // text. The pencil is the affordance; the hover tint confirms it.
         .child(
             div()
-                .size(px(24.))
-                .rounded(px(12.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(t.field)
-                .border_1()
-                .border_color(if row.visiting {
-                    t.accent_line
-                } else {
-                    t.divider
-                })
-                .text(Text::Micro)
-                .text_color(if row.visiting {
-                    t.accent_text
-                } else {
-                    t.text_muted
-                })
-                .child(initials(&row.name)),
-        )
-        .child(
-            div()
+                .id(format!("clock-person-open-{}", row.person_id))
+                .test_support()
                 .flex_1()
-                .min_w_0()
+                .min_w(px(0.))
                 .flex()
                 .items_center()
-                .gap(px(6.))
+                .gap(px(12.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .hover(move |style| style.bg(tokens.hover))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.open_person_edit(&person_id, window, cx)
+                }))
                 .child(
                     div()
-                        .text(Text::Strong)
-                        .text_color(t.text)
-                        .truncate()
-                        .child(row.name.clone()),
+                        .size(px(24.))
+                        .rounded(px(12.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(t.field)
+                        .border_1()
+                        .border_color(if row.visiting {
+                            t.accent_line
+                        } else {
+                            t.divider
+                        })
+                        .text(Text::Micro)
+                        .text_color(if row.visiting {
+                            t.accent_text
+                        } else {
+                            t.text_muted
+                        })
+                        .child(initials(&row.name)),
                 )
-                .when(row.visiting, |el| {
-                    el.child(
-                        div()
-                            .h(px(16.))
-                            .px(px(5.))
-                            .flex()
-                            .items_center()
-                            .rounded(px(3.))
-                            .bg(t.accent_soft)
-                            .text(Text::Micro)
-                            .text_color(t.accent_text)
-                            .child("visiting"),
-                    )
-                }),
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(
+                            div()
+                                .text(Text::Strong)
+                                .text_color(t.text)
+                                .truncate()
+                                .child(row.name.clone()),
+                        )
+                        .when(row.visiting, |el| {
+                            el.child(
+                                div()
+                                    .h(px(16.))
+                                    .px(px(5.))
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(3.))
+                                    .bg(t.accent_soft)
+                                    .text(Text::Micro)
+                                    .text_color(t.accent_text)
+                                    .child("visiting"),
+                            )
+                        })
+                        .child(icon(Icon::Pencil, 11., t.text_faint)),
+                ),
         )
         .child(
             div()
@@ -1615,7 +1678,7 @@ fn roster_row(row: &RosterRow, t: &Tokens) -> AnyElement {
 
 fn empty_people(t: &Tokens) -> AnyElement {
     div()
-        .id("clocks-people-empty")
+        .id("clocks-colleagues-empty")
         .test_support()
         .flex_1()
         .min_h_0()
@@ -1638,7 +1701,7 @@ fn empty_people(t: &Tokens) -> AnyElement {
                     div()
                         .text(Text::Strong)
                         .text_color(t.text)
-                        .child("No people yet"),
+                        .child("No colleagues yet"),
                 )
                 .child(
                     div()
@@ -1652,10 +1715,10 @@ fn empty_people(t: &Tokens) -> AnyElement {
 }
 
 /// Roster search that matched nobody. Kept distinct from [`empty_people`] so
-/// "no people yet" and "no match for this query" never read the same.
+/// "no colleagues yet" and "no match for this query" never read the same.
 fn no_people_match(query: &str, t: &Tokens) -> AnyElement {
     div()
-        .id("clocks-people-none")
+        .id("clocks-colleagues-none")
         .test_support()
         .flex_1()
         .min_h_0()
@@ -1674,12 +1737,10 @@ fn no_people_match(query: &str, t: &Tokens) -> AnyElement {
                 .border_1()
                 .border_color(t.border)
                 .child(icon(Icon::Search, 24., t.text_faint))
-                .child(
-                    div()
-                        .text(Text::Strong)
-                        .text_color(t.text)
-                        .child(format!("No people match \u{201c}{}\u{201d}", query.trim())),
-                )
+                .child(div().text(Text::Strong).text_color(t.text).child(format!(
+                    "No colleagues match \u{201c}{}\u{201d}",
+                    query.trim()
+                )))
                 .child(
                     div()
                         .text(Text::Small)
@@ -1721,7 +1782,7 @@ fn empty_state(t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
                     div()
                         .text(Text::Small)
                         .text_color(t.text_muted)
-                        .child("Add a city to see its time, residents and travel."),
+                        .child("Add a city to see its time, colleagues and travel."),
                 )
                 .child(
                     div()
@@ -2094,7 +2155,7 @@ fn people_row(people: &CityPeople, t: &Tokens) -> AnyElement {
                     .truncate()
                     .text(Text::Micro)
                     .text_color(t.text_ghost)
-                    .child("No residents"),
+                    .child("No colleagues"),
             )
         })
         .children(
@@ -2326,6 +2387,34 @@ mod tests {
     }
 
     #[test]
+    fn saved_zones_lead_the_person_form_rows() {
+        let entries = vec![
+            entry("a", "Europe/Kyiv", &[]),
+            entry("b", "Asia/Tokyo", &[]),
+        ];
+        let zones =
+            ["Asia/Seoul", "Asia/Tokyo", "Europe/Kyiv", "Europe/Lisbon"].map(str::to_string);
+        // Saved zones first, each group in `zones` order.
+        assert_eq!(
+            saved_first_rows(&entries, &zones, ""),
+            vec!["Asia/Tokyo", "Europe/Kyiv", "Asia/Seoul", "Europe/Lisbon"]
+        );
+        // A query filters both groups and keeps the saved-first grouping.
+        assert_eq!(
+            saved_first_rows(&entries, &zones, "o"),
+            vec!["Asia/Tokyo", "Europe/Kyiv", "Asia/Seoul", "Europe/Lisbon"]
+        );
+        assert_eq!(
+            saved_first_rows(&entries, &zones, "seoul"),
+            vec!["Asia/Seoul"]
+        );
+        assert_eq!(
+            saved_first_rows(&entries, &zones, "lisbon"),
+            vec!["Europe/Lisbon"]
+        );
+    }
+
+    #[test]
     fn instant_falls_back_to_now_and_follows_the_probe() {
         let mut state = ClockState::new();
         let now = Timestamp::from_second(1_700_000_000).expect("valid");
@@ -2484,31 +2573,6 @@ mod tests {
             until_next_travel(&travels, now),
             Some(Duration::from_secs(20) + Duration::from_millis(50))
         );
-    }
-
-    #[test]
-    fn roster_summary_counts_listed_rows() {
-        let row = |person: &str, city: &str| RosterRow {
-            person_id: person.to_string(),
-            name: person.to_string(),
-            clock_id: format!("{person}-{city}"),
-            city: city.to_string(),
-            visiting: false,
-            text: ClockText {
-                time: "9:00".into(),
-                period: None,
-                date: String::new(),
-                offset: String::new(),
-            },
-            delta: 0,
-        };
-        // One person, home plus a trip row: two rows, two cities, one person.
-        let rows = vec![row("ada", "Paris"), row("ada", "Rome")];
-        assert_eq!(roster_summary(&rows), (1, 2));
-        // Two people in the same city: one city.
-        let rows = vec![row("ada", "Paris"), row("grace", "Paris")];
-        assert_eq!(roster_summary(&rows), (2, 1));
-        assert_eq!(roster_summary(&[]), (0, 0));
     }
 
     #[test]

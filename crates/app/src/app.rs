@@ -39,8 +39,10 @@ use crate::views::archive;
 use crate::views::card_modal::{self, EditSession, ModalContext};
 use crate::views::clocks::{
     self, ClockDrag, ClockState, ConfirmKind, ConfirmState, DragState, FormKind, FormState,
-    InspectorState, NameParts, PersonFormState, PickerState, ProbeState, RenameState,
+    InspectorState, NameParts, PersonEditState, PersonFormState, PickerState, ProbeState,
+    RenameState,
 };
+use crate::views::clocks_panels;
 use crate::views::documents::{self, DocDraft, DocDraftKind, DocKind, DocTab};
 use crate::views::documents_pdf;
 use crate::views::projects::{
@@ -4102,7 +4104,7 @@ impl AppShell {
         }
     }
 
-    /// Open the People tab's add-person modal. The city field is a search over
+    /// Open the Colleagues tab's add-colleague modal. The city field is a search over
     /// the IANA zones; picking one that has no clock card yet creates the card
     /// on submit, so the roster can grow without a trip to the Cities tab.
     pub(crate) fn open_person_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4130,6 +4132,300 @@ impl AppShell {
         }
     }
 
+    /// Open the edit-colleague modal from a roster name. The name fields and
+    /// the city come from the person's stored name and home clock.
+    pub(crate) fn open_person_edit(
+        &mut self,
+        person_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(person) = self.clock_person(person_id).cloned() else {
+            return;
+        };
+        let Some(zone) = self
+            .clocks
+            .entry(&person.home_clock_id)
+            .map(|entry| entry.tz_identifier.clone())
+        else {
+            return;
+        };
+        self.clocks.ensure_zones();
+        let parts = NameParts::parse(&person.name);
+        let focus = cx.focus_handle();
+        let first = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("First name")
+                .default_value(parts.first)
+        });
+        let middle = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Middle (optional)")
+                .default_value(parts.middle)
+        });
+        let last = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Last name")
+                .default_value(parts.last)
+        });
+        let city =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search cities or time zones"));
+        let travel_search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search cities or time zones"));
+        let today = jiff::Zoned::now().date();
+        let trip_start = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(today.to_string())
+                .placeholder("YYYY-MM-DD")
+        });
+        let trip_end = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(today.tomorrow().unwrap_or(today).to_string())
+                .placeholder("YYYY-MM-DD")
+        });
+        self.clocks.person_edit = Some(PersonEditState {
+            person_id: person_id.to_string(),
+            focus: focus.clone(),
+            first,
+            middle,
+            last,
+            city,
+            zone: Some(zone),
+            home_open: false,
+            travel_open: false,
+            home_anchor: Rc::new(RefCell::new(None)),
+            travel_anchor: Rc::new(RefCell::new(None)),
+            travel_search,
+            travel: None,
+            trip_start,
+            trip_end,
+            trip_open_ended: false,
+            error: None,
+        });
+        focus.focus(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn close_person_edit(&mut self, cx: &mut Context<Self>) {
+        if self.clocks.person_edit.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn choose_person_edit_zone(
+        &mut self,
+        zone: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(edit) = &mut self.clocks.person_edit {
+            edit.zone = Some(zone.to_string());
+            edit.home_open = false;
+            edit.error = None;
+            edit.focus.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Expand or collapse the home-city dropdown; opening one closes the other
+    /// so the modal never shows two lists at once, and focuses its search so
+    /// Esc reaches the floating list.
+    pub(crate) fn toggle_person_edit_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = &mut self.clocks.person_edit else {
+            return;
+        };
+        let open = !edit.home_open;
+        edit.home_open = open;
+        edit.travel_open = false;
+        if open {
+            edit.city.update(cx, |state, cx| state.focus(window, cx));
+        } else {
+            edit.focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_person_edit_travel(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(edit) = &mut self.clocks.person_edit else {
+            return;
+        };
+        let open = !edit.travel_open;
+        edit.travel_open = open;
+        edit.home_open = false;
+        if open {
+            edit.travel_search
+                .update(cx, |state, cx| state.focus(window, cx));
+        } else {
+            edit.focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Dismiss the floating location list without closing the modal.
+    pub(crate) fn close_person_edit_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(edit) = &mut self.clocks.person_edit {
+            edit.home_open = false;
+            edit.travel_open = false;
+            edit.focus.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn choose_person_edit_travel(
+        &mut self,
+        zone: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(edit) = &mut self.clocks.person_edit {
+            edit.travel = Some(zone.to_string());
+            edit.travel_open = false;
+            edit.error = None;
+            edit.focus.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn toggle_person_edit_trip_open_ended(&mut self, cx: &mut Context<Self>) {
+        if let Some(edit) = &mut self.clocks.person_edit {
+            edit.trip_open_ended = !edit.trip_open_ended;
+            cx.notify();
+        }
+    }
+
+    /// Clock id for a zone, creating the city when it is not on the page yet.
+    /// Shared by the home move and the trip so both follow the add-modal rule.
+    fn clock_for_zone(&mut self, zone: &str) -> Result<String, String> {
+        if let Some(entry) = self
+            .clocks
+            .entries
+            .iter()
+            .find(|entry| entry.tz_identifier == zone)
+        {
+            return Ok(entry.id.clone());
+        }
+        self.store.add_clock(zone)?;
+        self.load_clocks();
+        self.clocks
+            .entries
+            .iter()
+            .find(|entry| entry.tz_identifier == zone)
+            .map(|entry| entry.id.clone())
+            .ok_or_else(|| format!("Could not add {zone}"))
+    }
+
+    fn set_person_edit_error(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        if let Some(edit) = &mut self.clocks.person_edit {
+            edit.error = Some(message.into());
+        }
+        cx.notify();
+    }
+
+    /// Save the edit modal: rename, move the home when the picked city differs,
+    /// then start the optional trip. A zone without a clock card gets one
+    /// first, matching the add modal.
+    pub(crate) fn save_person_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.clocks.person_edit.as_ref() else {
+            return;
+        };
+        let person_id = edit.person_id.clone();
+        let parts = self.name_parts(cx, &edit.first, &edit.middle, &edit.last);
+        let name = parts.display();
+        let zone = edit.zone.clone();
+        let trip = edit.travel.clone();
+        // Any non-empty name saves, matching the inline rename: a legacy
+        // single-word row can change city without inventing a surname.
+        if name.is_empty() {
+            self.set_person_edit_error("A name is required", cx);
+            return;
+        }
+        let Some(zone) = zone else {
+            self.set_person_edit_error("Choose the colleague's city", cx);
+            return;
+        };
+        let Some(home_clock) = self
+            .clock_person(&person_id)
+            .map(|person| person.home_clock_id.clone())
+        else {
+            return;
+        };
+        let target_clock = match self.clock_for_zone(&zone) {
+            Ok(clock) => clock,
+            Err(error) => {
+                self.set_person_edit_error(error, cx);
+                return;
+            }
+        };
+        if let Err(error) = self.store.rename_person(&person_id, &name) {
+            self.set_person_edit_error(error, cx);
+            return;
+        }
+        if target_clock != home_clock
+            && let Err(error) = self.store.relocate_person(&person_id, &target_clock)
+        {
+            self.set_person_edit_error(error, cx);
+            return;
+        }
+        // The home move runs first: relocation cancels trips to the old and
+        // new home, so a trip started before it would be closed immediately.
+        if let Some(destination) = trip
+            && let Err(error) = self.start_person_edit_trip(&person_id, &destination, cx)
+        {
+            self.set_person_edit_error(error, cx);
+            return;
+        }
+        self.clocks.person_edit = None;
+        self.load_clocks();
+        cx.notify();
+    }
+
+    /// Start the trip picked in the edit modal. Reuses the travel form's rules:
+    /// whole days in the destination zone, and `start_travel` for the
+    /// already-in-that-city and overlap checks.
+    fn start_person_edit_trip(
+        &mut self,
+        person_id: &str,
+        destination_zone: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let (start_raw, end_raw, open_ended) = {
+            let Some(edit) = self.clocks.person_edit.as_ref() else {
+                return Ok(());
+            };
+            (
+                edit.trip_start.read(cx).value().trim().to_string(),
+                edit.trip_end.read(cx).value().trim().to_string(),
+                edit.trip_open_ended,
+            )
+        };
+        let destination_clock = self.clock_for_zone(destination_zone)?;
+        let Some(zone) = self
+            .clocks
+            .entry(&destination_clock)
+            .and_then(|entry| entry.zone.clone())
+        else {
+            return Err("That city has no time zone".to_string());
+        };
+        let start = start_raw
+            .parse::<Date>()
+            .map_err(|_| "The start date must be YYYY-MM-DD".to_string())?;
+        let ends_at = if open_ended {
+            None
+        } else {
+            let end = end_raw
+                .parse::<Date>()
+                .map_err(|_| "The end date must be YYYY-MM-DD".to_string())?;
+            Some(day_end_seconds(end, &zone).map_err(|error| error.to_string())?)
+        };
+        let starts_at = day_start_seconds(start, &zone).map_err(|error| error.to_string())?;
+        self.store
+            .start_travel(person_id, &destination_clock, starts_at, ends_at)
+    }
+
     pub(crate) fn choose_person_zone(&mut self, zone: &str, cx: &mut Context<Self>) {
         if let Some(form) = &mut self.clocks.person_form {
             form.zone = Some(zone.to_string());
@@ -4138,7 +4434,7 @@ impl AppShell {
         }
     }
 
-    /// Add the person from the People form. A zone without a clock card gets a
+    /// Add the person from the Colleagues form. A zone without a clock card gets a
     /// clock first, in the same run, so the person always has a home city.
     pub(crate) fn add_person_from_form(&mut self, cx: &mut Context<Self>) {
         let (parts, zone) = {
@@ -4155,7 +4451,7 @@ impl AppShell {
             return;
         }
         let Some(zone) = zone else {
-            self.set_person_form_error("Choose the person's city", cx);
+            self.set_person_form_error("Choose the colleague's city", cx);
             return;
         };
         let clock_id = if let Some(entry) = self
@@ -6981,6 +7277,7 @@ impl Render for AppShell {
         let card_menu = self.card_menu_layer(cx);
         let card_confirm = self.card_confirm_layer(cx);
         let archive_filter = self.archive_filter_layer(window, cx);
+        let person_edit_menu = clocks_panels::person_edit_menu(&self.clocks, window, &t, cx);
         div()
             .id("app-root")
             .relative()
@@ -7010,6 +7307,7 @@ impl Render for AppShell {
             .children(clock_menu)
             .children(flight)
             .children(archive_filter)
+            .children(person_edit_menu)
             .children(card_menu)
             .children(card_confirm)
             // A press anywhere outside the inline title field commits it, the

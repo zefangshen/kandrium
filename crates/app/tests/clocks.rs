@@ -397,7 +397,7 @@ fn clock_inspector_blocks_the_page_and_closes(cx: &mut TestAppContext) {
 }
 
 fn open_people_tab(cx: ClocksUi) {
-    cx.update(|window, cx| window.click("clocks-tab-people", cx));
+    cx.update(|window, cx| window.click("clocks-tab-colleagues", cx));
     cx.update(|window, cx| window.render_frame(cx));
 }
 
@@ -523,11 +523,11 @@ fn person_form_open(cx: ClocksUi) -> bool {
     cx.update(|window, _cx| window.try_find("person-form").is_some())
 }
 
-/// The People tab's action adds a person to a city that has no clock card
+/// The Colleagues tab's action adds a person to a city that has no clock card
 /// yet: the modal creates that city on submit and the roster picks the person
 /// up straight away.
 #[gpui::test]
-fn people_tab_adds_a_person_to_a_new_city(cx: &mut TestAppContext) {
+fn colleagues_tab_adds_a_person_to_a_new_city(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     cx.update(gpui_kit::init);
     let (_shell, cx) = cx
@@ -535,11 +535,21 @@ fn people_tab_adds_a_person_to_a_new_city(cx: &mut TestAppContext) {
     open_clocks(cx);
     open_people_tab(cx);
     assert!(
-        cx.update(|window, _cx| window.try_find("clocks-add-person").is_some()),
-        "the People tab needs its own add action"
+        cx.update(|window, _cx| window.try_find("clocks-add-colleague").is_some()),
+        "the Colleagues tab needs its own add action"
     );
 
-    cx.update(|window, cx| window.click("clocks-add-person", cx));
+    cx.update(|window, _cx| {
+        let tab = window.find("clocks-tab-colleagues").bounds();
+        let count = window.find("clocks-tab-count").bounds();
+        let search = window.find("clocks-search").bounds();
+        assert!(
+            tab.right() <= count.left() && count.right() <= search.left(),
+            "the active tab's count sits left of the search: tab {tab:?}, count {count:?}, search {search:?}"
+        );
+    });
+
+    cx.update(|window, cx| window.click("clocks-add-colleague", cx));
     cx.update(|window, cx| window.render_frame(cx));
     assert!(person_form_open(cx), "the add-person modal should open");
     for id in [
@@ -569,13 +579,192 @@ fn people_tab_adds_a_person_to_a_new_city(cx: &mut TestAppContext) {
 
     assert!(!person_form_open(cx), "submitting closes the modal");
     assert!(
-        cx.update(|window, _cx| window.try_find("clocks-people").is_some()),
+        cx.update(|window, _cx| window.try_find("clocks-colleagues").is_some()),
         "the roster should list the new person"
     );
     assert!(
-        cx.update(|window, _cx| window.try_find("clocks-people-empty").is_none()),
+        cx.update(|window, _cx| window.try_find("clocks-colleagues-empty").is_none()),
         "the empty state should be gone once someone exists"
     );
+}
+
+/// Clicking a colleague's name opens the edit modal with the stored name and
+/// city; one save renames the person, moves the home city and starts a trip.
+#[gpui::test]
+fn clicking_a_colleague_name_edits_name_and_city(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open_path(seeded(dir.path()));
+    let data = store.clock_data().expect("clocks");
+    // The seed holds Kyiv, Tokyo and Los Angeles.
+    let kyiv = data.clocks[0].id.clone();
+    let tokyo = data.clocks[1].id.clone();
+    let los_angeles = data.clocks[2].id.clone();
+    store
+        .add_person(&kyiv, "Grace Brewster Hopper")
+        .expect("grace");
+    let person_id = store
+        .clock_data()
+        .expect("clocks")
+        .people
+        .into_iter()
+        .find(|person| person.name == "Grace Brewster Hopper")
+        .expect("grace")
+        .id;
+
+    cx.update(gpui_kit::init);
+    let (_shell, cx) = cx.add_window_view(|_window, _cx| AppShell::with_store(store));
+    open_clocks(cx);
+    open_people_tab(cx);
+
+    cx.update(|window, cx| window.click(format!("clock-person-open-{person_id}"), cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    for id in [
+        "person-edit-first",
+        "person-edit-middle",
+        "person-edit-last",
+        "person-edit-home-trigger",
+        "person-edit-travel-trigger",
+        "person-edit-save",
+        "person-edit-cancel",
+    ] {
+        assert!(
+            cx.update(|window, _cx| window.try_find(id).is_some()),
+            "the edit modal is missing {id}"
+        );
+    }
+
+    // The footer must be reachable by a hit-tested click, not only by id.
+    cx.update(|window, cx| {
+        let size = window.find("person-edit-cancel").bounds().size;
+        window.click_at(
+            "person-edit-cancel",
+            gpui::point(size.width / 2., size.height / 2.),
+            cx,
+        );
+    });
+    cx.update(|window, cx| window.render_frame(cx));
+    assert!(
+        cx.update(|window, _cx| window.try_find("person-edit").is_none()),
+        "a hit-tested click on Cancel must reach the button"
+    );
+    cx.update(|window, cx| window.click(format!("clock-person-open-{person_id}"), cx));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    // Opening a list floats it over the modal: the panel height is unchanged
+    // and the list renders at the app root, outside the scroll body.
+    let modal_height = cx.update(|window, _cx| window.find("person-edit").bounds().size.height);
+    // The footer must sit inside the panel: a footer painted past the card's
+    // hitbox is unreachable by the pointer.
+    cx.update(|window, _cx| {
+        let panel = window.find("person-edit").bounds();
+        let footer = window.find("person-edit-footer").bounds();
+        assert!(
+            footer.origin.y >= panel.origin.y
+                && footer.origin.y + footer.size.height <= panel.origin.y + panel.size.height,
+            "the footer must stay inside the panel card: panel {panel:?}, footer {footer:?}"
+        );
+    });
+    cx.update(|window, cx| window.click("person-edit-home-trigger", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, _cx| {
+        assert!(
+            window.find("person-edit-home-menu").visible(),
+            "the home list floats over the modal"
+        );
+        assert!(
+            window.try_find("person-edit-menu-layer").is_some(),
+            "the list is rendered at the app root"
+        );
+        assert_eq!(
+            window.find("person-edit").bounds().size.height,
+            modal_height,
+            "an open list must not change the modal height"
+        );
+    });
+    // Esc dismisses the list first, leaving the modal open.
+    cx.update(|window, cx| window.press("escape", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, _cx| {
+        assert!(
+            window.try_find("person-edit-home-menu").is_none(),
+            "Esc closes the floating list"
+        );
+        assert!(
+            window.try_find("person-edit").is_some(),
+            "the modal stays open while a list is dismissed"
+        );
+    });
+
+    // Esc closes the modal without saving.
+    cx.update(|window, cx| window.click("person-edit-first", cx));
+    cx.update(|window, cx| window.press("escape", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    assert!(
+        cx.update(|window, _cx| window.try_find("person-edit").is_none()),
+        "Esc closes the edit modal"
+    );
+    assert_eq!(
+        Store::open_path(dir.path().join("kandrium.db"))
+            .clock_data()
+            .expect("clocks")
+            .people[0]
+            .name,
+        "Grace Brewster Hopper",
+        "Esc must not save"
+    );
+
+    // Reopen: edit the surname, pick a new home from the dropdown and pick a
+    // trip destination from the other dropdown, then Save once.
+    cx.update(|window, cx| window.click(format!("clock-person-open-{person_id}"), cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, cx| window.click("person-edit-last", cx));
+    cx.update(|window, cx| window.press("cmd-a", cx));
+    cx.update(|window, cx| window.input("Hopper-Smith", cx));
+    cx.update(|window, cx| window.click("person-edit-home-trigger", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, cx| window.click("person-edit-home-search", cx));
+    cx.update(|window, cx| window.input("Tokyo", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, cx| window.click("person-edit-home-option-0", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, cx| window.click("person-edit-travel-trigger", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, cx| window.click("person-edit-travel-search", cx));
+    cx.update(|window, cx| window.input("Los Angeles", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, cx| window.click("person-edit-travel-option-0", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, cx| window.click("person-edit-save", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    assert!(
+        cx.update(|window, _cx| window.try_find("person-edit").is_none()),
+        "saving closes the edit modal"
+    );
+    let data = Store::open_path(dir.path().join("kandrium.db"))
+        .clock_data()
+        .expect("clocks");
+    let edited = data
+        .people
+        .into_iter()
+        .find(|person| person.id == person_id)
+        .expect("the person survives the edit");
+    assert_eq!(edited.name, "Grace Brewster Hopper-Smith");
+    assert_eq!(
+        edited.home_clock_id, tokyo,
+        "the picked city becomes the home clock"
+    );
+    assert_ne!(edited.home_clock_id, kyiv);
+    let travel = data
+        .travels
+        .into_iter()
+        .find(|travel| travel.person_id == person_id)
+        .expect("the trip is started in the same save");
+    assert_eq!(
+        travel.destination_clock_id.as_deref(),
+        Some(los_angeles.as_str())
+    );
+    assert_eq!(travel.origin_clock_id.as_deref(), Some(tokyo.as_str()));
 }
 
 /// The toolbar search filters the People roster by name and by city, and
@@ -691,7 +880,7 @@ fn people_tab_shows_its_empty_state(cx: &mut TestAppContext) {
 
     open_people_tab(cx);
     assert!(
-        cx.update(|window, _cx| window.try_find("clocks-people-empty").is_some()),
+        cx.update(|window, _cx| window.try_find("clocks-colleagues-empty").is_some()),
         "an empty roster needs its own empty state"
     );
     assert!(cx.update(|window, _cx| window.try_find("clocks-grid").is_none()));

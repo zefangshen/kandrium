@@ -4,11 +4,14 @@
 //! Every panel renders from [`ClockState`] and sends actions back to
 //! [`AppShell`], which owns the [`crate::store::Store`]. No SQL here.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, App, ClickEvent, Context, Entity, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, TestSupportExt, Window, div, px, rgba,
+    AnyElement, App, Bounds, ClickEvent, Context, Entity, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, Pixels, TestSupportExt, Window, canvas, div, px, rgba,
 };
 
 use kandrium_core::{Travel, format_offset, resolve_zone};
@@ -18,7 +21,7 @@ use crate::assets::{Icon, icon};
 use crate::theme::{Text, TextStyled, Tokens};
 use crate::views::clocks::{
     ClockState, ConfirmKind, FormKind, PersonStatus, PickerTarget, city_label, picker_rows,
-    starts_label, until_label, zone_is_added,
+    saved_first_rows, starts_label, until_label, zone_is_added,
 };
 
 /// Full-section scrim with a centred panel.
@@ -564,10 +567,10 @@ fn probe_zone_row(
 }
 
 // ---------------------------------------------------------------------------
-// Add-person form (People tab)
+// Add-colleague form (Colleagues tab)
 // ---------------------------------------------------------------------------
 
-/// Add a person from the People tab: three name fields plus a searchable city.
+/// Add a colleague from the Colleagues tab: three name fields plus a searchable city.
 /// The city may be one that has no clock card yet; submitting creates that
 /// clock first, so the person always lands on a real city.
 pub fn person_form(
@@ -578,7 +581,9 @@ pub fn person_form(
 ) -> Option<AnyElement> {
     let form = state.person_form.as_ref()?;
     let query = form.city.read(cx).value().to_string();
-    let rows = picker_rows(&state.zones, &query);
+    // Saved zones lead the list, so the cities already on the page are the
+    // first thing offered; search still filters both groups.
+    let rows = saved_first_rows(&state.entries, &state.zones, &query);
 
     let mut list = div()
         .id("person-form-city-list")
@@ -658,7 +663,7 @@ pub fn person_form(
                 this.close_person_form(cx);
             }
         }))
-        .child(panel_header("Add a person", t))
+        .child(panel_header("Add a colleague", t))
         .child(
             div()
                 .w_full()
@@ -699,66 +704,74 @@ pub fn person_form(
                                     .child(kandrium_core::city_name(&zone)),
                             ),
                     )
-                })
-                // Actions sit with the form, above the city list, so they stay
-                // put while the list scrolls and the panel never needs a
-                // clipped footer.
-                .child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .child(div().flex_1())
-                        .child(
-                            div()
-                                .id("person-form-cancel")
-                                .test_support()
-                                .h(px(28.))
-                                .px(px(10.))
-                                .flex()
-                                .items_center()
-                                .rounded(px(t.radius))
-                                .cursor_pointer()
-                                .text(Text::Button)
-                                .text_color(t.text_muted)
-                                .hover(|style| style.bg(t.hover))
-                                .child("Cancel")
-                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                    this.close_person_form(cx)
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id("person-form-submit")
-                                .test_support()
-                                .h(px(28.))
-                                .px(px(10.))
-                                .flex()
-                                .items_center()
-                                .gap(px(5.))
-                                .rounded(px(t.radius))
-                                .bg(t.accent_soft)
-                                .cursor_pointer()
-                                .text(Text::Button)
-                                .text_color(t.accent_text)
-                                .child(icon(Icon::Plus, 13., t.accent_text))
-                                .child("Add person")
-                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                    this.add_person_from_form(cx)
-                                })),
-                        ),
-                )
-                .child(list),
+                }),
         )
+        // The zone list is the only scrolling region and has a fixed height, so
+        // the footer below it is a plain sibling: it can never be pushed past
+        // the panel's max height and lose its hitbox.
+        .child(div().w_full().px(px(16.)).child(list))
         .when_some(form.error.clone(), |el, message| {
             el.child(
                 div()
                     .px(px(16.))
-                    .pb(px(8.))
+                    .pt(px(8.))
                     .child(error_banner(&message, t)),
             )
-        });
+        })
+        .child(
+            div()
+                .id("person-form-footer")
+                .test_support()
+                .w_full()
+                .flex_shrink_0()
+                .mt(px(10.))
+                .px(px(16.))
+                .py(px(12.))
+                .border_t_1()
+                .border_color(t.divider)
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .id("person-form-cancel")
+                        .test_support()
+                        .h(px(28.))
+                        .px(px(10.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(t.radius))
+                        .cursor_pointer()
+                        .text(Text::Button)
+                        .text_color(t.text_muted)
+                        .hover(|style| style.bg(t.hover))
+                        .child("Cancel")
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.close_person_form(cx)
+                        })),
+                )
+                .child(
+                    div()
+                        .id("person-form-submit")
+                        .test_support()
+                        .h(px(28.))
+                        .px(px(10.))
+                        .flex()
+                        .items_center()
+                        .gap(px(5.))
+                        .rounded(px(t.radius))
+                        .bg(t.accent_soft)
+                        .cursor_pointer()
+                        .text(Text::Button)
+                        .text_color(t.accent_text)
+                        .child(icon(Icon::Plus, 13., t.accent_text))
+                        .child("Add colleague")
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.add_person_from_form(cx)
+                        })),
+                ),
+        );
 
     let layer = div()
         .id("person-form-layer")
@@ -778,6 +791,545 @@ pub fn person_form(
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _window, cx| this.close_person_form(cx)),
+                ),
+        )
+        .child(div().occlude().child(panel));
+
+    Some(layer.into_any_element())
+}
+
+// ---------------------------------------------------------------------------
+// Edit-colleague form (Colleagues tab)
+// ---------------------------------------------------------------------------
+
+/// One location dropdown trigger: the current pick plus a canvas that
+/// publishes its window bounds. The list is a root-level floating layer
+/// (`person_edit_menu`), so opening it never changes the modal's height and
+/// the modal's scroll body cannot clip it.
+struct LocationDropdown<'a> {
+    prefix: &'static str,
+    label: &'static str,
+    placeholder: &'static str,
+    selected: Option<&'a str>,
+    anchor: &'a Rc<RefCell<Option<Bounds<Pixels>>>>,
+    helper: &'static str,
+}
+
+fn location_dropdown(
+    dd: LocationDropdown<'_>,
+    state: &ClockState,
+    t: &Tokens,
+    cx: &mut Context<AppShell>,
+    toggle: fn(&mut AppShell, &mut Window, &mut Context<AppShell>),
+) -> AnyElement {
+    let label = dd
+        .selected
+        .map(|zone| {
+            let city = state
+                .entries
+                .iter()
+                .find(|entry| entry.tz_identifier == zone)
+                .map(|entry| entry.city.clone())
+                .unwrap_or_else(|| kandrium_core::city_name(zone));
+            format!("{city} \u{00b7} {zone}")
+        })
+        .unwrap_or_else(|| dd.placeholder.to_string());
+    let has_selection = dd.selected.is_some();
+    let anchor = dd.anchor.clone();
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .child(section_label(dd.label, t))
+        .child(
+            div()
+                .id(format!("{}-trigger", dd.prefix))
+                .test_support()
+                .relative()
+                .h(px(28.))
+                .px(px(8.))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.))
+                .rounded(px(t.radius))
+                .border_1()
+                .border_color(t.border)
+                .bg(t.field)
+                .cursor_pointer()
+                .text(Text::Body)
+                .text_color(if has_selection { t.text } else { t.text_faint })
+                .child(div().flex_1().min_w(px(0.)).truncate().child(label))
+                .child(icon(Icon::ChevronDown, 12., t.text_muted))
+                .on_click(
+                    cx.listener(move |this, _: &ClickEvent, window, cx| toggle(this, window, cx)),
+                )
+                .child(
+                    canvas(
+                        move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| {
+                            *anchor.borrow_mut() = Some(bounds);
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .inset_0(),
+                ),
+        )
+        .child(
+            div()
+                .text(Text::Small)
+                .text_color(t.text_faint)
+                .child(dd.helper),
+        )
+        .into_any_element()
+}
+
+/// The floating location list for the edit modal, rendered at the app root so
+/// it paints above the modal and outside its scroll region. Four catcher
+/// strips around the trigger + list union dismiss on an outside press (the
+/// trigger stays clickable so it toggles), and Esc closes just the list.
+pub fn person_edit_menu(
+    state: &ClockState,
+    window: &Window,
+    t: &Tokens,
+    cx: &mut Context<AppShell>,
+) -> Option<AnyElement> {
+    let edit = state.person_edit.as_ref()?;
+    let choose: fn(&mut AppShell, &str, &mut Window, &mut Context<AppShell>) = if edit.home_open {
+        AppShell::choose_person_edit_zone
+    } else if edit.travel_open {
+        AppShell::choose_person_edit_travel
+    } else {
+        return None;
+    };
+    let (prefix, anchor, search, selected) = if edit.home_open {
+        (
+            "person-edit-home",
+            (*edit.home_anchor.borrow())?,
+            &edit.city,
+            edit.zone.as_deref(),
+        )
+    } else {
+        (
+            "person-edit-travel",
+            (*edit.travel_anchor.borrow())?,
+            &edit.travel_search,
+            edit.travel.as_deref(),
+        )
+    };
+    let viewport = window.viewport_size();
+    let width = anchor.size.width;
+    // Search field + gap + 120 px list + padding and border.
+    let height = px(176.);
+    let x = anchor
+        .origin
+        .x
+        .min(viewport.width - width - px(8.))
+        .max(px(8.));
+    let below = anchor.origin.y + anchor.size.height;
+    let y = if below + height > viewport.height - px(8.) {
+        (anchor.origin.y - height - px(4.)).max(px(8.))
+    } else {
+        below
+    };
+
+    let query = search.read(cx).value().to_string();
+    let rows = saved_first_rows(&state.entries, &state.zones, &query);
+    let mut list = div()
+        .id(format!("{prefix}-list"))
+        .test_support()
+        .h(px(120.))
+        .overflow_y_scroll()
+        .flex()
+        .flex_col();
+    if rows.is_empty() {
+        list = list.child(
+            div()
+                .p(px(10.))
+                .text(Text::Small)
+                .text_color(t.text_muted)
+                .child(format!("No time zones match \u{201c}{query}\u{201d}.")),
+        );
+    } else {
+        for (index, zone) in rows.iter().enumerate() {
+            let saved = zone_is_added(&state.entries, zone);
+            let chosen = selected == Some(zone.as_str());
+            let row = div()
+                .id(format!("{prefix}-option-{index}"))
+                .test_support()
+                .px(px(8.))
+                .py(px(6.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .cursor_pointer()
+                .when(chosen, |el| el.bg(t.selected))
+                .hover(|style| style.bg(t.hover))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text(Text::Body)
+                                .text_color(t.text)
+                                .child(kandrium_core::city_name(zone)),
+                        )
+                        .child(
+                            div()
+                                .text(Text::Small)
+                                .text_color(t.text_faint)
+                                .child(zone.clone()),
+                        ),
+                )
+                .when(saved, |el| {
+                    el.child(
+                        div()
+                            .px(px(6.))
+                            .h(px(18.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(4.))
+                            .bg(t.field)
+                            .text(Text::SmallStrong)
+                            .text_color(t.text_faint)
+                            .child("Saved"),
+                    )
+                });
+            let zone = zone.clone();
+            list = list.child(row.on_click(cx.listener(
+                move |this, _: &ClickEvent, window, cx| choose(this, &zone, window, cx),
+            )));
+        }
+    }
+
+    let menu = div()
+        .id(format!("{prefix}-menu"))
+        .test_support()
+        .absolute()
+        .left(x)
+        .top(y)
+        .w(width)
+        .occlude()
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .p(px(6.))
+        .rounded(px(t.radius))
+        .bg(t.surface_2)
+        .border_1()
+        .border_color(t.border)
+        .child(
+            div()
+                .id(format!("{prefix}-search"))
+                .test_support()
+                .child(Input::new(search)),
+        )
+        .child(list);
+
+    let union_left = x.min(anchor.origin.x);
+    let union_right = (x + width).max(anchor.origin.x + anchor.size.width);
+    let union_top = y.min(anchor.origin.y);
+    let union_bottom = (y + height).max(anchor.origin.y + anchor.size.height);
+
+    Some(
+        div()
+            .id("person-edit-menu-layer")
+            .test_support()
+            .absolute()
+            .inset_0()
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" {
+                    cx.stop_propagation();
+                    this.close_person_edit_menu(window, cx);
+                }
+            }))
+            .children(
+                [
+                    (px(0.), px(0.), viewport.width, union_top),
+                    (
+                        px(0.),
+                        union_bottom,
+                        viewport.width,
+                        viewport.height - union_bottom,
+                    ),
+                    (px(0.), union_top, union_left, union_bottom - union_top),
+                    (
+                        union_right,
+                        union_top,
+                        viewport.width - union_right,
+                        union_bottom - union_top,
+                    ),
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(index, (left, top, width, height))| {
+                    div()
+                        .id(("person-edit-menu-catcher", index))
+                        .test_support()
+                        .absolute()
+                        .left(left)
+                        .top(top)
+                        .w(width)
+                        .h(height)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                this.close_person_edit_menu(window, cx)
+                            }),
+                        )
+                }),
+            )
+            .child(menu)
+            .into_any_element(),
+    )
+}
+
+/// Edit a colleague from the roster: name, home city and an optional new trip,
+/// all in one save. The home city and the trip destination each use a
+/// searchable dropdown with saved zones first; a different home moves the
+/// person (creating the clock when needed), and a trip reuses the same rules
+/// as the travel form (`start_travel`).
+pub fn person_edit(
+    state: &ClockState,
+    t: &Tokens,
+    cx: &mut Context<AppShell>,
+) -> Option<AnyElement> {
+    let edit = state.person_edit.as_ref()?;
+
+    let panel = panel_shell("person-edit", 520., t)
+        .track_focus(&edit.focus)
+        .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+            if event.keystroke.key == "escape" {
+                cx.stop_propagation();
+                this.close_person_edit(cx);
+            }
+        }))
+        .child(panel_header("Edit colleague", t))
+        // Header and footer stay put. The body needs no scroll region: the
+        // location lists float at the app root, so content height is fixed and
+        // the footer always stays inside the panel's hitbox.
+        .child(
+            div()
+                .id("person-edit-body")
+                .test_support()
+                .w_full()
+                .px(px(16.))
+                .py(px(12.))
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .child(section_label("Name", t))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(name_field("person-edit-first", &edit.first))
+                        .child(name_field("person-edit-middle", &edit.middle))
+                        .child(name_field("person-edit-last", &edit.last)),
+                )
+                .child(location_dropdown(
+                    LocationDropdown {
+                        prefix: "person-edit-home",
+                        label: "Home city",
+                        placeholder: "Choose the home city",
+                        selected: edit.zone.as_deref(),
+                        anchor: &edit.home_anchor,
+                        helper: "Saving a different city moves the colleague to that city's card.",
+                    },
+                    state,
+                    t,
+                    cx,
+                    AppShell::toggle_person_edit_home,
+                ))
+                .child(div().mt(px(2.)).border_t_1().border_color(t.divider))
+                .child(section_label("Start a trip", t))
+                .child(
+                    div()
+                        .text(Text::Small)
+                        .text_color(t.text_faint)
+                        .child(
+                            "Optional: pick a destination and the first day there. Leave it on \
+                             \"No trip\" to only edit the colleague.",
+                        ),
+                )
+                .child(location_dropdown(
+                    LocationDropdown {
+                        prefix: "person-edit-travel",
+                        label: "Destination",
+                        placeholder: "No trip",
+                        selected: edit.travel.as_deref(),
+                        anchor: &edit.travel_anchor,
+                        helper: "Dates are destination-local; existing trips and their overlap rules apply.",
+                    },
+                    state,
+                    t,
+                    cx,
+                    AppShell::toggle_person_edit_travel,
+                ))
+                .when(edit.travel.is_some(), |el| {
+                    el.child(
+                        div()
+                            .flex()
+                            // Top-align: Starts carries a hint line under its
+                            // field, and centring would push Ends down.
+                            .items_start()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.))
+                                    .child(section_label("Starts", t))
+                                    .child(Input::new(&edit.trip_start))
+                                    .child(
+                                        div()
+                                            .text(Text::Small)
+                                            .text_color(t.text_faint)
+                                            .child("First day in the destination, from 00:00."),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.))
+                                    .child(section_label("Ends", t))
+                                    .when(edit.trip_open_ended, |el| {
+                                        el.child(
+                                            div()
+                                                .h(px(28.))
+                                                .px(px(8.))
+                                                .flex()
+                                                .items_center()
+                                                .rounded(px(t.radius))
+                                                .bg(t.field)
+                                                .text(Text::Small)
+                                                .text_color(t.text_faint)
+                                                .child("Open-ended"),
+                                        )
+                                    })
+                                    .when(!edit.trip_open_ended, |el| {
+                                        el.child(Input::new(&edit.trip_end))
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("person-edit-trip-open-ended")
+                            .test_support()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .cursor_pointer()
+                            .child(
+                                div()
+                                    .size(px(14.))
+                                    .rounded(px(3.))
+                                    .border_1()
+                                    .border_color(if edit.trip_open_ended {
+                                        t.accent
+                                    } else {
+                                        t.border
+                                    })
+                                    .when(edit.trip_open_ended, |el| el.bg(t.accent_soft))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .when(edit.trip_open_ended, |el| {
+                                        el.child(icon(Icon::Check, 10., t.accent_text))
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text(Text::Small)
+                                    .text_color(t.text_muted)
+                                    .child("Open-ended (no return day)"),
+                            )
+                            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                this.toggle_person_edit_trip_open_ended(cx)
+                            })),
+                    )
+                })
+                .when_some(edit.error.clone(), |el, message| el.child(error_banner(&message, t))),
+        )
+        .child(
+            div()
+                .id("person-edit-footer")
+                .test_support()
+                .w_full()
+                .flex_shrink_0()
+                .mt(px(10.))
+                .px(px(16.))
+                .py(px(12.))
+                .border_t_1()
+                .border_color(t.divider)
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .id("person-edit-cancel")
+                        .test_support()
+                        .h(px(28.))
+                        .px(px(10.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(t.radius))
+                        .cursor_pointer()
+                        .text(Text::Button)
+                        .text_color(t.text_muted)
+                        .hover(|style| style.bg(t.hover))
+                        .child("Cancel")
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.close_person_edit(cx)
+                        })),
+                )
+                .child(
+                    div()
+                        .id("person-edit-save")
+                        .test_support()
+                        .h(px(28.))
+                        .px(px(10.))
+                        .flex()
+                        .items_center()
+                        .gap(px(5.))
+                        .rounded(px(t.radius))
+                        .bg(t.accent_soft)
+                        .cursor_pointer()
+                        .text(Text::Button)
+                        .text_color(t.accent_text)
+                        .child("Save")
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.save_person_edit(cx)
+                        })),
+                ),
+        );
+
+    let layer = div()
+        .id("person-edit-layer")
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .id("person-edit-backdrop")
+                .occlude()
+                .test_support()
+                .absolute()
+                .inset_0()
+                .bg(rgba(0x00000080))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _window, cx| this.close_person_edit(cx)),
                 ),
         )
         .child(div().occlude().child(panel));
@@ -807,7 +1359,7 @@ pub fn inspector(
                 .p(px(10.))
                 .text(Text::Small)
                 .text_color(t.text_faint)
-                .child("No residents yet."),
+                .child("No colleagues yet."),
         );
     }
     for status in &people.residents {
@@ -834,10 +1386,15 @@ pub fn inspector(
                 .text(Text::Small)
                 .text_color(t.text_faint)
                 .child(format!(
-                    "{} \u{00b7} {} \u{00b7} {} residents",
+                    "{} \u{00b7} {} \u{00b7} {} {}",
                     entry.city,
                     entry.tz_identifier,
-                    people.residents.len()
+                    people.residents.len(),
+                    if people.residents.len() == 1 {
+                        "colleague"
+                    } else {
+                        "colleagues"
+                    }
                 )),
         )
         .child(
@@ -845,7 +1402,7 @@ pub fn inspector(
                 .flex()
                 .flex_col()
                 .gap(px(6.))
-                .child(section_label("Residents", t))
+                .child(section_label("Colleagues", t))
                 .child(residents),
         )
         .child(
@@ -1593,7 +2150,7 @@ pub fn confirm(state: &ClockState, t: &Tokens, cx: &mut Context<AppShell>) -> Op
     let message = confirm.message.clone();
     let emphasis = match confirm.kind {
         ConfirmKind::RemoveClock { .. } => "Remove city",
-        ConfirmKind::RemovePerson { .. } => "Remove person",
+        ConfirmKind::RemovePerson { .. } => "Remove colleague",
         ConfirmKind::RemoveTravel { .. } => "Remove trip",
     };
 
