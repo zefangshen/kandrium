@@ -158,7 +158,25 @@ fn people_are_added_renamed_and_removed() {
     );
 
     store.remove_person(&person.id).expect("remove");
+    // Removing only the placement empties the roster; the canonical profile
+    // survives, hidden, and can be shown again.
     assert!(store.clock_data().expect("clocks").people.is_empty());
+    let hidden = store.get_person(&person.id).expect("profile stays");
+    assert_eq!(hidden.name, "Ada Lovelace");
+    assert!(!hidden.in_clocks);
+    assert_eq!(
+        store.list_persons("", "all").expect("people").len(),
+        1,
+        "the person stays in the Network list"
+    );
+
+    store
+        .add_existing_person(&clock_id, &person.id)
+        .expect("place again");
+    let restored = store.clock_data().expect("clocks").people;
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].id, person.id);
+    assert_eq!(restored[0].position, 0, "the same city slot is available");
 }
 
 #[test]
@@ -906,4 +924,94 @@ fn people_tab_lists_every_person_with_their_city(cx: &mut TestAppContext) {
         move |window, _cx| window.try_find(row).is_some()
     });
     assert!(found, "the roster needs a row for {row}");
+}
+
+/// Hiding from the edit modal removes the colleague from the roster and the
+/// city counts while the profile and its slot stay in place; showing them
+/// again restores the same position.
+#[gpui::test]
+fn hiding_from_the_edit_modal_keeps_the_profile(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = seeded(dir.path());
+    let store = Store::open_path(db_path.clone());
+    let kyiv = store.clock_data().expect("clocks").clocks[0].id.clone();
+    store.add_person(&kyiv, "Ada Lovelace").expect("ada");
+    store.add_person(&kyiv, "Grace Hopper").expect("grace");
+    let people = store.clock_data().expect("clocks").people;
+    let ada = people
+        .iter()
+        .find(|person| person.name == "Ada Lovelace")
+        .expect("ada")
+        .clone();
+    let grace = people
+        .iter()
+        .find(|person| person.name == "Grace Hopper")
+        .expect("grace")
+        .clone();
+    assert_eq!(ada.position, 0);
+    assert_eq!(grace.position, 1);
+    let ada_row = format!("clock-person-{}-{kyiv}", ada.id);
+    let grace_row = format!("clock-person-{}-{kyiv}", grace.id);
+
+    cx.update(gpui_kit::init);
+    let (_shell, cx) = cx.add_window_view(|_window, _cx| AppShell::with_store(store));
+    open_clocks(cx);
+    open_people_tab(cx);
+    assert!(cx.update({
+        let row = ada_row.clone();
+        move |window, _cx| window.try_find(row).is_some()
+    }));
+
+    cx.update({
+        let open = format!("clock-person-open-{}", ada.id);
+        move |window, cx| window.click(open, cx)
+    });
+    cx.update(|window, cx| window.render_frame(cx));
+    assert!(
+        cx.update(|window, _cx| window.try_find("person-edit-hide").is_some()),
+        "the edit modal needs the hide action"
+    );
+    cx.update(|window, cx| window.click("person-edit-hide", cx));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    assert!(
+        cx.update(|window, _cx| window.try_find("person-edit").is_none()),
+        "hiding closes the edit modal"
+    );
+    assert!(
+        cx.update({
+            let row = ada_row.clone();
+            move |window, _cx| window.try_find(row).is_none()
+        }),
+        "a hidden person leaves the Clocks roster"
+    );
+    assert!(
+        cx.update({
+            let row = grace_row.clone();
+            move |window, _cx| window.try_find(row).is_some()
+        }),
+        "the other colleague stays on the roster"
+    );
+
+    let reopened = Store::open_path(db_path);
+    let visible = reopened.clock_data().expect("clocks").people;
+    assert_eq!(visible.len(), 1, "hidden people are not in Clocks counts");
+    assert_eq!(visible[0].id, grace.id);
+    assert_eq!(visible[0].position, 1, "hiding keeps the retained slot");
+    let profile = reopened.get_person(&ada.id).expect("profile stays");
+    assert_eq!(profile.name, "Ada Lovelace");
+    assert!(!profile.in_clocks, "the person is hidden, not deleted");
+    assert_eq!(
+        reopened.list_persons("", "all").expect("people").len(),
+        2,
+        "the hidden profile stays in the Network list"
+    );
+
+    reopened.set_person_in_clocks(&ada.id, true).expect("show");
+    let restored = reopened.clock_data().expect("clocks").people;
+    let ada_again = restored
+        .iter()
+        .find(|person| person.id == ada.id)
+        .expect("the person is back");
+    assert_eq!(ada_again.position, 0, "showing restores the same slot");
 }

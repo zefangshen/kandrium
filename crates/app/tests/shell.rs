@@ -45,6 +45,7 @@ fn every_section_renders_its_body(cx: &mut TestAppContext) {
     let expected = [
         (Section::Clocks, "clocks-view"),
         (Section::Wiki, "wiki-view"),
+        (Section::Network, "network-view"),
         (Section::Projects, "projects-view"),
         (Section::Tasks, "board-view"),
     ];
@@ -1467,6 +1468,10 @@ fn the_titlebar_clock_fits_the_minimum_window_width(cx: &mut TestAppContext) {
         assert!(
             window.find("titlebar-drag-right").bounds().size.width > px(0.),
             "the empty drag stretch must survive at 940 px"
+        );
+        assert!(
+            window.find("nav-network").visible(),
+            "all five section chips fit at 940 px"
         );
         assert!(window.find("titlebar-clock-text").visible());
     });

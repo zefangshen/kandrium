@@ -1256,6 +1256,15 @@ pub fn person_edit(
                             })),
                     )
                 })
+                .child(
+                    div()
+                        .text(Text::Small)
+                        .text_color(t.text_faint)
+                        .child(
+                            "Hiding removes the colleague from Clocks; the profile stays in \
+                             Network.",
+                        ),
+                )
                 .when_some(edit.error.clone(), |el, message| el.child(error_banner(&message, t))),
         )
         .child(
@@ -1272,6 +1281,45 @@ pub fn person_edit(
                 .flex()
                 .items_center()
                 .gap(px(8.))
+                .child(
+                    div()
+                        .id("person-edit-open-network")
+                        .test_support()
+                        .h(px(28.))
+                        .px(px(10.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(t.radius))
+                        .cursor_pointer()
+                        .text(Text::Button)
+                        .text_color(t.text_muted)
+                        .hover(|style| style.bg(t.hover))
+                        .child("Open in Network")
+                        .on_click(cx.listener({
+                            let person_id = edit.person_id.clone();
+                            move |this, _: &ClickEvent, window, cx| {
+                                this.open_person_in_network(&person_id, window, cx)
+                            }
+                        })),
+                )
+                .child(
+                    div()
+                        .id("person-edit-hide")
+                        .test_support()
+                        .h(px(28.))
+                        .px(px(10.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(t.radius))
+                        .cursor_pointer()
+                        .text(Text::Button)
+                        .text_color(t.text_muted)
+                        .hover(|style| style.bg(t.hover))
+                        .child("Hide from Clocks")
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.hide_person_edit(cx)
+                        })),
+                )
                 .child(div().flex_1())
                 .child(
                     div()
@@ -2150,7 +2198,7 @@ pub fn confirm(state: &ClockState, t: &Tokens, cx: &mut Context<AppShell>) -> Op
     let message = confirm.message.clone();
     let emphasis = match confirm.kind {
         ConfirmKind::RemoveClock { .. } => "Remove city",
-        ConfirmKind::RemovePerson { .. } => "Remove colleague",
+        ConfirmKind::RemovePerson { .. } => "Remove from Clocks",
         ConfirmKind::RemoveTravel { .. } => "Remove trip",
     };
 

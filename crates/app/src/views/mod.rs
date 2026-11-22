@@ -16,6 +16,7 @@ pub mod clocks;
 pub mod clocks_panels;
 pub mod documents;
 pub mod documents_pdf;
+pub mod network;
 pub mod notes;
 pub mod placeholder;
 pub mod projects;

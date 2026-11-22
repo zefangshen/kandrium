@@ -35,7 +35,7 @@ Workspace, edition 2024. All comments, identifiers, and docs are in English.
   `archive_all_cards` remains. Preserve the names and schemas of the exposed
   tools — MCP clients may depend on them.
 - The SQL schema lives as numbered files at the workspace root
-  (`migrations/0001_initial_schema.sql` … `migrations/0011_project_paths.sql`)
+  (`migrations/0001_initial_schema.sql` … `migrations/0014_person_identity.sql`)
   and is embedded into `crates/core/src/db/migrations.rs` at compile time.
   `db::run_schema` (crate-private) applies them through `rusqlite_migration` via
   `PRAGMA user_version`. v1 (`0001_initial_schema.sql`) is identical in shape
@@ -51,7 +51,13 @@ Workspace, edition 2024. All comments, identifiers, and docs are in English.
   free-form `projects.source` reference (local path or URL) shown on the
   Overview; v8–v10 add the Clocks data (`clocks`, then `clock_people`, then
   `clock_travels`); v11 adds `project_paths`, the folder references attached to
-  a project. The `db` module is split into `db/connection.rs` (open/path/legacy
+  a project; v12–v13 add the wiki index and run history; v14 adds the canonical
+  `persons` / `person_expertise` and the Clocks placement/travel tables
+  (`clock_placements`, `clock_travels_v2`). v14 backfills every
+  `clock_people` row into a person + placement with the same id and copies
+  travels, then `clock_people` / `clock_travels` are frozen and never read or
+  written; a later migration may drop them. The `db` module is split into
+  `db/connection.rs` (open/path/legacy
   migration/bootstrap), `db/migrations.rs` (schema + runner), and
   `db/backup.rs` (snapshots + integrity). `db::bootstrap(&mut Connection,
   &Path)` is the single boot path for both front-ends: it runs `db::prepare`
@@ -209,7 +215,8 @@ shell (screen capture blocked) — ask the user to confirm UI changes.
   highlighting grammar comes from the `tree-sitter-markdown` feature on
   `gpui-component`; do not add unrelated grammar features without a reason.
 - The shell is one `AppShell` entity (`crates/app/src/app.rs`). Sections
-  are Tasks, Clocks, Wiki (compiled pages + sources) and Projects. Views live under
+  are Tasks, Projects, Wiki (compiled pages + sources), Network (people) and
+  Clocks. Views live under
   `crates/app/src/views/`, reusable widgets under `src/views/` helpers or
   `gpui-kit`.
 - Every screen keeps its data in the shell's `Store`

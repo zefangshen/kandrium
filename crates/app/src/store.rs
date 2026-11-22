@@ -18,19 +18,22 @@ use std::path::{Path, PathBuf};
 use kandrium_core::documents::{self, AnnotationDoc, DocEntry};
 use kandrium_core::fsutil::FsEntry;
 use kandrium_core::notes::{self, NoteEntry};
+use kandrium_core::persons::{
+    self as person_data, NewPerson, Person as PersonProfile, PersonPatch,
+};
 use kandrium_core::projects::{
     self as project_data, Project, ProjectFolder, ProjectNode, ProjectPath, ProjectSummary,
 };
 use kandrium_core::wiki::{self, LintFinding, SourceDelta, SourceState, WikiStatus};
 use kandrium_core::{
     ArchivedCard, Board, BoardWithColumns, CardStatus, Clock, CreateCardBody, Person,
-    ProjectChoice, Travel, add_clock, add_person, bootstrap, delete_card, end_travel,
-    extend_travel, get_all_board, get_board_readonly, get_project_board, list_all_people,
-    list_all_travels, list_archived_cards, list_boards, list_clocks, list_project_choices,
-    migrate_legacy_db, move_all_card, move_area_card, move_card_to_board, move_card_to_status,
-    open_db, open_db_readonly, relocate_person, remove_clock, remove_person, remove_travel,
-    rename_card, rename_person, reorder_clocks, resolve_db_path, set_card_archived, set_card_area,
-    set_card_project, start_travel, update_card,
+    ProjectChoice, Travel, add_clock, add_existing_person, add_person, bootstrap, delete_card,
+    delete_person, end_travel, extend_travel, get_all_board, get_board_readonly, get_project_board,
+    list_all_people, list_all_travels, list_archived_cards, list_boards, list_clocks,
+    list_project_choices, migrate_legacy_db, move_all_card, move_area_card, move_card_to_board,
+    move_card_to_status, open_db, open_db_readonly, relocate_person, remove_clock, remove_person,
+    remove_travel, rename_card, rename_person, reorder_clocks, resolve_db_path, set_card_archived,
+    set_card_area, set_card_project, start_travel, update_card,
 };
 
 /// One snapshot of the Clocks data. The app caches this so the minute tick
@@ -211,6 +214,34 @@ impl Store {
         })
     }
 
+    /// Person id → (clock id, IANA zone) for every placement, including the
+    /// ones retained by people hidden from Clocks. `clock_data` only reports
+    /// visible people, so Network needs this to show the retained city.
+    pub fn person_placements(&self) -> StoreResult<HashMap<String, (String, String)>> {
+        let db = self.conn()?;
+        let mut stmt = db
+            .prepare(
+                "SELECT c.person_id, c.clock_id, cl.tz_identifier \
+                 FROM clock_placements c \
+                 JOIN clocks cl ON cl.id = c.clock_id",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (row.get::<_, String>(1)?, row.get::<_, String>(2)?),
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut placements = HashMap::new();
+        for row in rows {
+            let (person_id, placement) = row.map_err(|e| e.to_string())?;
+            placements.insert(person_id, placement);
+        }
+        Ok(placements)
+    }
+
     /// Add a saved city. Core rejects duplicates.
     pub fn add_clock(&self, tz_identifier: &str) -> StoreResult<()> {
         self.app_run("add_clock", |db, _| {
@@ -292,6 +323,63 @@ impl Store {
     pub fn remove_travel(&self, travel_id: &str) -> StoreResult<()> {
         self.app_run("remove_travel", |db, _| {
             remove_travel(db, travel_id).map_err(|e| e.to_string())
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Network people — the canonical profile behind a Clocks placement. These
+    // wrap `kandrium_core::persons`; Clocks keeps its own placement wrappers
+    // above.
+    // -----------------------------------------------------------------------
+
+    /// Every person matching `query` and `status` (`"all"` for every status).
+    /// Hidden people are included, so the Network list can show them.
+    pub fn list_persons(&self, query: &str, status: &str) -> StoreResult<Vec<PersonProfile>> {
+        person_data::list_persons(self.conn()?, query, status).map_err(|e| e.to_string())
+    }
+
+    pub fn get_person(&self, id: &str) -> StoreResult<PersonProfile> {
+        person_data::get_person(self.conn()?, id).map_err(|e| e.to_string())
+    }
+
+    pub fn create_person(&self, input: NewPerson) -> StoreResult<PersonProfile> {
+        self.app_run("create_person", |db, _| {
+            person_data::create_person(db, input).map_err(|e| e.to_string())
+        })
+    }
+
+    pub fn update_person(&self, id: &str, patch: PersonPatch) -> StoreResult<PersonProfile> {
+        self.app_run("update_person", |db, _| {
+            person_data::update_person(db, id, patch).map_err(|e| e.to_string())
+        })
+    }
+
+    /// Show or hide a person on Clocks. Hiding keeps the placement and trips;
+    /// showing needs a retained placement.
+    pub fn set_person_in_clocks(&self, id: &str, on: bool) -> StoreResult<()> {
+        self.app_run("set_person_in_clocks", |db, _| {
+            person_data::set_person_in_clocks(db, id, on).map_err(|e| e.to_string())
+        })
+    }
+
+    /// Delete the canonical person; placements and trips cascade.
+    pub fn delete_person(&self, id: &str) -> StoreResult<()> {
+        self.app_run("delete_person", |db, _| {
+            delete_person(db, id).map_err(|e| e.to_string())
+        })
+    }
+
+    /// Distinct expertise labels for the Network autocomplete.
+    pub fn expertise_labels(&self) -> StoreResult<Vec<String>> {
+        person_data::expertise_labels(self.conn()?).map_err(|e| e.to_string())
+    }
+
+    /// Place an existing Network person on a city and show them on Clocks.
+    pub fn add_existing_person(&self, clock_id: &str, person_id: &str) -> StoreResult<()> {
+        self.app_run("add_existing_person", |db, _| {
+            add_existing_person(db, clock_id, person_id)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         })
     }
 

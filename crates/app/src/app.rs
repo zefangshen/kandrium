@@ -21,6 +21,7 @@ use gpui_kit::{
 use jiff::Timestamp;
 use jiff::civil::Date;
 use kandrium_core::documents::{AnnotationDoc, AnnotationKind, import_file, new_annotation};
+use kandrium_core::persons::{NewPerson, Person as PersonProfile, PersonPatch};
 use kandrium_core::{
     ALL_BOARD_ID, ArchivedCard, Board, BoardWithColumns, Card, CardStatus, CreateCardBody, Person,
     ProjectChoice, Travel, day_end_seconds, day_start_seconds, probe_date, project_dir,
@@ -45,6 +46,9 @@ use crate::views::clocks::{
 use crate::views::clocks_panels;
 use crate::views::documents::{self, DocDraft, DocDraftKind, DocKind, DocTab};
 use crate::views::documents_pdf;
+use crate::views::network::{
+    self, NetworkCity, NetworkConfirm, NetworkEditor, NetworkPlacement, NetworkState, PlacePicker,
+};
 use crate::views::projects::{
     self, DetailEditor, DocDraft as ProjectDocDraft, DocDraftKind as ProjectDocDraftKind,
     ProjectConfirm, ProjectConfirmKind, ProjectDocTab, ProjectDraft, ProjectDraftKind, ProjectTab,
@@ -60,21 +64,23 @@ use crate::views::{
 };
 use crate::vim;
 
-/// The four top-level sections. [`Section::ALL`] fixes the segmented
+/// The five top-level sections. [`Section::ALL`] fixes the segmented
 /// control's order, which deliberately differs from the egui app.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
     Tasks,
     Clocks,
     Wiki,
+    Network,
     Projects,
 }
 
 impl Section {
-    pub const ALL: [Section; 4] = [
+    pub const ALL: [Section; 5] = [
         Section::Tasks,
         Section::Projects,
         Section::Wiki,
+        Section::Network,
         Section::Clocks,
     ];
 
@@ -83,6 +89,7 @@ impl Section {
             Section::Tasks => "Tasks",
             Section::Clocks => "Clocks",
             Section::Wiki => "Knowledge",
+            Section::Network => "Network",
             Section::Projects => "Projects",
         }
     }
@@ -93,6 +100,7 @@ impl Section {
             Section::Tasks => "tasks",
             Section::Clocks => "clocks",
             Section::Wiki => "wiki",
+            Section::Network => "network",
             Section::Projects => "projects",
         }
     }
@@ -118,6 +126,7 @@ impl Section {
             Section::Tasks => Icon::SquareKanban,
             Section::Clocks => Icon::Globe,
             Section::Wiki => Icon::Folder,
+            Section::Network => Icon::Users,
             Section::Projects => Icon::FolderKanban,
         }
     }
@@ -254,6 +263,7 @@ pub struct AppShell {
     clock_tick_running: Option<u64>,
     /// The merged Wiki section: both trees, the shared tab order and the split.
     wiki: WikiState,
+    pub(crate) network: NetworkState,
     projects: ProjectsState,
     /// Board currently loaded into `board` for a project's Tasks tab. Kept
     /// separate from `active_board_id` so the Tasks section is unaffected.
@@ -392,6 +402,7 @@ impl AppShell {
             clock_tick: 0,
             clock_tick_running: None,
             wiki,
+            network: NetworkState::new(),
             projects,
             project_board_shown: None,
             settings,
@@ -414,6 +425,7 @@ impl AppShell {
                 shell.reload_wiki_status();
             }
             Section::Projects => shell.load_projects(),
+            Section::Network => shell.load_network(),
             _ => {}
         }
         shell
@@ -817,6 +829,7 @@ impl AppShell {
                 self.reload_wiki_status();
             }
             Section::Projects => self.load_projects(),
+            Section::Network => self.load_network(),
         }
         if section != Section::Clocks {
             self.invalidate_clock_tick();
@@ -3593,7 +3606,7 @@ impl AppShell {
     fn wants_watcher(&self) -> bool {
         matches!(
             self.section,
-            Section::Tasks | Section::Clocks | Section::Projects | Section::Wiki
+            Section::Tasks | Section::Clocks | Section::Projects | Section::Wiki | Section::Network
         )
     }
 
@@ -3689,6 +3702,7 @@ impl AppShell {
                 self.load_documents();
                 self.reload_wiki_status();
             }
+            Section::Network => self.load_network(),
         }
         cx.notify();
     }
@@ -4212,6 +4226,23 @@ impl AppShell {
         }
     }
 
+    /// Hide the colleague being edited from Clocks. The placement and trips
+    /// stay, so the profile keeps its slot and the city is not renumbered.
+    pub(crate) fn hide_person_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.clocks.person_edit.as_ref() else {
+            return;
+        };
+        let person_id = edit.person_id.clone();
+        match self.store.set_person_in_clocks(&person_id, false) {
+            Ok(()) => {
+                self.clocks.person_edit = None;
+                self.load_clocks();
+            }
+            Err(error) => self.set_person_edit_error(error, cx),
+        }
+        cx.notify();
+    }
+
     pub(crate) fn choose_person_edit_zone(
         &mut self,
         zone: &str,
@@ -4424,6 +4455,666 @@ impl AppShell {
         let starts_at = day_start_seconds(start, &zone).map_err(|error| error.to_string())?;
         self.store
             .start_travel(person_id, &destination_clock, starts_at, ends_at)
+    }
+
+    // -----------------------------------------------------------------------
+    // Network section
+    // -----------------------------------------------------------------------
+
+    pub(crate) fn load_network(&mut self) {
+        self.reload_network_people();
+        self.network.expertise_labels = self.store.expertise_labels().unwrap_or_default();
+        match self.store.clock_data() {
+            Ok(data) => {
+                self.network.cities = data
+                    .clocks
+                    .iter()
+                    .map(|clock| NetworkCity {
+                        id: clock.id.clone(),
+                        zone: clock.tz_identifier.clone(),
+                        city: kandrium_core::city_name(&clock.tz_identifier),
+                    })
+                    .collect();
+            }
+            Err(error) => self.network.error = Some(error),
+        }
+        match self.store.person_placements() {
+            Ok(placements) => {
+                self.network.placements = placements
+                    .into_iter()
+                    .map(|(person_id, (clock_id, zone))| {
+                        (
+                            person_id,
+                            NetworkPlacement {
+                                clock_id,
+                                city: kandrium_core::city_name(&zone),
+                            },
+                        )
+                    })
+                    .collect();
+            }
+            Err(error) => self.network.error = Some(error),
+        }
+        let mut zones: Vec<String> = self
+            .network
+            .cities
+            .iter()
+            .map(|city| city.zone.clone())
+            .collect();
+        for zone in kandrium_core::clocks::available_zones() {
+            if !zones.contains(&zone) {
+                zones.push(zone);
+            }
+        }
+        self.network.zones = zones;
+    }
+
+    /// Re-run the search/status query without touching the selection or an open
+    /// editor. Called by the search field observer and by filter changes.
+    pub(crate) fn reload_network_people(&mut self) {
+        match self
+            .store
+            .list_persons(&self.network.query, &self.network.status_filter)
+        {
+            Ok(people) => {
+                if let Some(selected) = &self.network.selected
+                    && !people.iter().any(|person| &person.id == selected)
+                {
+                    self.network.selected = None;
+                }
+                self.network.people = people;
+                self.network.error = None;
+            }
+            Err(error) => {
+                self.network.people.clear();
+                self.network.error = Some(error);
+            }
+        }
+    }
+
+    pub(crate) fn select_network_person(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.network.selected = Some(id.to_string());
+        self.network.status_menu = false;
+        self.network.expertise_menu = false;
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_network_status_menu(&mut self, cx: &mut Context<Self>) {
+        self.network.status_menu = !self.network.status_menu;
+        self.network.expertise_menu = false;
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_network_expertise_menu(&mut self, cx: &mut Context<Self>) {
+        self.network.expertise_menu = !self.network.expertise_menu;
+        self.network.status_menu = false;
+        cx.notify();
+    }
+
+    pub(crate) fn set_network_status_filter(&mut self, status: &str, cx: &mut Context<Self>) {
+        self.network.status_filter = status.to_string();
+        self.network.status_menu = false;
+        self.reload_network_people();
+        cx.notify();
+    }
+
+    pub(crate) fn set_network_expertise_filter(
+        &mut self,
+        label: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.network.expertise_filter = label;
+        self.network.expertise_menu = false;
+        cx.notify();
+    }
+
+    fn network_person(&self, id: &str) -> Option<&PersonProfile> {
+        self.network.people.iter().find(|person| person.id == id)
+    }
+
+    /// Open the create (`None`) or edit modal. The modal owns every profile
+    /// field; saving runs through `kandrium_core::persons` validation.
+    pub(crate) fn open_network_editor(
+        &mut self,
+        person_id: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let profile = person_id.and_then(|id| self.store.get_person(id).ok());
+        let person_id = profile.as_ref().map(|person| person.id.clone());
+        let parts = NameParts::parse(
+            profile
+                .as_ref()
+                .map(|person| person.name.as_str())
+                .unwrap_or_default(),
+        );
+        let first = network_input(window, cx, "First name", parts.first);
+        let middle = network_input(window, cx, "Middle name", parts.middle);
+        let last = network_input(window, cx, "Last name", parts.last);
+        let role = network_input(
+            window,
+            cx,
+            "Role",
+            profile
+                .as_ref()
+                .map(|p| p.role_title.clone())
+                .unwrap_or_default(),
+        );
+        let organization = network_input(
+            window,
+            cx,
+            "Organization",
+            profile
+                .as_ref()
+                .map(|p| p.organization.clone())
+                .unwrap_or_default(),
+        );
+        let collaboration = network_input(
+            window,
+            cx,
+            "Possible collaboration",
+            profile
+                .as_ref()
+                .map(|p| p.collaboration.clone())
+                .unwrap_or_default(),
+        );
+        let email = network_input(
+            window,
+            cx,
+            "Email",
+            profile
+                .as_ref()
+                .map(|p| p.email.clone())
+                .unwrap_or_default(),
+        );
+        let url = network_input(
+            window,
+            cx,
+            "URL",
+            profile.as_ref().map(|p| p.url.clone()).unwrap_or_default(),
+        );
+        let location = network_input(
+            window,
+            cx,
+            "City or region",
+            profile
+                .as_ref()
+                .map(|p| p.location.clone())
+                .unwrap_or_default(),
+        );
+        let last_contact = network_input(
+            window,
+            cx,
+            "YYYY-MM-DD",
+            profile
+                .as_ref()
+                .and_then(|p| p.last_contact_on.clone())
+                .unwrap_or_default(),
+        );
+        let how_met = network_input(
+            window,
+            cx,
+            "How you met",
+            profile
+                .as_ref()
+                .map(|p| p.how_met.clone())
+                .unwrap_or_default(),
+        );
+        let expertise_input =
+            network_input(window, cx, "Add expertise and press Enter", String::new());
+        cx.subscribe_in(
+            &expertise_input,
+            window,
+            |this: &mut AppShell, _input, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.network_editor_add_expertise(window, cx);
+                }
+            },
+        )
+        .detach();
+        let notes_value = profile
+            .as_ref()
+            .map(|p| p.notes.clone())
+            .unwrap_or_default();
+        let notes = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .default_value(notes_value)
+                .placeholder("Notes (Markdown)")
+        });
+        let zone_input = network_input(window, cx, "Search cities or time zones", String::new());
+        let expertise = profile
+            .as_ref()
+            .map(|p| p.expertise.clone())
+            .unwrap_or_default();
+        let status = profile
+            .as_ref()
+            .map(|p| p.status.clone())
+            .unwrap_or_else(|| "active".to_string());
+        let zone = profile
+            .as_ref()
+            .map(|p| p.tz_identifier.clone())
+            .filter(|zone| !zone.is_empty());
+        let focus = cx.focus_handle();
+        self.network.status_menu = false;
+        self.network.expertise_menu = false;
+        self.network.editor = Some(NetworkEditor {
+            person_id,
+            focus: focus.clone(),
+            first: first.clone(),
+            middle,
+            last,
+            role,
+            organization,
+            collaboration,
+            email,
+            url,
+            location,
+            last_contact,
+            how_met,
+            expertise_input,
+            expertise,
+            notes,
+            status,
+            zone,
+            zone_input,
+            zone_open: false,
+            error: None,
+        });
+        first.update(cx, |state, cx| state.focus(window, cx));
+        focus.focus(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn close_network_editor(&mut self, cx: &mut Context<Self>) {
+        if self.network.editor.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn network_editor_add_expertise(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.network.editor.as_ref() else {
+            return;
+        };
+        let value = editor.expertise_input.read(cx).value().trim().to_string();
+        if value.is_empty() {
+            return;
+        }
+        self.push_network_expertise(value, window, cx);
+    }
+
+    pub(crate) fn pick_network_expertise(
+        &mut self,
+        label: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.push_network_expertise(label, window, cx);
+    }
+
+    fn push_network_expertise(
+        &mut self,
+        label: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.network.editor.as_mut() else {
+            return;
+        };
+        if !editor
+            .expertise
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&label))
+        {
+            editor.expertise.push(label);
+        }
+        editor.error = None;
+        let input = editor.expertise_input.clone();
+        input.update(cx, |state, cx| state.set_value("", window, cx));
+        input.update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
+    }
+
+    pub(crate) fn remove_network_expertise(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(editor) = self.network.editor.as_mut()
+            && index < editor.expertise.len()
+        {
+            editor.expertise.remove(index);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn toggle_network_editor_zone(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.network.editor.as_mut() else {
+            return;
+        };
+        editor.zone_open = !editor.zone_open;
+        if editor.zone_open {
+            editor
+                .zone_input
+                .update(cx, |state, cx| state.focus(window, cx));
+        } else {
+            editor.focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn choose_network_editor_zone(
+        &mut self,
+        zone: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(editor) = self.network.editor.as_mut() {
+            editor.zone = Some(zone.to_string());
+            editor.zone_open = false;
+            editor.error = None;
+            editor.focus.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn save_network_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.network.editor.as_ref() else {
+            return;
+        };
+        let person_id = editor.person_id.clone();
+        let name = NameParts {
+            first: editor.first.read(cx).value().trim().to_string(),
+            middle: editor.middle.read(cx).value().trim().to_string(),
+            last: editor.last.read(cx).value().trim().to_string(),
+        }
+        .display();
+        let role = editor.role.read(cx).value().trim().to_string();
+        let organization = editor.organization.read(cx).value().trim().to_string();
+        let collaboration = editor.collaboration.read(cx).value().trim().to_string();
+        let email = editor.email.read(cx).value().trim().to_string();
+        let url = editor.url.read(cx).value().trim().to_string();
+        let location = editor.location.read(cx).value().trim().to_string();
+        let last_contact = editor.last_contact.read(cx).value().trim().to_string();
+        let how_met = editor.how_met.read(cx).value().trim().to_string();
+        let notes = editor.notes.read(cx).value().to_string();
+        let status = editor.status.clone();
+        let zone = editor.zone.clone().unwrap_or_default();
+        let expertise = editor.expertise.clone();
+
+        let result = match &person_id {
+            Some(id) => self.store.update_person(
+                id,
+                PersonPatch {
+                    name: Some(name),
+                    role_title: Some(role),
+                    organization: Some(organization),
+                    collaboration: Some(collaboration),
+                    email: Some(email),
+                    url: Some(url),
+                    location: Some(location),
+                    tz_identifier: Some(zone),
+                    last_contact_on: Some(last_contact),
+                    how_met: Some(how_met),
+                    notes: Some(notes),
+                    status: Some(status),
+                    expertise: Some(expertise),
+                },
+            ),
+            None => self.store.create_person(NewPerson {
+                name,
+                role_title: role,
+                organization,
+                collaboration,
+                email,
+                url,
+                location,
+                tz_identifier: zone,
+                last_contact_on: Some(last_contact),
+                how_met,
+                notes,
+                expertise,
+            }),
+        };
+
+        match result {
+            Ok(person) => {
+                self.network.selected = Some(person.id);
+                self.network.editor = None;
+                self.load_network();
+            }
+            Err(error) => {
+                if let Some(editor) = self.network.editor.as_mut() {
+                    editor.error = Some(error);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn open_network_place_picker(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(person) = self
+            .network
+            .selected
+            .as_deref()
+            .and_then(|id| self.network_person(id))
+            .cloned()
+        else {
+            return;
+        };
+        if self.network.placements.contains_key(&person.id) {
+            return;
+        }
+        let search = network_input(window, cx, "Search saved cities", String::new());
+        let zone_input = network_input(window, cx, "Search cities or time zones", String::new());
+        let focus = cx.focus_handle();
+        search.update(cx, |state, cx| state.focus(window, cx));
+        focus.focus(window, cx);
+        self.network.place_picker = Some(PlacePicker {
+            person_id: person.id,
+            person_name: person.name,
+            focus,
+            search,
+            zone_input,
+            new_city_open: false,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn close_network_place_picker(&mut self, cx: &mut Context<Self>) {
+        if self.network.place_picker.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn toggle_network_new_city(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(picker) = self.network.place_picker.as_mut() else {
+            return;
+        };
+        picker.new_city_open = !picker.new_city_open;
+        if picker.new_city_open {
+            picker
+                .zone_input
+                .update(cx, |state, cx| state.focus(window, cx));
+        } else {
+            picker.focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn place_network_person(&mut self, clock_id: &str, cx: &mut Context<Self>) {
+        let Some(picker) = self.network.place_picker.as_ref() else {
+            return;
+        };
+        let person_id = picker.person_id.clone();
+        match self.store.add_existing_person(clock_id, &person_id) {
+            Ok(()) => {
+                self.network.place_picker = None;
+                self.load_clocks();
+                self.load_network();
+            }
+            Err(error) => {
+                if let Some(picker) = self.network.place_picker.as_mut() {
+                    picker.error = Some(error);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn place_network_person_new_city(&mut self, zone: &str, cx: &mut Context<Self>) {
+        let Some(picker) = self.network.place_picker.as_ref() else {
+            return;
+        };
+        let person_id = picker.person_id.clone();
+        let clock_id = match self.clock_for_zone(zone) {
+            Ok(clock) => clock,
+            Err(error) => {
+                if let Some(picker) = self.network.place_picker.as_mut() {
+                    picker.error = Some(error);
+                }
+                cx.notify();
+                return;
+            }
+        };
+        match self.store.add_existing_person(&clock_id, &person_id) {
+            Ok(()) => {
+                self.network.place_picker = None;
+                self.load_clocks();
+                self.load_network();
+            }
+            Err(error) => {
+                if let Some(picker) = self.network.place_picker.as_mut() {
+                    picker.error = Some(error);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Show or hide the selected person on Clocks. Hiding keeps the placement
+    /// and trips; showing restores the retained slot.
+    pub(crate) fn toggle_network_clocks(&mut self, cx: &mut Context<Self>) {
+        let Some(person) = self
+            .network
+            .selected
+            .as_deref()
+            .and_then(|id| self.network_person(id))
+            .cloned()
+        else {
+            return;
+        };
+        let placed = self.network.placements.contains_key(&person.id);
+        let result = if person.in_clocks {
+            self.store.set_person_in_clocks(&person.id, false)
+        } else if placed {
+            self.store.set_person_in_clocks(&person.id, true)
+        } else {
+            Ok(())
+        };
+        match result {
+            Ok(()) => {
+                self.network.error = None;
+                self.load_clocks();
+                self.load_network();
+            }
+            Err(error) => self.network.error = Some(error),
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn open_network_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(person) = self
+            .network
+            .selected
+            .as_deref()
+            .and_then(|id| self.network_person(id))
+            .cloned()
+        else {
+            return;
+        };
+        let focus = cx.focus_handle();
+        focus.focus(window, cx);
+        self.network.confirm = Some(NetworkConfirm {
+            person_id: person.id,
+            person_name: person.name,
+            focus,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_network_delete(&mut self, cx: &mut Context<Self>) {
+        if self.network.confirm.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn confirm_network_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(confirm) = self.network.confirm.as_ref() else {
+            return;
+        };
+        let person_id = confirm.person_id.clone();
+        match self.store.delete_person(&person_id) {
+            Ok(()) => {
+                if self.network.selected.as_deref() == Some(person_id.as_str()) {
+                    self.network.selected = None;
+                }
+                self.network.confirm = None;
+                self.load_clocks();
+                self.load_network();
+            }
+            Err(error) => {
+                if let Some(confirm) = self.network.confirm.as_mut() {
+                    confirm.error = Some(error);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Jump to Clocks with the placed person's city inspector open.
+    pub(crate) fn open_network_person_in_clocks(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(person) = self
+            .network
+            .selected
+            .as_deref()
+            .and_then(|id| self.network_person(id))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(place) = self.network.placements.get(&person.id).cloned() else {
+            return;
+        };
+        self.select(Section::Clocks, window, cx);
+        self.open_inspector(&place.clock_id, window, cx);
+    }
+
+    /// Open one person in Network (used by the Clocks edit-colleague modal).
+    pub(crate) fn open_person_in_network(
+        &mut self,
+        person_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.clocks.person_edit = None;
+        self.clocks.inspector = None;
+        self.network.selected = Some(person_id.to_string());
+        self.select(Section::Network, window, cx);
+        cx.notify();
     }
 
     pub(crate) fn choose_person_zone(&mut self, zone: &str, cx: &mut Context<Self>) {
@@ -4681,8 +5372,10 @@ impl AppShell {
             kind: ConfirmKind::RemovePerson {
                 person_id: person_id.to_string(),
             },
-            title: format!("Remove {name}?"),
-            message: "Their trips are removed with them.".to_string(),
+            title: format!("Remove {name} from Clocks?"),
+            message: "They leave this city and the Clocks roster; their profile and trip \
+                      history stay in Network."
+                .to_string(),
             error: None,
         });
         cx.notify();
@@ -6620,12 +7313,13 @@ impl AppShell {
 
     /// The mockup's nav: text-only chips on the titlebar surface, 26 px tall,
     /// 5 px radius, 1 px apart. The active one sits on `surface2`; hover is a
-    /// faint wash and full-strength text. Below 980 px the mockup tightens the
-    /// horizontal padding to 8 px, which covers the 940 px minimum window.
+    /// faint wash and full-strength text. Below 980 px the five-chip row
+    /// tightens the horizontal padding to 6 px, which covers the 940 px
+    /// minimum window.
     fn section_control(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.tokens;
         let pad = if window.bounds().size.width <= px(980.) {
-            px(8.)
+            px(6.)
         } else {
             px(10.)
         };
@@ -6671,6 +7365,9 @@ impl AppShell {
                     cx.notify();
                 }
                 element.into_any_element()
+            }
+            Section::Network => {
+                network::network_view(&mut self.network, &t, window, cx).into_any_element()
             }
             Section::Projects => {
                 self.ensure_project_filter(window, cx);
@@ -7327,6 +8024,20 @@ impl Render for AppShell {
                 cx.listener(|this, _: &MouseUpEvent, window, cx| this.cancel_card_drag(window, cx)),
             )
     }
+}
+
+/// One text field for the Network modals.
+fn network_input(
+    window: &mut Window,
+    cx: &mut Context<AppShell>,
+    placeholder: &'static str,
+    value: String,
+) -> Entity<InputState> {
+    cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder(placeholder)
+            .default_value(value)
+    })
 }
 
 /// One row in a small context menu.

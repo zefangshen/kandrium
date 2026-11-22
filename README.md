@@ -8,6 +8,7 @@ Kandrium is a local-first Kanban desktop app with a companion [Model Context Pro
 - **Virtual "All" board** that aggregates every card into To Do / In Progress / Done with its own ordering
 - **Wiki and Projects** alongside the board — Markdown notes and PDF/Markdown documents in one Wiki section, plus project workspaces with their own board and files
 - **Clocks** — a world-clock page with saved cities, residents, visitors, and temporary travel/relocation
+- **Network** — a people address book; placing a contact on a saved city card also shows them on Clocks
 - **Local SQLite storage** (WAL mode), no account and no network
 
 ## Features
@@ -20,6 +21,7 @@ Kandrium is a local-first Kanban desktop app with a companion [Model Context Pro
 - Wiki: Markdown notes and PDF/Markdown documents side by side, with debounced autosave, vim-modal editing, and PDF annotation sidecars
 - Projects: a folder/project tree, one board per project, short unique identifiers, a tabbed Overview/Tasks detail pane, and per-project documents
 - Clocks: searchable city list, 12/24-hour toggle, three cities per page, residents and visitors, and per-person travel windows that expire on their own
+- Network: searchable people list, profile details, status and expertise filters, and placing a contact on a saved city card (hide/show without losing the retained slot)
 - Dark appearance with a single blue accent
 - One-click MCP access: create, move, update, archive, and query cards from an AI assistant
 
