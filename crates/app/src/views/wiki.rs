@@ -30,7 +30,7 @@ pub const MIN_HALF_H: f32 = 120.0;
 /// Half header height: the same 38 px row the tree panels use.
 pub const HEADER_H: f32 = 38.0;
 /// The wiki status toolbar above the halves.
-pub const TOOLBAR_H: f32 = 34.0;
+pub const TOOLBAR_H: f32 = 38.0;
 /// Height the 5 px vertical splitter occupies in the column layout: its
 /// `-2 px` side margins overlap the two halves.
 const SPLITTER_H: f32 = 1.0;
