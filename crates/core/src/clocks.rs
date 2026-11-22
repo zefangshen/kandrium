@@ -6,12 +6,15 @@
 //! function here is synchronous and takes `&rusqlite::Connection`, like the
 //! rest of `kandrium-core`.
 //!
-//! People are residents of exactly one city (`home_clock_id`). A travel row
-//! temporarily places someone in another saved city for a window; home is
-//! never mutated by travel. A city with residents refuses to be deleted
-//! (`ON DELETE RESTRICT`); a city that is only a travel destination cancels
-//! the active trips pointing at it before deleting (`SET NULL` keeps the
-//! history). Placement is a pure function of the cached travel rows and an
+//! People are residents of exactly one city (`home_clock_id`), stored as a
+//! `clock_placements` row that references the canonical person in `persons`
+//! ([`crate::persons`]). Identity, profile and the Clocks visibility flag live
+//! on the person; Clocks owns only the placement and the travel windows. A
+//! travel row temporarily places someone in another saved city for a window;
+//! home is never mutated by travel. A city with residents refuses to be
+//! deleted (`ON DELETE RESTRICT`); a city that is only a travel destination
+//! cancels the active trips pointing at it before deleting (`SET NULL` keeps
+//! the history). Placement is a pure function of the cached travel rows and an
 //! instant, so callers can expire a trip without touching the database.
 //!
 //! Time-zone math uses `jiff` (already a workspace dependency), which bundles
@@ -51,6 +54,9 @@ pub struct Clock {
 }
 
 /// A person attached to one saved city.
+///
+/// Assembled from `clock_placements JOIN persons`; `id` is the canonical
+/// person id and only people with `persons.in_clocks = 1` are returned.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Person {
@@ -180,8 +186,9 @@ pub fn remove_clock(db: &Connection, id: &str) -> Result<()> {
         return Err(KandriumError::new("Clock not found"));
     };
 
+    // Hidden placements still hold the city, so they count for RESTRICT.
     let residents: i64 = db.query_row(
-        "SELECT COUNT(*) FROM clock_people WHERE home_clock_id = ?1",
+        "SELECT COUNT(*) FROM clock_placements WHERE clock_id = ?1",
         [id],
         |row| row.get(0),
     )?;
@@ -195,7 +202,7 @@ pub fn remove_clock(db: &Connection, id: &str) -> Result<()> {
     let tx = db.unchecked_transaction()?;
     let now = Timestamp::now().as_second();
     tx.execute(
-        "UPDATE clock_travels SET cancelled_at = ?2
+        "UPDATE clock_travels_v2 SET cancelled_at = ?2
          WHERE destination_clock_id = ?1
            AND cancelled_at IS NULL
            AND (ends_at IS NULL OR ends_at > ?2)",
@@ -241,26 +248,29 @@ pub fn reorder_clocks(db: &Connection, ordered_ids: &[String]) -> Result<()> {
 
 /// People attached to one city, in display order.
 ///
-/// `home_clock_id` is the resident relation. Visitors (people currently in
-/// this city because of travel) arrive with Phase 4's travel rows.
+/// Only people with `persons.in_clocks = 1` render. A hidden person keeps a
+/// retained placement (and its position slot) but is omitted here.
 pub fn list_people(db: &Connection, clock_id: &str) -> Result<Vec<Person>> {
     let mut stmt = db.prepare(
-        "SELECT id, name, home_clock_id, position, created_at
-         FROM clock_people
-         WHERE home_clock_id = ?1
-         ORDER BY position, id",
+        "SELECT p.id, p.name, c.clock_id, c.position, c.created_at
+         FROM clock_placements c
+         JOIN persons p ON p.id = c.person_id
+         WHERE c.clock_id = ?1 AND p.in_clocks = 1
+         ORDER BY c.position, p.id",
     )?;
     let rows = stmt.query_map([clock_id], person_from_row)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Every person, ordered by city then display position. The UI groups these
-/// by `home_clock_id` when reloading the Clocks page.
+/// Every visible person, ordered by city then display position. The UI groups
+/// these by `home_clock_id` when reloading the Clocks page.
 pub fn list_all_people(db: &Connection) -> Result<Vec<Person>> {
     let mut stmt = db.prepare(
-        "SELECT id, name, home_clock_id, position, created_at
-         FROM clock_people
-         ORDER BY home_clock_id, position, id",
+        "SELECT p.id, p.name, c.clock_id, c.position, c.created_at
+         FROM clock_placements c
+         JOIN persons p ON p.id = c.person_id
+         WHERE p.in_clocks = 1
+         ORDER BY c.clock_id, c.position, p.id",
     )?;
     let rows = stmt.query_map([], person_from_row)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -276,8 +286,27 @@ fn person_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Person> {
     })
 }
 
-/// Attach a person to a city. Rejects blank names and unknown clocks; the
-/// person is appended to the end of that city's list.
+fn placement_position(db: &Connection, clock_id: &str) -> Result<i64> {
+    Ok(db.query_row(
+        "SELECT COALESCE(MAX(position) + 1, 0) FROM clock_placements \
+         WHERE clock_id = ?1",
+        [clock_id],
+        |row| row.get(0),
+    )?)
+}
+
+fn renumber_after(db: &Connection, clock_id: &str, position: i64) -> Result<()> {
+    db.execute(
+        "UPDATE clock_placements SET position = position - 1
+         WHERE clock_id = ?1 AND position > ?2",
+        rusqlite::params![clock_id, position],
+    )?;
+    Ok(())
+}
+
+/// Attach a new person to a city ("Add colleague"). Creates the canonical
+/// person with `in_clocks = 1` and a placement in one transaction. Rejects
+/// blank names and unknown clocks; the person is appended to the city's list.
 pub fn add_person(db: &Connection, clock_id: &str, name: &str) -> Result<Person> {
     let name = name.trim();
     if name.is_empty() {
@@ -292,53 +321,94 @@ pub fn add_person(db: &Connection, clock_id: &str, name: &str) -> Result<Person>
         return Err(KandriumError::new("Clock not found"));
     }
 
-    let position: i64 = db.query_row(
-        "SELECT COALESCE(MAX(position) + 1, 0) FROM clock_people WHERE home_clock_id = ?1",
-        [clock_id],
-        |row| row.get(0),
+    let position = placement_position(db, clock_id)?;
+    let created_at = Timestamp::now().to_string();
+    let id = uid();
+    let tx = db.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO persons (id, name, status, in_clocks, created_at, updated_at)
+         VALUES (?1, ?2, 'active', 1, ?3, ?3)",
+        rusqlite::params![id, name, created_at],
     )?;
-    let person = Person {
-        id: uid(),
+    tx.execute(
+        "INSERT INTO clock_placements (person_id, clock_id, position, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![id, clock_id, position, created_at],
+    )?;
+    tx.commit()?;
+    Ok(Person {
+        id,
         name: name.to_string(),
         home_clock_id: clock_id.to_string(),
         position,
-        created_at: Timestamp::now().to_string(),
-    };
-    db.execute(
-        "INSERT INTO clock_people (id, name, home_clock_id, position, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![
-            person.id,
-            person.name,
-            person.home_clock_id,
-            person.position,
-            person.created_at
-        ],
-    )?;
-    Ok(person)
+        created_at,
+    })
 }
 
-/// Rename a person in place (blank names are rejected).
+/// Place an existing Network person on a city and show them on Clocks.
+/// Rejects a person who already has a placement.
+pub fn add_existing_person(db: &Connection, clock_id: &str, person_id: &str) -> Result<Person> {
+    let clock_exists: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM clocks WHERE id = ?1)",
+        [clock_id],
+        |row| row.get(0),
+    )?;
+    if !clock_exists {
+        return Err(KandriumError::new("Clock not found"));
+    }
+    let name: String = db
+        .query_row(
+            "SELECT name FROM persons WHERE id = ?1",
+            [person_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| KandriumError::new("Person not found"))?;
+    let placed: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM clock_placements WHERE person_id = ?1)",
+        [person_id],
+        |row| row.get(0),
+    )?;
+    if placed {
+        return Err(KandriumError::new(
+            "This person is already placed on a city.",
+        ));
+    }
+
+    let position = placement_position(db, clock_id)?;
+    let created_at = Timestamp::now().to_string();
+    let tx = db.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO clock_placements (person_id, clock_id, position, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![person_id, clock_id, position, created_at],
+    )?;
+    tx.execute(
+        "UPDATE persons SET in_clocks = 1, updated_at = ?2 WHERE id = ?1",
+        rusqlite::params![person_id, created_at],
+    )?;
+    tx.commit()?;
+    Ok(Person {
+        id: person_id.to_string(),
+        name,
+        home_clock_id: clock_id.to_string(),
+        position,
+        created_at,
+    })
+}
+
+/// Rename a person in place (blank names are rejected). Delegates to the
+/// canonical record so Clocks and Network never diverge.
 pub fn rename_person(db: &Connection, id: &str, name: &str) -> Result<()> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err(KandriumError::new("Person name required"));
-    }
-    let changed = db.execute(
-        "UPDATE clock_people SET name = ?1 WHERE id = ?2",
-        rusqlite::params![name, id],
-    )?;
-    if changed == 0 {
-        return Err(KandriumError::new("Person not found"));
-    }
-    Ok(())
+    crate::persons::set_person_name(db, id, name)
 }
 
-/// Remove a person and close the gap they leave in their city's order.
+/// Remove a person from their city: deletes only the placement, hides them
+/// from Clocks and closes the gap in the city's order. The person, profile,
+/// expertise and travel history survive in Network.
 pub fn remove_person(db: &Connection, id: &str) -> Result<()> {
     let row: Option<(String, i64)> = db
         .query_row(
-            "SELECT home_clock_id, position FROM clock_people WHERE id = ?1",
+            "SELECT clock_id, position FROM clock_placements WHERE person_id = ?1",
             [id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -348,12 +418,38 @@ pub fn remove_person(db: &Connection, id: &str) -> Result<()> {
     };
 
     let tx = db.unchecked_transaction()?;
-    tx.execute("DELETE FROM clock_people WHERE id = ?1", [id])?;
+    tx.execute("DELETE FROM clock_placements WHERE person_id = ?1", [id])?;
     tx.execute(
-        "UPDATE clock_people SET position = position - 1
-         WHERE home_clock_id = ?1 AND position > ?2",
-        rusqlite::params![clock_id, position],
+        "UPDATE persons SET in_clocks = 0, updated_at = ?2 WHERE id = ?1",
+        rusqlite::params![id, Timestamp::now().to_string()],
     )?;
+    renumber_after(&tx, &clock_id, position)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Show or hide a person on Clocks. Hiding keeps the placement and travels;
+/// showing restores the retained placement.
+pub fn set_person_in_clocks(db: &Connection, id: &str, on: bool) -> Result<()> {
+    crate::persons::set_person_in_clocks(db, id, on)
+}
+
+/// Delete the canonical person. Placements and travels cascade, and every
+/// city that held a placement is renumbered.
+pub fn delete_person(db: &Connection, id: &str) -> Result<()> {
+    let placement: Option<(String, i64)> = db
+        .query_row(
+            "SELECT clock_id, position FROM clock_placements WHERE person_id = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+
+    let tx = db.unchecked_transaction()?;
+    crate::persons::delete_person(&tx, id)?;
+    if let Some((clock_id, position)) = placement {
+        renumber_after(&tx, &clock_id, position)?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -374,7 +470,8 @@ pub fn reorder_people(db: &Connection, clock_id: &str, ordered_ids: &[String]) -
     let tx = db.unchecked_transaction()?;
     for (position, id) in ordered_ids.iter().enumerate() {
         tx.execute(
-            "UPDATE clock_people SET position = ?1 WHERE id = ?2 AND home_clock_id = ?3",
+            "UPDATE clock_placements SET position = ?1
+             WHERE person_id = ?2 AND clock_id = ?3",
             rusqlite::params![position as i64, id, clock_id],
         )?;
     }
@@ -388,7 +485,7 @@ pub fn list_all_travels(db: &Connection) -> Result<Vec<Travel>> {
     let mut stmt = db.prepare(
         "SELECT id, person_id, origin_clock_id, destination_clock_id,
                 starts_at, ends_at, cancelled_at, created_at
-         FROM clock_travels
+         FROM clock_travels_v2
          ORDER BY person_id, starts_at, id",
     )?;
     let rows = stmt.query_map([], travel_from_row)?;
@@ -400,7 +497,7 @@ pub fn list_travels(db: &Connection, person_id: &str) -> Result<Vec<Travel>> {
     let mut stmt = db.prepare(
         "SELECT id, person_id, origin_clock_id, destination_clock_id,
                 starts_at, ends_at, cancelled_at, created_at
-         FROM clock_travels
+         FROM clock_travels_v2
          WHERE person_id = ?1
          ORDER BY starts_at, id",
     )?;
@@ -482,7 +579,9 @@ pub fn start_travel(
 
     let home_clock_id: String = db
         .query_row(
-            "SELECT home_clock_id FROM clock_people WHERE id = ?1",
+            "SELECT c.clock_id FROM clock_placements c
+             JOIN persons p ON p.id = c.person_id
+             WHERE c.person_id = ?1 AND p.in_clocks = 1",
             [person_id],
             |row| row.get(0),
         )
@@ -558,12 +657,12 @@ pub fn start_travel(
     let tx = db.unchecked_transaction()?;
     if let Some(id) = &closed {
         tx.execute(
-            "UPDATE clock_travels SET ends_at = ?1 WHERE id = ?2",
+            "UPDATE clock_travels_v2 SET ends_at = ?1 WHERE id = ?2",
             rusqlite::params![starts_at, id],
         )?;
     }
     tx.execute(
-        "INSERT INTO clock_travels
+        "INSERT INTO clock_travels_v2
              (id, person_id, origin_clock_id, destination_clock_id,
               starts_at, ends_at, cancelled_at, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
@@ -587,7 +686,7 @@ pub fn end_travel(db: &Connection, travel_id: &str) -> Result<()> {
     let now = Timestamp::now().as_second();
     let (starts_at, ends_at, cancelled_at): (i64, Option<i64>, Option<i64>) = db
         .query_row(
-            "SELECT starts_at, ends_at, cancelled_at FROM clock_travels WHERE id = ?1",
+            "SELECT starts_at, ends_at, cancelled_at FROM clock_travels_v2 WHERE id = ?1",
             [travel_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -606,7 +705,7 @@ pub fn end_travel(db: &Connection, travel_id: &str) -> Result<()> {
     }
 
     db.execute(
-        "UPDATE clock_travels SET ends_at = ?1 WHERE id = ?2",
+        "UPDATE clock_travels_v2 SET ends_at = ?1 WHERE id = ?2",
         rusqlite::params![now, travel_id],
     )?;
     Ok(())
@@ -621,7 +720,7 @@ pub fn extend_travel(db: &Connection, travel_id: &str, ends_at: Option<i64>) -> 
         .query_row(
             "SELECT id, person_id, origin_clock_id, destination_clock_id,
                     starts_at, ends_at, cancelled_at, created_at
-             FROM clock_travels WHERE id = ?1",
+             FROM clock_travels_v2 WHERE id = ?1",
             [travel_id],
             travel_from_row,
         )
@@ -652,7 +751,7 @@ pub fn extend_travel(db: &Connection, travel_id: &str, ends_at: Option<i64>) -> 
     }
 
     db.execute(
-        "UPDATE clock_travels SET ends_at = ?1 WHERE id = ?2",
+        "UPDATE clock_travels_v2 SET ends_at = ?1 WHERE id = ?2",
         rusqlite::params![ends_at, travel.id],
     )?;
     Ok(())
@@ -661,7 +760,7 @@ pub fn extend_travel(db: &Connection, travel_id: &str, ends_at: Option<i64>) -> 
 /// Delete a travel row outright (used to discard a mistake or a finished
 /// entry from the history).
 pub fn remove_travel(db: &Connection, travel_id: &str) -> Result<()> {
-    let changed = db.execute("DELETE FROM clock_travels WHERE id = ?1", [travel_id])?;
+    let changed = db.execute("DELETE FROM clock_travels_v2 WHERE id = ?1", [travel_id])?;
     if changed == 0 {
         return Err(KandriumError::new("Travel not found"));
     }
@@ -678,7 +777,7 @@ pub fn remove_travel(db: &Connection, travel_id: &str) -> Result<()> {
 pub fn relocate_person(db: &Connection, person_id: &str, new_home_clock_id: &str) -> Result<()> {
     let (old_home, old_position): (String, i64) = db
         .query_row(
-            "SELECT home_clock_id, position FROM clock_people WHERE id = ?1",
+            "SELECT clock_id, position FROM clock_placements WHERE person_id = ?1",
             [person_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -695,16 +794,12 @@ pub fn relocate_person(db: &Connection, person_id: &str, new_home_clock_id: &str
         return Ok(());
     }
 
-    let new_position: i64 = db.query_row(
-        "SELECT COALESCE(MAX(position) + 1, 0) FROM clock_people WHERE home_clock_id = ?1",
-        [new_home_clock_id],
-        |row| row.get(0),
-    )?;
+    let new_position = placement_position(db, new_home_clock_id)?;
     let now = Timestamp::now().as_second();
 
     let tx = db.unchecked_transaction()?;
     tx.execute(
-        "UPDATE clock_travels SET cancelled_at = ?3
+        "UPDATE clock_travels_v2 SET cancelled_at = ?3
          WHERE person_id = ?1
            AND cancelled_at IS NULL
            AND (ends_at IS NULL OR ends_at > ?3)
@@ -712,14 +807,10 @@ pub fn relocate_person(db: &Connection, person_id: &str, new_home_clock_id: &str
         rusqlite::params![person_id, new_home_clock_id, now, old_home],
     )?;
     tx.execute(
-        "UPDATE clock_people SET home_clock_id = ?1, position = ?2 WHERE id = ?3",
+        "UPDATE clock_placements SET clock_id = ?1, position = ?2 WHERE person_id = ?3",
         rusqlite::params![new_home_clock_id, new_position, person_id],
     )?;
-    tx.execute(
-        "UPDATE clock_people SET position = position - 1
-         WHERE home_clock_id = ?1 AND position > ?2",
-        rusqlite::params![old_home, old_position],
-    )?;
+    renumber_after(&tx, &old_home, old_position)?;
     tx.commit()?;
     Ok(())
 }
@@ -1233,7 +1324,10 @@ mod tests {
         assert_eq!(rest[0].id, ben.id);
         assert_eq!(rest[0].position, 0);
 
-        assert!(rename_person(&db, &ana.id, "Ghost").is_err());
+        // The person survives removal, so the name is still editable; only
+        // the placement is gone.
+        rename_person(&db, &ana.id, "Ann Again").unwrap();
+        assert!(rename_person(&db, "person_missing", "Ghost").is_err());
         assert!(remove_person(&db, &ana.id).is_err());
     }
 
@@ -1486,17 +1580,139 @@ mod tests {
         assert_eq!(list_travels(&db, &ana.id).unwrap().len(), 2);
     }
 
+    /// Hiding keeps the placement and the trips, and showing restores the
+    /// same position slot. A hidden placement still holds its city.
     #[test]
-    fn removing_a_person_cascades_travel_history() {
+    fn hiding_keeps_the_placement_and_travel_and_restores_the_position() {
         let (_dir, db) = mem_db();
         let tokyo = add_clock(&db, "Asia/Tokyo").unwrap();
         let paris = add_clock(&db, "Europe/Paris").unwrap();
         let ana = add_person(&db, &tokyo.id, "Ana").unwrap();
+        let ben = add_person(&db, &tokyo.id, "Ben").unwrap();
+        let now = now_secs();
+        start_travel(&db, &ana.id, &paris.id, now - 60, None).unwrap();
+
+        set_person_in_clocks(&db, &ana.id, false).unwrap();
+        let visible = list_people(&db, &tokyo.id).unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, ben.id);
+        assert_eq!(visible[0].position, 1, "hiding must not renumber slots");
+        assert!(!crate::persons::get_person(&db, &ana.id).unwrap().in_clocks);
+        // The trip stays in the v2 table while the person is hidden.
+        assert_eq!(list_all_travels(&db).unwrap().len(), 1);
+        // A hidden placement still blocks deleting the city (RESTRICT).
+        assert!(remove_clock(&db, &tokyo.id).is_err());
+
+        set_person_in_clocks(&db, &ana.id, true).unwrap();
+        let restored = list_people(&db, &tokyo.id).unwrap();
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[0].id, ana.id);
+        assert_eq!(restored[0].position, 0);
+    }
+
+    /// `remove_person` deletes only the placement: the canonical person and
+    /// their travel history stay. A person with no placement cannot be shown
+    /// again until placed.
+    #[test]
+    fn removing_a_person_keeps_the_profile_and_travel() {
+        let (_dir, db) = mem_db();
+        let tokyo = add_clock(&db, "Asia/Tokyo").unwrap();
+        let paris = add_clock(&db, "Europe/Paris").unwrap();
+        let ana = add_person(&db, &tokyo.id, "Ana").unwrap();
+        let ben = add_person(&db, &tokyo.id, "Ben").unwrap();
         let now = now_secs();
         start_travel(&db, &ana.id, &paris.id, now - 60, None).unwrap();
 
         remove_person(&db, &ana.id).unwrap();
+        let person = crate::persons::get_person(&db, &ana.id).unwrap();
+        assert_eq!(person.name, "Ana");
+        assert!(!person.in_clocks);
+        assert_eq!(list_all_travels(&db).unwrap().len(), 1);
+
+        let visible = list_people(&db, &tokyo.id).unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, ben.id);
+        assert_eq!(visible[0].position, 0, "removal compacts the city");
+
+        assert!(
+            set_person_in_clocks(&db, &ana.id, true)
+                .unwrap_err()
+                .to_string()
+                .contains("city")
+        );
+        // Placing her again appends to the city and restores Clocks visibility.
+        let placed = add_existing_person(&db, &tokyo.id, &ana.id).unwrap();
+        assert_eq!(placed.position, 1);
+        assert!(crate::persons::get_person(&db, &ana.id).unwrap().in_clocks);
+        assert_eq!(list_people(&db, &tokyo.id).unwrap().len(), 2);
+    }
+
+    /// `delete_person` removes the canonical row; placements and trips
+    /// cascade and every affected city is renumbered.
+    #[test]
+    fn deleting_a_person_removes_placements_and_travels() {
+        let (_dir, db) = mem_db();
+        let tokyo = add_clock(&db, "Asia/Tokyo").unwrap();
+        let paris = add_clock(&db, "Europe/Paris").unwrap();
+        let ana = add_person(&db, &tokyo.id, "Ana").unwrap();
+        let ben = add_person(&db, &tokyo.id, "Ben").unwrap();
+        let now = now_secs();
+        start_travel(&db, &ana.id, &paris.id, now - 60, None).unwrap();
+
+        delete_person(&db, &ana.id).unwrap();
+        assert!(crate::persons::get_person(&db, &ana.id).is_err());
         assert!(list_all_travels(&db).unwrap().is_empty());
+        let visible = list_people(&db, &tokyo.id).unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, ben.id);
+        assert_eq!(visible[0].position, 0);
+        assert!(delete_person(&db, &ana.id).is_err());
+    }
+
+    #[test]
+    fn add_existing_person_places_a_network_person_once() {
+        let (_dir, db) = mem_db();
+        let tokyo = add_clock(&db, "Asia/Tokyo").unwrap();
+        let cleo =
+            crate::persons::create_person(&db, crate::persons::NewPerson::new("Cleo")).unwrap();
+        assert!(!cleo.in_clocks);
+        assert!(list_people(&db, &tokyo.id).unwrap().is_empty());
+
+        let placed = add_existing_person(&db, &tokyo.id, &cleo.id).unwrap();
+        assert_eq!(placed.name, "Cleo");
+        assert_eq!(placed.position, 0);
+        assert_eq!(list_people(&db, &tokyo.id).unwrap().len(), 1);
+        assert!(
+            add_existing_person(&db, &tokyo.id, &cleo.id)
+                .unwrap_err()
+                .to_string()
+                .contains("already placed")
+        );
+        assert!(add_existing_person(&db, &tokyo.id, "person_missing").is_err());
+        assert!(add_existing_person(&db, "clock_missing", &cleo.id).is_err());
+    }
+
+    /// Travel rows live in `clock_travels_v2`, and overlap checks read them.
+    #[test]
+    fn travel_start_and_overlap_use_the_v2_table() {
+        let (_dir, db) = mem_db();
+        let tokyo = add_clock(&db, "Asia/Tokyo").unwrap();
+        let paris = add_clock(&db, "Europe/Paris").unwrap();
+        let berlin = add_clock(&db, "Europe/Berlin").unwrap();
+        let ana = add_person(&db, &tokyo.id, "Ana").unwrap();
+        let now = now_secs();
+
+        let first = start_travel(&db, &ana.id, &paris.id, now - 100, Some(now + 100)).unwrap();
+        let stored: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM clock_travels_v2 WHERE id = ?1",
+                [&first.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 1);
+        let err = start_travel(&db, &ana.id, &berlin.id, now - 50, Some(now + 200)).unwrap_err();
+        assert!(err.to_string().contains("Paris"), "{err}");
     }
 
     /// Residency keeps `RESTRICT`, but a city that is only a travel

@@ -76,13 +76,18 @@ pub const SCHEMA_V13_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../migrations/0013_run_history.sql"
 ));
+/// Additive v14 step (canonical persons; Clocks keeps placement and travel).
+pub const SCHEMA_V14_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../migrations/0014_person_identity.sql"
+));
 /// Latest schema version. Must match the number of entries in the migration set.
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// The SQL of every migration, in application order. `SCHEMA_VERSION` must
 /// equal its length; `every_sql_file_is_registered` proves the list still
 /// covers every file under `migrations/`.
-const MIGRATION_SQL: [&str; 13] = [
+const MIGRATION_SQL: [&str; 14] = [
     SCHEMA_SQL,
     SCHEMA_V2_SQL,
     SCHEMA_V3_SQL,
@@ -96,6 +101,7 @@ const MIGRATION_SQL: [&str; 13] = [
     SCHEMA_V11_SQL,
     SCHEMA_V12_SQL,
     SCHEMA_V13_SQL,
+    SCHEMA_V14_SQL,
 ];
 
 /// The ordered migration set. `rusqlite_migration` tracks the applied version
@@ -728,7 +734,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
 
         for table in ["run_history", "run_row_changes", "run_undo"] {
             let count: i64 = db
@@ -785,5 +791,109 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    /// A v13 database upgrades to v14 by copying every colleague into
+    /// `persons` + `clock_placements` (same ids) and every trip into
+    /// `clock_travels_v2`. The legacy tables stay untouched, and re-running
+    /// the v14 SQL is a no-op.
+    #[test]
+    fn v13_database_backfills_persons_placements_and_travels() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open_db(&dir.path().join("t.db")).unwrap();
+        Migrations::new(vec![
+            M::up(SCHEMA_SQL),
+            M::up(SCHEMA_V2_SQL),
+            M::up(SCHEMA_V3_SQL),
+            M::up(SCHEMA_V4_SQL),
+            M::up(SCHEMA_V5_SQL),
+            M::up(SCHEMA_V6_SQL),
+            M::up(SCHEMA_V7_SQL),
+            M::up(SCHEMA_V8_SQL),
+            M::up(SCHEMA_V9_SQL),
+            M::up(SCHEMA_V10_SQL),
+            M::up(SCHEMA_V11_SQL),
+            M::up(SCHEMA_V12_SQL),
+            M::up(SCHEMA_V13_SQL),
+        ])
+        .to_latest(&mut db)
+        .unwrap();
+        db.execute_batch(
+            "INSERT INTO clocks (id, tz_identifier, position, created_at)
+                 VALUES ('clock_tokyo', 'Asia/Tokyo', 0, '2026-01-01T00:00:00Z');
+             INSERT INTO clocks (id, tz_identifier, position, created_at)
+                 VALUES ('clock_paris', 'Europe/Paris', 1, '2026-01-01T00:00:00Z');
+             INSERT INTO clock_people (id, name, home_clock_id, position, created_at)
+                 VALUES ('person_ana', 'Ana', 'clock_tokyo', 0, '2026-02-01T00:00:00Z');
+             INSERT INTO clock_travels
+                 (id, person_id, origin_clock_id, destination_clock_id,
+                  starts_at, ends_at, cancelled_at, created_at)
+                 VALUES ('travel_paris', 'person_ana', 'clock_tokyo', 'clock_paris',
+                         100, NULL, NULL, '2026-02-02T00:00:00Z');",
+        )
+        .unwrap();
+
+        run_schema(&mut db).unwrap();
+
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        let person: (String, String, i64, String, String) = db
+            .query_row(
+                "SELECT name, status, in_clocks, created_at, updated_at
+                 FROM persons WHERE id = 'person_ana'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(person.0, "Ana");
+        assert_eq!(person.1, "active");
+        assert_eq!(person.2, 1);
+        assert_eq!(person.3, "2026-02-01T00:00:00Z");
+        assert_eq!(person.4, "2026-02-01T00:00:00Z");
+
+        let placement: (String, i64, String) = db
+            .query_row(
+                "SELECT clock_id, position, created_at FROM clock_placements
+                 WHERE person_id = 'person_ana'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(placement.0, "clock_tokyo");
+        assert_eq!(placement.1, 0);
+        assert_eq!(placement.2, "2026-02-01T00:00:00Z");
+
+        let travel: (String, String, i64) = db
+            .query_row(
+                "SELECT person_id, destination_clock_id, starts_at
+                 FROM clock_travels_v2 WHERE id = 'travel_paris'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            travel,
+            ("person_ana".to_string(), "clock_paris".to_string(), 100)
+        );
+
+        // The legacy tables still exist with their original rows.
+        for table in ["clock_people", "clock_travels"] {
+            let count: i64 = db
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 1, "legacy {table} was modified");
+        }
+
+        // Re-running the v14 SQL completes nothing twice.
+        db.execute_batch(SCHEMA_V14_SQL).unwrap();
+        for table in ["persons", "clock_placements", "clock_travels_v2"] {
+            let count: i64 = db
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 1, "{table} duplicated on re-run");
+        }
     }
 }

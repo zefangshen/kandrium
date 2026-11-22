@@ -1,7 +1,7 @@
 //! Row capture: a start/end database snapshot pair and a derived table diff.
 //!
 //! A run takes a start snapshot lazily at its first row mutation, an end
-//! snapshot at close, diffs the eleven app-owned tables, and deletes the end
+//! snapshot at close, diffs the thirteen app-owned tables, and deletes the end
 //! snapshot once the diff is stored. The diff holds keys and row hashes only;
 //! before values live in the start snapshot ([`crate::history`] §3B).
 
@@ -29,8 +29,10 @@ pub struct TableSpec {
     pub keys: &'static [&'static str],
 }
 
-/// The eleven app-owned tables captured by the row diff. Derived wiki tables
-/// and `sqlite_*` are deliberately excluded: files own the wiki.
+/// The thirteen app-owned tables captured by the row diff. Derived wiki
+/// tables and `sqlite_*` are deliberately excluded: files own the wiki. The
+/// frozen v13 `clock_people` / `clock_travels` tables are not captured: v14
+/// moves all Clocks data to the persons-owned tables below.
 pub const CAPTURED_TABLES: &[TableSpec] = &[
     TableSpec {
         name: "boards",
@@ -69,11 +71,19 @@ pub const CAPTURED_TABLES: &[TableSpec] = &[
         keys: &["id"],
     },
     TableSpec {
-        name: "clock_people",
+        name: "persons",
         keys: &["id"],
     },
     TableSpec {
-        name: "clock_travels",
+        name: "person_expertise",
+        keys: &["person_id", "label"],
+    },
+    TableSpec {
+        name: "clock_placements",
+        keys: &["person_id"],
+    },
+    TableSpec {
+        name: "clock_travels_v2",
         keys: &["id"],
     },
 ];

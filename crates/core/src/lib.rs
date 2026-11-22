@@ -15,6 +15,7 @@ pub mod import;
 pub mod logging;
 pub mod models;
 pub mod notes;
+pub mod persons;
 pub mod projects;
 pub mod seed;
 mod services;
@@ -22,12 +23,12 @@ pub mod wiki;
 
 pub use clocks::{
     Clock, ClockText, Person, ProbeAmbiguity, ProbeError, ProbeReading, Travel, add_clock,
-    add_person, city_name, day_end_seconds, day_start_seconds, end_travel, extend_travel,
-    format_clock, format_offset, list_all_people, list_all_travels, list_clocks, list_people,
-    list_travels, parse_probe_time, placement_at, placement_for, probe_ambiguity, probe_date,
-    read_probe_time, relocate_person, remove_clock, remove_person, remove_travel, rename_person,
-    reorder_clocks, reorder_people, resolve_zone, seed_defaults as seed_clocks, start_travel,
-    system_zone,
+    add_existing_person, add_person, city_name, day_end_seconds, day_start_seconds, delete_person,
+    end_travel, extend_travel, format_clock, format_offset, list_all_people, list_all_travels,
+    list_clocks, list_people, list_travels, parse_probe_time, placement_at, placement_for,
+    probe_ambiguity, probe_date, read_probe_time, relocate_person, remove_clock, remove_person,
+    remove_travel, rename_person, reorder_clocks, reorder_people, resolve_zone,
+    seed_defaults as seed_clocks, start_travel, system_zone,
 };
 pub use constants::{
     ALL_BOARD_ID, ALL_COLUMN_PREFIX, CARD_STATUSES, normalize_column_title,
@@ -40,6 +41,10 @@ pub use db::{
 pub use error::{KandriumError, Result};
 pub use import::{ImportCounts, import_old_db};
 pub use models::*;
+pub use persons::{
+    NewPerson, PERSON_STATUSES, PersonPatch, create_person, expertise_labels, get_person,
+    list_persons, set_person_in_clocks, set_person_name, update_person,
+};
 pub use projects::{
     PROJECT_FILE_EXTS, PROJECT_STATUSES, Project, ProjectChoice, ProjectFolder, ProjectNode,
     ProjectPath, ProjectSummary, ProjectTemplate, TEMPLATES, add_project_path, archive_project,
