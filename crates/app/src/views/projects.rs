@@ -1136,15 +1136,23 @@ fn folder_row(
         .when(selected, |this| this.bg(t.surface_2))
         .when(selected, |this| this.child(selected_marker(t)))
         .hover(|style| style.bg(t.hover))
-        .child(icon(
-            if open {
-                Icon::ChevronDown
-            } else {
-                Icon::ChevronRight
-            },
-            12.,
-            t.text_faint,
-        ))
+        .child(
+            div()
+                .w(px(12.))
+                .h(px(12.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icon(
+                    if open {
+                        Icon::CaretDown
+                    } else {
+                        Icon::CaretRight
+                    },
+                    10.,
+                    t.text_faint,
+                )),
+        )
         .child(icon(Icon::Folder, 14., t.text_muted))
         .child(
             div()
@@ -1260,11 +1268,11 @@ fn project_row(
                 }))
                 .child(icon(
                     if expanded {
-                        Icon::ChevronDown
+                        Icon::CaretDown
                     } else {
-                        Icon::ChevronRight
+                        Icon::CaretRight
                     },
-                    12.,
+                    10.,
                     t.text_faint,
                 ))
                 .into_any_element()
@@ -1403,15 +1411,23 @@ fn tree_doc_rows(
         if entry.is_dir {
             let toggle = key.clone();
             row = row
-                .child(icon(
-                    if open {
-                        Icon::ChevronDown
-                    } else {
-                        Icon::ChevronRight
-                    },
-                    12.,
-                    t.text_faint,
-                ))
+                .child(
+                    div()
+                        .w(px(12.))
+                        .h(px(12.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icon(
+                            if open {
+                                Icon::CaretDown
+                            } else {
+                                Icon::CaretRight
+                            },
+                            10.,
+                            t.text_faint,
+                        )),
+                )
                 .child(icon(Icon::Folder, 14., t.text_muted))
                 .child(name)
                 .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {

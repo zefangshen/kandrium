@@ -736,15 +736,23 @@ fn page_row(
     if entry.is_dir {
         let toggle = path.clone();
         row = row
-            .child(icon(
-                if open {
-                    Icon::ChevronDown
-                } else {
-                    Icon::ChevronRight
-                },
-                12.,
-                t.text_faint,
-            ))
+            .child(
+                div()
+                    .w(px(12.))
+                    .h(px(12.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(icon(
+                        if open {
+                            Icon::CaretDown
+                        } else {
+                            Icon::CaretRight
+                        },
+                        10.,
+                        t.text_faint,
+                    )),
+            )
             .child(icon(Icon::Folder, 13., t.text_muted))
             .child(
                 div()
