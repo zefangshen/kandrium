@@ -54,14 +54,12 @@ pub struct NetworkState {
     pub search: Option<Entity<InputState>>,
     pub query: String,
     pub status_filter: String,
-    pub expertise_filter: Option<String>,
     pub expertise_labels: Vec<String>,
     pub error: Option<String>,
     pub editor: Option<NetworkEditor>,
     pub place_picker: Option<PlacePicker>,
     pub confirm: Option<NetworkConfirm>,
     pub status_menu: bool,
-    pub expertise_menu: bool,
     /// Saved cities, in their Clocks order.
     pub cities: Vec<NetworkCity>,
     /// Person → city placement for every person, hidden ones included.
@@ -78,14 +76,12 @@ impl NetworkState {
             search: None,
             query: String::new(),
             status_filter: "all".to_string(),
-            expertise_filter: None,
             expertise_labels: Vec::new(),
             error: None,
             editor: None,
             place_picker: None,
             confirm: None,
             status_menu: false,
-            expertise_menu: false,
             cities: Vec::new(),
             placements: HashMap::new(),
             zones: Vec::new(),
@@ -151,18 +147,7 @@ pub fn network_view(
     cx: &mut Context<AppShell>,
 ) -> AnyElement {
     let search = ensure_search_input(state, window, cx);
-    let expertise_filter = state.expertise_filter.clone();
-    let filtered: Vec<&Person> = state
-        .people
-        .iter()
-        .filter(|person| match &expertise_filter {
-            None => true,
-            Some(label) => person
-                .expertise
-                .iter()
-                .any(|candidate| candidate.eq_ignore_ascii_case(label)),
-        })
-        .collect();
+    let filtered: Vec<&Person> = state.people.iter().collect();
     let selected = state
         .selected
         .as_deref()
@@ -234,8 +219,9 @@ fn rail(
             div()
                 .id("network-search")
                 .test_support()
-                .w(px(200.))
-                .child(field_input(search, t)),
+                .flex_1()
+                .min_w(px(0.))
+                .child(field_input(search, t).w_full()),
         )
         .child(toolbar_button(
             "network-status-trigger",
@@ -243,13 +229,6 @@ fn rail(
             false,
             t,
             cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_network_status_menu(cx)),
-        ))
-        .child(toolbar_button(
-            "network-expertise-trigger",
-            "Expertise filter",
-            false,
-            t,
-            cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_network_expertise_menu(cx)),
         ))
         .child(
             div()
@@ -323,83 +302,6 @@ fn rail(
                     .when(active, |el| el.child(icon(Icon::Check, 11., t.accent_text)))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                         this.set_network_status_filter(option, cx)
-                    })),
-            );
-        }
-        rail = rail.child(menu);
-    }
-
-    if state.expertise_menu {
-        let mut menu = div()
-            .id("network-expertise-menu")
-            .test_support()
-            .flex_none()
-            .max_h(px(180.))
-            .overflow_y_scroll()
-            .border_b_1()
-            .border_color(t.divider)
-            .py(px(4.));
-        menu = menu.child(
-            div()
-                .id("network-expertise-all")
-                .test_support()
-                .mx(px(4.))
-                .px(px(8.))
-                .h(px(26.))
-                .flex()
-                .items_center()
-                .justify_between()
-                .rounded(px(4.))
-                .cursor_pointer()
-                .when(state.expertise_filter.is_none(), |el| el.bg(t.selected))
-                .hover(|style| style.bg(t.hover))
-                .text(Text::Small)
-                .text_color(if state.expertise_filter.is_none() {
-                    t.text
-                } else {
-                    t.text_muted
-                })
-                .child("All expertise")
-                .when(state.expertise_filter.is_none(), |el| {
-                    el.child(icon(Icon::Check, 11., t.accent_text))
-                })
-                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                    this.set_network_expertise_filter(None, cx)
-                })),
-        );
-        if state.expertise_labels.is_empty() {
-            menu = menu.child(
-                div()
-                    .px(px(12.))
-                    .py(px(8.))
-                    .text(Text::Small)
-                    .text_color(t.text_faint)
-                    .child("No expertise labels yet."),
-            );
-        }
-        for (index, label) in state.expertise_labels.iter().enumerate() {
-            let active = state.expertise_filter.as_deref() == Some(label.as_str());
-            let value = label.clone();
-            menu = menu.child(
-                div()
-                    .id(format!("network-expertise-filter-{index}"))
-                    .test_support()
-                    .mx(px(4.))
-                    .px(px(8.))
-                    .h(px(26.))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .rounded(px(4.))
-                    .cursor_pointer()
-                    .when(active, |el| el.bg(t.selected))
-                    .hover(|style| style.bg(t.hover))
-                    .text(Text::Small)
-                    .text_color(if active { t.text } else { t.text_muted })
-                    .child(label.clone())
-                    .when(active, |el| el.child(icon(Icon::Check, 11., t.accent_text)))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                        this.set_network_expertise_filter(Some(value.clone()), cx)
                     })),
             );
         }
@@ -737,11 +639,7 @@ fn detail(
         .flex_col()
         .gap(px(18.));
 
-    body = body.child(detail_section(
-        "Expertise",
-        expertise_chips(person, t, cx),
-        t,
-    ));
+    body = body.child(detail_section("Expertise", expertise_chips(person, t), t));
     body = body.child(detail_section(
         "Collaboration",
         detail_text(&person.collaboration, "No collaboration notes.", t),
@@ -797,7 +695,7 @@ fn detail_text(value: &str, empty: &str, t: &Tokens) -> AnyElement {
         .into_any_element()
 }
 
-fn expertise_chips(person: &Person, t: &Tokens, cx: &mut Context<AppShell>) -> AnyElement {
+fn expertise_chips(person: &Person, t: &Tokens) -> AnyElement {
     if person.expertise.is_empty() {
         return div()
             .text(Text::Small)
@@ -807,7 +705,6 @@ fn expertise_chips(person: &Person, t: &Tokens, cx: &mut Context<AppShell>) -> A
     }
     let mut chips = div().flex().flex_wrap().gap(px(6.));
     for (index, label) in person.expertise.iter().enumerate() {
-        let value = label.clone();
         chips = chips.child(
             div()
                 .id(format!("network-expertise-{index}"))
@@ -818,14 +715,9 @@ fn expertise_chips(person: &Person, t: &Tokens, cx: &mut Context<AppShell>) -> A
                 .items_center()
                 .rounded(px(4.))
                 .bg(t.surface_2)
-                .cursor_pointer()
-                .hover(|style| style.bg(t.hover))
                 .text(Text::Small)
                 .text_color(t.text_muted)
-                .child(label.clone())
-                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                    this.set_network_expertise_filter(Some(value.clone()), cx)
-                })),
+                .child(label.clone()),
         );
     }
     chips.into_any_element()

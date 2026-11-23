@@ -70,6 +70,50 @@ fn network_section_renders_empty_and_restores_its_setting(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+fn toolbar_search_takes_the_slack(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = seeded(dir.path());
+    cx.update(gpui_kit::init);
+
+    let (_shell, cx) =
+        cx.add_window_view(|_window, _cx| AppShell::with_store(Store::open_path(path.clone())));
+    cx.update(|window, cx| window.render_frame(cx));
+    open_network(cx);
+
+    cx.update(|window, _cx| {
+        let toolbar = window.find("network-toolbar").bounds();
+        let search = window.find("network-search").bounds();
+        let status = window.find("network-status-trigger").bounds();
+        let add = window.find("network-add-person").bounds();
+        let width = |bounds: gpui::Bounds<gpui::Pixels>| f32::from(bounds.size.width);
+        let centre = |bounds: gpui::Bounds<gpui::Pixels>| {
+            f32::from(bounds.origin.y) + f32::from(bounds.size.height) / 2.0
+        };
+        let right =
+            |bounds: gpui::Bounds<gpui::Pixels>| f32::from(bounds.origin.x + bounds.size.width);
+
+        assert!((width(toolbar) - 299.0).abs() < 1.0);
+        assert!(
+            (width(search) - 227.0).abs() < 2.0,
+            "the search takes the slack: {}",
+            width(search)
+        );
+        assert!(
+            (right(toolbar) - right(add) - 8.0).abs() < 1.5,
+            "the add action sits at the row's right edge"
+        );
+        assert!(
+            (f32::from(status.origin.x) - right(search) - 4.0).abs() < 1.5,
+            "search right {} status x {}",
+            right(search),
+            f32::from(status.origin.x)
+        );
+        assert!((centre(search) - centre(status)).abs() < 1.0);
+        assert!((centre(search) - centre(add)).abs() < 1.0);
+    });
+}
+
+#[gpui::test]
 fn create_edit_and_filter_people(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let path = seeded(dir.path());
@@ -100,6 +144,8 @@ fn create_edit_and_filter_people(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let (_shell, cx) = cx.add_window_view(|_window, _cx| AppShell::with_store(store));
     open_network(cx);
+    assert!(cx.update(|window, _cx| { window.try_find("network-expertise-trigger").is_none() }));
+    assert!(cx.update(|window, _cx| { window.try_find("network-status-trigger").is_some() }));
     cx.update(|window, cx| window.click("network-add-person", cx));
     cx.update(|window, cx| window.render_frame(cx));
 

@@ -4632,19 +4632,11 @@ impl AppShell {
     pub(crate) fn select_network_person(&mut self, id: &str, cx: &mut Context<Self>) {
         self.network.selected = Some(id.to_string());
         self.network.status_menu = false;
-        self.network.expertise_menu = false;
         cx.notify();
     }
 
     pub(crate) fn toggle_network_status_menu(&mut self, cx: &mut Context<Self>) {
         self.network.status_menu = !self.network.status_menu;
-        self.network.expertise_menu = false;
-        cx.notify();
-    }
-
-    pub(crate) fn toggle_network_expertise_menu(&mut self, cx: &mut Context<Self>) {
-        self.network.expertise_menu = !self.network.expertise_menu;
-        self.network.status_menu = false;
         cx.notify();
     }
 
@@ -4652,16 +4644,6 @@ impl AppShell {
         self.network.status_filter = status.to_string();
         self.network.status_menu = false;
         self.reload_network_people();
-        cx.notify();
-    }
-
-    pub(crate) fn set_network_expertise_filter(
-        &mut self,
-        label: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
-        self.network.expertise_filter = label;
-        self.network.expertise_menu = false;
         cx.notify();
     }
 
@@ -4793,7 +4775,6 @@ impl AppShell {
             .filter(|zone| !zone.is_empty());
         let focus = cx.focus_handle();
         self.network.status_menu = false;
-        self.network.expertise_menu = false;
         self.network.editor = Some(NetworkEditor {
             person_id,
             focus: focus.clone(),
