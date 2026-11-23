@@ -5832,6 +5832,9 @@ impl AppShell {
                 self.wiki.pages.root = Some(root);
                 self.wiki.pages.entries = entries;
                 self.wiki.pages.error = None;
+                // A previous failed open may have left the root banner up even
+                // though the tree loads fine now.
+                self.wiki.notes.error = None;
             }
             Err(error) => {
                 self.wiki.pages.root = Some(root);
@@ -5852,12 +5855,18 @@ impl AppShell {
 
     /// The root a note tab belongs to: every tab now opens a compiled page
     /// under the wiki root.
+    ///
+    /// Both sides are canonicalised before the prefix test: macOS is
+    /// case-insensitive, and the legacy data directory is spelled `Kandrium`,
+    /// so comparing the lowercase configured root with scanned paths would
+    /// falsely reject every page.
     fn note_root_for(&self, path: &Path) -> Option<PathBuf> {
-        self.wiki
-            .pages
-            .root
-            .clone()
-            .filter(|root| path.starts_with(root))
+        let root = self.wiki.pages.root.clone()?;
+        let canonical_root = std::fs::canonicalize(&root).unwrap_or(root);
+        let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        canonical_path
+            .starts_with(&canonical_root)
+            .then_some(canonical_root)
     }
 
     /// Open a page in a tab, reusing the tab when the path is already open.
@@ -5867,6 +5876,7 @@ impl AppShell {
         if let Some(index) = self.wiki.notes.tab_index(&path) {
             self.wiki.notes.active = Some(index);
             self.wiki.set_active(TabKey::note(path.clone()));
+            self.wiki.notes.error = None;
             let editor = self.wiki.notes.tabs[index].editor.clone();
             editor.update(cx, |state, cx| state.focus(window, cx));
             cx.notify();

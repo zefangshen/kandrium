@@ -64,10 +64,19 @@ impl NotesState {
     }
 }
 
+/// Display form of a wiki page path: `wiki/<rel>` under the wiki root, never
+/// the absolute data-directory path. Paths outside the root are shown as-is.
+fn wiki_display_path(path: &Path, root: Option<&Path>) -> String {
+    root.and_then(|root| path.strip_prefix(root).ok())
+        .map(|rel| format!("wiki/{}", rel.display()))
+        .unwrap_or_else(|| path.display().to_string())
+}
+
 /// One note's head row, editor or preview, and status bar, below the tab row.
 pub(crate) fn detail_body(
     state: &NotesState,
     index: usize,
+    root: Option<&Path>,
     t: &Tokens,
     window: &Window,
     cx: &mut Context<AppShell>,
@@ -85,6 +94,7 @@ pub(crate) fn detail_body(
         return body.into_any_element();
     };
     let preview = tab.preview;
+    let display_path = wiki_display_path(&tab.path, root);
     body = body.child(
         div()
             .id("notes-head")
@@ -97,12 +107,7 @@ pub(crate) fn detail_body(
             .px(px(14.))
             .border_b_1()
             .border_color(t.divider)
-            .child(crate::views::path_label(
-                "notes-path",
-                tab.path.display().to_string(),
-                t,
-                cx,
-            ))
+            .child(crate::views::path_label("notes-path", display_path, t, cx))
             .child(div().flex_1())
             .child(crate::views::mode_switch(
                 "notes-preview",
@@ -233,4 +238,30 @@ fn status_bar(tab: &NoteTab, t: &Tokens, cx: &mut Context<AppShell>) -> AnyEleme
         t,
         cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_vim_mode(cx)),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wiki_paths_display_relative_to_the_root() {
+        let root = Path::new("/Users/me/Library/Application Support/Kandrium/wiki");
+        assert_eq!(
+            wiki_display_path(&root.join("index.md"), Some(root)),
+            "wiki/index.md"
+        );
+        assert_eq!(
+            wiki_display_path(&root.join("notes/plan.md"), Some(root)),
+            "wiki/notes/plan.md"
+        );
+        assert_eq!(
+            wiki_display_path(Path::new("/elsewhere/a.md"), Some(root)),
+            "/elsewhere/a.md"
+        );
+        assert_eq!(
+            wiki_display_path(&root.join("index.md"), None),
+            "/Users/me/Library/Application Support/Kandrium/wiki/index.md"
+        );
+    }
 }

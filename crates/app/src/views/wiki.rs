@@ -922,7 +922,14 @@ fn detail_column(
     match key.kind {
         TabKind::Note => {
             if let Some(index) = state.notes.tab_index(&key.path) {
-                column = column.child(notes::detail_body(&state.notes, index, t, window, cx));
+                column = column.child(notes::detail_body(
+                    &state.notes,
+                    index,
+                    state.pages.root.as_deref(),
+                    t,
+                    window,
+                    cx,
+                ));
             }
         }
         TabKind::Doc => {
@@ -1048,8 +1055,8 @@ fn panel_body(
                     .child(kv_row("Concepts", &status.pages.concept.to_string(), t))
                     .child(kv_row("Hand-written", &status.pages.page.to_string(), t))
                     .child(kv_row("Index", &status.pages.index.to_string(), t));
-                if let Some(root) = &state.pages.root {
-                    body = body.child(kv_row("Wiki root", &root.display().to_string(), t));
+                if state.pages.root.is_some() {
+                    body = body.child(kv_row("Wiki root", "wiki/", t));
                 }
                 if let Some(root) = &state.documents.root {
                     body = body.child(kv_row("Sources root", &root.display().to_string(), t));

@@ -63,11 +63,15 @@ pub fn resolve_wiki_root() -> PathBuf {
     resolve_root_from(std::env::var_os(WIKI_ENV), dirs::data_dir())
 }
 
-/// Create the wiki root if missing and return it.
+/// Create the wiki root if missing and return its canonical path.
+///
+/// The canonical form matters on case-insensitive filesystems: the legacy
+/// data directory is spelled `Kandrium`, so a byte-wise prefix test against
+/// the lowercase path would reject pages scanned from the real directory.
 pub fn ensure_wiki_root() -> Result<PathBuf> {
     let root = resolve_wiki_root();
     fs::create_dir_all(&root)?;
-    Ok(root)
+    Ok(fs::canonicalize(&root)?)
 }
 
 fn resolve_root_from(wiki: Option<OsString>, data_dir: Option<PathBuf>) -> PathBuf {
