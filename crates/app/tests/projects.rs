@@ -38,6 +38,16 @@ fn a_project_renders_its_tree_overview_tasks_and_documents(cx: &mut TestAppConte
         kandrium_core::create_project(&db, &projects_root, "Old Idea", None, "blank")
             .expect("create archived project");
     kandrium_core::archive_project(&db, &archived_project.id).expect("archive project");
+    // A second active project with its own documents, for the document-owner
+    // and per-project memory checks below.
+    let other_project =
+        kandrium_core::create_project(&db, &projects_root, "Borealis", None, "blank")
+            .expect("create second project");
+    let other_dir = projects_root.join(&other_project.id);
+    std::fs::write(other_dir.join("notes.md"), "# Notes\n").unwrap();
+    std::fs::write(other_dir.join("plan.md"), "# Plan\n").unwrap();
+    let other_notes = std::fs::canonicalize(other_dir.join("notes.md")).unwrap();
+    let other_plan = std::fs::canonicalize(other_dir.join("plan.md")).unwrap();
     let board = kandrium_core::get_board_readonly(&db, &project.board_id).expect("project board");
     let column_id = board.columns[0].id.clone();
     let card = kandrium_core::create_card(
@@ -391,6 +401,98 @@ fn a_project_renders_its_tree_overview_tasks_and_documents(cx: &mut TestAppConte
     let board = kandrium_core::get_board_readonly(&db, &project.board_id).expect("board");
     assert_eq!(board.title, "Apollo Two", "the project board title follows");
     drop(db);
+
+    // --- Document ownership and per-project memory -------------------------
+    // A document row belongs to the project that rendered it: expanding
+    // another project's documents while a different project is selected must
+    // never read the selected project's folder.
+    cx.update(|window, cx| window.click(format!("project-row-{}", other_project.id), cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, _cx| {
+        assert!(
+            window.try_find("project-doc-body").is_none(),
+            "switching projects does not carry the previous project's document over"
+        );
+    });
+    cx.update(|window, cx| window.click(format!("project-docs-{}", other_project.id), cx));
+    cx.update(|window, cx| window.render_frame(cx));
+
+    // A file deleted after the tree was scanned reports a readable failure in
+    // the document area, not a raw errno in the tree's banner.
+    std::fs::remove_file(&other_plan).unwrap();
+    let plan_row = format!(
+        "project-tree-doc-{}:{}",
+        other_project.id,
+        other_plan.display()
+    );
+    cx.update(|window, _cx| assert!(window.find(plan_row.clone()).visible()));
+    cx.update(|window, cx| window.click(plan_row, cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, _cx| {
+        assert!(
+            window.find("projects-doc-error").visible(),
+            "a failed document open is reported in the document area"
+        );
+        assert!(
+            window.try_find("projects-error").is_none(),
+            "the tree banner stays reserved for tree and root failures"
+        );
+        assert!(window.try_find("project-doc-body").is_none());
+    });
+
+    // Apollo's row, clicked while Borealis is still selected, opens Apollo's
+    // file because the row carries its owning project.
+    cx.update(|window, cx| window.click(format!("project-docs-{}", project.id), cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    let brief_row = format!("project-tree-doc-{}:{}", project.id, doc_path.display());
+    cx.update(|window, _cx| assert!(window.find(brief_row.clone()).visible()));
+    cx.update(|window, cx| window.click(brief_row, cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, _cx| {
+        assert!(
+            window.find("project-doc-body").visible(),
+            "the row's own project owns the read, not the previous selection"
+        );
+        assert!(window.try_find("projects-doc-error").is_none());
+    });
+
+    // Open one of Borealis's documents from its Overview, leave, and delete the
+    // file while away: coming back must not reopen it.
+    cx.update(|window, cx| window.click(format!("project-row-{}", other_project.id), cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    let notes_row = format!("project-doc-{}", other_notes.display());
+    cx.update(|window, _cx| assert!(window.find(notes_row.clone()).visible()));
+    cx.update(|window, cx| window.click(notes_row, cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, _cx| assert!(window.find("project-doc-body").visible()));
+
+    cx.update(|window, cx| window.click(format!("project-row-{}", project.id), cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    std::fs::remove_file(&other_notes).unwrap();
+    cx.update(|window, cx| window.click(format!("project-row-{}", other_project.id), cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, _cx| {
+        assert!(
+            window.try_find("project-tab-2").is_none(),
+            "a document deleted while the project was away is not reopened"
+        );
+        assert!(window.try_find("projects-doc-error").is_none());
+    });
+
+    // Returning to Apollo restores exactly the file it had open, and the tab
+    // that was active when it was left.
+    cx.update(|window, cx| window.click(format!("project-row-{}", project.id), cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.update(|window, _cx| {
+        assert!(
+            window.find("project-tab-2").visible(),
+            "the project's open document tab is restored"
+        );
+        assert!(
+            window.find("project-doc-body").visible(),
+            "the active document is restored too, without another click"
+        );
+    });
 
     // Leaving Projects restores the Tasks section's own board: loading the
     // project board never overwrote the Tasks selection.

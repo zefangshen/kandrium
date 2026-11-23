@@ -51,8 +51,9 @@ use crate::views::network::{
 };
 use crate::views::projects::{
     self, DetailEditor, DocDraft as ProjectDocDraft, DocDraftKind as ProjectDocDraftKind,
-    ProjectConfirm, ProjectConfirmKind, ProjectDocTab, ProjectDraft, ProjectDraftKind, ProjectTab,
-    ProjectsState, TitleEdit as ProjectTitleEdit, folder_name, project_folder, sibling_projects,
+    ProjectActiveTab, ProjectConfirm, ProjectConfirmKind, ProjectDocTab, ProjectDraft,
+    ProjectDraftKind, ProjectTab, ProjectsState, TitleEdit as ProjectTitleEdit, folder_name,
+    project_folder, sibling_projects,
 };
 use crate::views::tasks::{
     COLUMN_W, CardMetrics, DropTarget, GAP_FALLBACK, SLOT_H, card_body, title_row,
@@ -2311,6 +2312,11 @@ impl AppShell {
             self.projects.title_edit = None;
             self.projects.doc_draft = None;
             self.projects.doc_folder = PathBuf::new();
+            // The selection changed outside `select_project` (boot, or the
+            // held project disappearing), so no other project's rows may stay
+            // expanded.
+            self.projects.docs_open.clear();
+            self.projects.doc_folders_open.clear();
         }
         self.reload_project_detail();
     }
@@ -2336,6 +2342,8 @@ impl AppShell {
                     .doc_trees
                     .insert(id.clone(), self.projects.files.clone());
                 self.projects.detail = Some(project);
+                // A reload that succeeds proves the project is readable again.
+                self.projects.doc_error = None;
             }
             Err(error) => {
                 self.projects.error = Some(error);
@@ -2438,6 +2446,12 @@ impl AppShell {
         self.flush_project_fields(window, cx);
         self.save_project_description(cx);
         self.flush_project_docs(cx);
+        // Remember what the outgoing project was showing before its tabs are
+        // replaced, then restore the incoming project's own workspace.
+        let keep_tasks = self.projects.active_is_tasks();
+        if let Some(previous) = self.projects.selected.clone() {
+            self.projects.remember_open(&previous);
+        }
         self.projects.selected = Some(id.to_string());
         self.projects.selected_folder = project_folder(&self.projects.tree, id).or_else(|| {
             self.projects
@@ -2446,17 +2460,103 @@ impl AppShell {
                 .find(|p| p.id == id)
                 .and_then(|p| p.folder_id.clone())
         });
-        let keep_tasks = self.projects.active_is_tasks();
-        self.projects.tabs = vec![ProjectTab::Overview, ProjectTab::Tasks];
-        self.projects.active = if keep_tasks { 1 } else { 0 };
-        self.projects.tabs_project = Some(id.to_string());
+        self.restore_project_tabs(id, keep_tasks, window, cx);
         self.projects.detail_editor = None;
         self.projects.title_edit = None;
         self.projects.doc_draft = None;
         self.projects.doc_folder = PathBuf::new();
         self.projects.confirm = None;
+        self.projects.doc_error = None;
         self.reload_project_detail();
         cx.notify();
+    }
+
+    /// Rebuild the tab row for `id`: the pinned Overview/Tasks pair plus one
+    /// tab per remembered document that still exists on disk. Disclosures come
+    /// from the same record, so only this project's rows are expanded.
+    fn restore_project_tabs(
+        &mut self,
+        id: &str,
+        keep_tasks: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.projects.tabs = vec![ProjectTab::Overview, ProjectTab::Tasks];
+        self.projects.active = if keep_tasks { 1 } else { 0 };
+        self.projects.tabs_project = Some(id.to_string());
+        self.projects.restore_disclosures(id);
+        let Some(remembered) = self.projects.remembered.get(id).cloned() else {
+            return;
+        };
+        let Some(root) = self.projects.root.clone() else {
+            return;
+        };
+        let mut restored = Vec::new();
+        for rel in remembered.docs {
+            // A file deleted while the project was away is dropped from the
+            // remembered set instead of reopening an error or an empty tab.
+            if let Ok(text) = self.store.read_project_doc(&root, id, &rel) {
+                self.push_project_doc_tab(rel.clone(), text, window, cx);
+                restored.push(rel);
+            }
+        }
+        self.projects.active = match &remembered.active {
+            ProjectActiveTab::Tasks => 1,
+            ProjectActiveTab::Doc(rel) => self.projects.tab_index(rel).unwrap_or(0),
+            ProjectActiveTab::Overview => 0,
+        };
+        if let Some(entry) = self.projects.remembered.get_mut(id) {
+            entry.docs = restored;
+        }
+    }
+
+    /// Append one document tab over an already-read file.
+    fn push_project_doc_tab(
+        &mut self,
+        rel: PathBuf,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .default_value(text.clone())
+                .placeholder("Start writing… Markdown is supported")
+                .language("markdown")
+        });
+        let mut session = crate::vim::VimSession::new();
+        session.set_enabled(self.vim_mode, &editor, cx);
+        cx.observe(&editor, |this: &mut AppShell, editor, cx| {
+            this.project_doc_edited(&editor, cx)
+        })
+        .detach();
+        let name = rel
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        self.projects.tabs.push(ProjectTab::Doc(ProjectDocTab {
+            rel,
+            name,
+            editor,
+            vim: session,
+            preview: false,
+            draft: Draft::new(text),
+        }));
+        self.projects.active = self.projects.tabs.len() - 1;
+    }
+
+    /// The project's display name, for messages that must name it.
+    fn project_display_name(&self, id: &str) -> String {
+        kandrium_core::projects::find_project(&self.projects.tree, id)
+            .map(|project| project.name.clone())
+            .or_else(|| {
+                self.projects
+                    .archived
+                    .iter()
+                    .find(|project| project.id == id)
+                    .map(|project| project.name.clone())
+            })
+            .unwrap_or_else(|| id.to_string())
     }
 
     pub(crate) fn toggle_project_folder(&mut self, id: String, cx: &mut Context<Self>) {
@@ -3110,54 +3210,51 @@ impl AppShell {
 
     pub(crate) fn open_project_doc(
         &mut self,
+        project_id: String,
         rel: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The row names its own project; clicking one under an expanded but
+        // unselected project switches selection first, so the read can never
+        // target another project's folder.
+        if self.projects.selected.as_deref() != Some(project_id.as_str()) {
+            self.select_project(&project_id, window, cx);
+        }
         if let Some(index) = self.projects.tab_index(&rel) {
             self.projects.active = index;
             if let Some(ProjectTab::Doc(doc)) = self.projects.tabs.get(index) {
                 let editor = doc.editor.clone();
                 editor.update(cx, |state, cx| state.focus(window, cx));
             }
+            self.projects.doc_error = None;
             cx.notify();
             return;
         }
-        let (Some(root), Some(id)) = (self.projects.root.clone(), self.projects.selected.clone())
-        else {
+        let Some(root) = self.projects.root.clone() else {
             return;
         };
-        match self.store.read_project_doc(&root, &id, &rel) {
+        match self.store.read_project_doc(&root, &project_id, &rel) {
             Ok(text) => {
-                let editor = cx.new(|cx| {
-                    EditorState::new(window, cx)
-                        .default_value(text.clone())
-                        .placeholder("Start writing… Markdown is supported")
-                        .language("markdown")
-                });
-                let mut session = crate::vim::VimSession::new();
-                session.set_enabled(self.vim_mode, &editor, cx);
-                cx.observe(&editor, |this: &mut AppShell, editor, cx| {
-                    this.project_doc_edited(&editor, cx)
-                })
-                .detach();
+                self.push_project_doc_tab(rel, text, window, cx);
+                self.projects.doc_error = None;
+                if let Some(ProjectTab::Doc(doc)) = self.projects.active_tab() {
+                    let editor = doc.editor.clone();
+                    editor.update(cx, |state, cx| state.focus(window, cx));
+                }
+            }
+            Err(error) => {
                 let name = rel
                     .file_name()
                     .map(|name| name.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                self.projects.tabs.push(ProjectTab::Doc(ProjectDocTab {
-                    rel,
-                    name,
-                    editor: editor.clone(),
-                    vim: session,
-                    preview: false,
-                    draft: Draft::new(text),
-                }));
-                self.projects.active = self.projects.tabs.len() - 1;
-                self.projects.error = None;
-                editor.update(cx, |state, cx| state.focus(window, cx));
+                    .unwrap_or_else(|| rel.display().to_string());
+                let project = self.project_display_name(&project_id);
+                // The document area gets a sentence naming the file, the
+                // project and the path; the tree's banner is left for tree and
+                // root failures.
+                self.projects.doc_error =
+                    Some(projects::doc_error_message(&name, &project, &error));
             }
-            Err(error) => self.projects.error = Some(error),
         }
         cx.notify();
     }
@@ -3437,7 +3534,7 @@ impl AppShell {
                 if let Some(created) = created
                     && let Some(rel) = self.projects.rel_path(&created)
                 {
-                    self.open_project_doc(rel, window, cx);
+                    self.open_project_doc(id.clone(), rel, window, cx);
                 }
             }
             Err(error) => self.projects.error = Some(error),

@@ -151,6 +151,30 @@ impl ProjectTab {
     }
 }
 
+/// The tab a project was showing when the user navigated away from it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ProjectActiveTab {
+    #[default]
+    Overview,
+    Tasks,
+    Doc(PathBuf),
+}
+
+/// Open documents and tree disclosures remembered for one project, so leaving
+/// it — for another project, section or view — and coming back restores
+/// exactly the same workspace.
+#[derive(Clone, Debug, Default)]
+pub struct RememberedProject {
+    /// Open document tabs, oldest first, as project-relative paths.
+    pub docs: Vec<PathBuf>,
+    /// Tab that was active when the project was left.
+    pub active: ProjectActiveTab,
+    /// Whether the project's document list was expanded in the tree.
+    pub docs_open: bool,
+    /// Expanded document folders, keyed like [`ProjectsState::doc_folders_open`].
+    pub folders: HashSet<String>,
+}
+
 pub struct ProjectDragState {
     pub id: String,
     pub from_folder: Option<String>,
@@ -190,6 +214,12 @@ pub struct ProjectsState {
     pub tree_open: bool,
     pub tree_w: f32,
     pub error: Option<String>,
+    /// A failed document open, shown under the tab row rather than in the
+    /// tree panel's banner. Cleared on a successful open or tree reload.
+    pub doc_error: Option<String>,
+    /// Workspace remembered per project id, restored when it is selected
+    /// again.
+    pub remembered: HashMap<String, RememberedProject>,
     pub draft: Option<ProjectDraft>,
     pub confirm: Option<ProjectConfirm>,
     pub title_edit: Option<TitleEdit>,
@@ -232,6 +262,8 @@ impl Default for ProjectsState {
             tree_open: true,
             tree_w: TREE_W,
             error: None,
+            doc_error: None,
+            remembered: HashMap::new(),
             draft: None,
             confirm: None,
             title_edit: None,
@@ -308,6 +340,54 @@ impl ProjectsState {
             Some(ProjectTab::Doc(doc)) => Some(doc),
             _ => None,
         }
+    }
+
+    /// Snapshot the open tabs and tree disclosures under `id`, so selecting
+    /// the project again restores them.
+    pub fn remember_open(&mut self, id: &str) {
+        let docs = self
+            .tabs
+            .iter()
+            .filter_map(|tab| match tab {
+                ProjectTab::Doc(doc) => Some(doc.rel.clone()),
+                _ => None,
+            })
+            .collect();
+        let active = match self.active_tab() {
+            Some(ProjectTab::Tasks) => ProjectActiveTab::Tasks,
+            Some(ProjectTab::Doc(doc)) => ProjectActiveTab::Doc(doc.rel.clone()),
+            _ => ProjectActiveTab::Overview,
+        };
+        let prefix = format!("{id}:");
+        self.remembered.insert(
+            id.to_string(),
+            RememberedProject {
+                docs,
+                active,
+                docs_open: self.docs_open.contains(id),
+                folders: self
+                    .doc_folders_open
+                    .iter()
+                    .filter(|key| key.starts_with(&prefix))
+                    .cloned()
+                    .collect(),
+            },
+        );
+    }
+
+    /// Restore the remembered disclosures for `id` and drop every other
+    /// project's, so only the selected project's rows stay expanded.
+    pub fn restore_disclosures(&mut self, id: &str) {
+        self.docs_open.clear();
+        self.doc_folders_open.clear();
+        let Some(remembered) = self.remembered.get(id) else {
+            return;
+        };
+        if remembered.docs_open {
+            self.docs_open.insert(id.to_string());
+        }
+        self.doc_folders_open
+            .extend(remembered.folders.iter().cloned());
     }
 }
 
@@ -1289,6 +1369,7 @@ fn tree_doc_rows(
 ) -> Vec<AnyElement> {
     let filter = state.filter.trim().to_lowercase();
     let project_dir = state.root.as_ref().map(|root| root.join(project_id));
+    let owner = project_id.to_string();
     let mut rows = Vec::new();
     for entry in entries {
         if !filter.is_empty() && !doc_entry_matches(entry, &filter) {
@@ -1338,12 +1419,13 @@ fn tree_doc_rows(
                 }));
         } else if let Some(rel) = rel.filter(|rel| is_text_doc(rel)) {
             let open_doc = rel.clone();
+            let owner = owner.clone();
             row = row
                 .child(div().w(px(12.)))
                 .child(icon(Icon::FileText, 14., t.text_muted))
                 .child(name)
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.open_project_doc(open_doc.clone(), window, cx)
+                    this.open_project_doc(owner.clone(), open_doc.clone(), window, cx)
                 }));
         } else {
             row = row
@@ -1656,6 +1738,25 @@ fn detail_pane(
     }
     strip = strip.child(div().flex_1());
     body = body.child(strip);
+
+    // A failed document open belongs to the document area, not the tree
+    // panel's banner: it names the file and project, and disappears on the
+    // next successful open or reload.
+    if let Some(error) = &state.doc_error {
+        body = body.child(
+            div()
+                .id("projects-doc-error")
+                .test_support()
+                .mx(px(12.))
+                .my(px(8.))
+                .p(px(8.))
+                .rounded(px(t.radius))
+                .bg(rgba(0x5c1d1dcc))
+                .text(Text::Small)
+                .text_color(t.text)
+                .child(error.clone()),
+        );
+    }
 
     match state.active_tab() {
         Some(ProjectTab::Overview) => body
@@ -2355,10 +2456,11 @@ fn doc_rows(
     entries: &[FsEntry],
     depth: usize,
     state: &ProjectsState,
-    _project: &Project,
+    project: &Project,
     t: &Tokens,
     cx: &mut Context<AppShell>,
 ) -> Vec<AnyElement> {
+    let owner = project.id.clone();
     let mut rows = Vec::new();
     for entry in entries {
         let name = entry.name.clone();
@@ -2423,9 +2525,10 @@ fn doc_rows(
                 ));
         } else if let Some(rel) = rel.filter(|rel| is_text_doc(rel)) {
             let open = rel.clone();
+            let owner = owner.clone();
             row = row.child(doc_tag("MD", t)).on_click(cx.listener(
                 move |this, _: &ClickEvent, window, cx| {
-                    this.open_project_doc(open.clone(), window, cx)
+                    this.open_project_doc(owner.clone(), open.clone(), window, cx)
                 },
             ));
         } else {
@@ -2433,7 +2536,7 @@ fn doc_rows(
         }
         rows.push(row.into_any_element());
         if is_dir && let Some(children) = &entry.children {
-            rows.extend(doc_rows(children, depth + 1, state, _project, t, cx));
+            rows.extend(doc_rows(children, depth + 1, state, project, t, cx));
         }
     }
     rows
@@ -2447,6 +2550,13 @@ fn doc_tag(label: &'static str, t: &Tokens) -> AnyElement {
         .text_color(t.text_ghost)
         .child(label)
         .into_any_element()
+}
+
+/// A failed document open, phrased for the document area: names the file and
+/// the project that owns it. `detail` already names the path (see
+/// `kandrium_core::projects::read_doc`), so no bare errno reaches the reader.
+pub fn doc_error_message(file: &str, project: &str, detail: &str) -> String {
+    format!("Couldn't open \"{file}\" in \"{project}\". {detail}")
 }
 
 fn is_text_doc(path: &Path) -> bool {
@@ -2708,5 +2818,39 @@ mod tests {
         assert!(project_folder(&tree, "p1").is_none());
         assert_eq!(folder_name(&tree, "f1").as_deref(), Some("Work"));
         assert!(folder_name(&tree, "missing").is_none());
+    }
+
+    #[test]
+    fn document_errors_name_the_file_project_and_path() {
+        let message = doc_error_message(
+            "plan.md",
+            "Deep learning for spectroscopy",
+            "The file is missing: /p/5f8e/plan.md",
+        );
+        assert!(message.contains("\"plan.md\""));
+        assert!(message.contains("Deep learning for spectroscopy"));
+        assert!(message.contains("/p/5f8e/plan.md"));
+        assert!(
+            !message.contains("os error"),
+            "the raw errno must never reach the reader: {message}"
+        );
+    }
+
+    #[test]
+    fn remembering_a_project_keeps_its_own_disclosures_and_tabs() {
+        let mut state = ProjectsState::new();
+        state.docs_open.insert("a".into());
+        state.doc_folders_open.insert("a:/p/a/docs".into());
+        state.remember_open("a");
+        assert!(state.remembered["a"].docs_open);
+        assert_eq!(state.remembered["a"].folders.len(), 1);
+
+        // Selecting another project swaps the disclosures instead of merging.
+        state.restore_disclosures("b");
+        assert!(state.docs_open.is_empty());
+        assert!(state.doc_folders_open.is_empty());
+        state.restore_disclosures("a");
+        assert!(state.docs_open.contains("a"));
+        assert!(state.doc_folders_open.contains("a:/p/a/docs"));
     }
 }

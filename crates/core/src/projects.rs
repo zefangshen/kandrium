@@ -947,10 +947,39 @@ pub fn project_files(root: &Path, id: &str) -> Result<Vec<FsEntry>> {
 
 /// Read one text document inside a project folder. `rel` is joined onto
 /// `<root>/<project_id>/` and must stay inside it (see `fsutil::guard`).
+///
+/// A failure names the path instead of surfacing a bare `os error N`, and the
+/// path is logged so a missing or unreadable file can be traced from the app
+/// log rather than guessed from the errno.
 pub fn read_doc(root: &Path, id: &str, rel: &Path) -> Result<String> {
     let dir = project_dir(root, id);
+    // A folder that disappeared is reported as such, so the reader gets a
+    // sentence instead of `fsutil::guard`'s raw `os error 2`.
+    if !dir.is_dir() {
+        crate::logging::warn!("project folder missing {}", dir.display());
+        return Err(KandriumError::new(format!(
+            "The project folder is missing: {}",
+            dir.display()
+        )));
+    }
     let path = fsutil::guard(&dir, &dir.join(rel))?;
-    Ok(fs::read_to_string(path)?)
+    match fs::read_to_string(&path) {
+        Ok(text) => Ok(text),
+        Err(error) => {
+            crate::logging::warn!("project document read failed {}: {error}", path.display());
+            Err(KandriumError::new(describe_io(&path, &error, "read")))
+        }
+    }
+}
+
+/// User-facing description of a filesystem failure, always naming the path.
+fn describe_io(path: &Path, error: &std::io::Error, action: &str) -> String {
+    use std::io::ErrorKind;
+    match error.kind() {
+        ErrorKind::NotFound => format!("The file is missing: {}", path.display()),
+        ErrorKind::PermissionDenied => format!("Permission denied: {}", path.display()),
+        _ => format!("The file could not be {action}: {}", path.display()),
+    }
 }
 
 /// Write one text document inside a project folder, with the same path guard
@@ -969,12 +998,19 @@ pub fn write_doc_in_run(
     run: Option<&RunContext>,
 ) -> Result<()> {
     let dir = project_dir(root, id);
+    // The project folder is app-owned. Recreate it when it was removed outside
+    // the app, so an autosave never fails with a bare "No such file or
+    // directory" because someone deleted or moved the folder.
+    fs::create_dir_all(&dir)?;
     let path = fsutil::guard(&dir, &dir.join(rel))?;
     let guard = match run {
         Some(ctx) => Some(ctx.capture(RootKind::Projects, root, &path)?),
         None => None,
     };
-    fsutil::write_atomic(&path, text)?;
+    if let Err(error) = fsutil::write_atomic(&path, text) {
+        crate::logging::warn!("project document write failed {}: {error}", path.display());
+        return Err(error);
+    }
     if let Some(guard) = guard {
         guard.commit(Some(text.as_bytes()))?;
     }
@@ -999,6 +1035,9 @@ pub fn create_doc_file_in_run(
     run: Option<&RunContext>,
 ) -> Result<PathBuf> {
     let dir = project_dir(root, id);
+    // Self-heal the app-owned project folder before resolving `parent`, so a
+    // folder removed outside the app cannot fail the create with ENOENT.
+    fs::create_dir_all(&dir)?;
     let parent = project_parent(&dir, parent_rel)?;
     let name = validate_doc_name(name)?;
     if !fsutil::has_extension(Path::new(name), &["md", "markdown", "txt"]) {
@@ -1035,6 +1074,8 @@ pub fn create_doc_folder_in_run(
     run: Option<&RunContext>,
 ) -> Result<PathBuf> {
     let dir = project_dir(root, id);
+    // Same self-heal as `create_doc_file_in_run`.
+    fs::create_dir_all(&dir)?;
     let parent = project_parent(&dir, parent_rel)?;
     let name = validate_doc_name(name)?;
     let target = fsutil::guard(&dir, &parent.join(name))?;
@@ -1723,6 +1764,49 @@ mod tests {
                 .files
                 .iter()
                 .any(|entry| entry.path == format!("{}/notes.md", project.id))
+        );
+    }
+
+    #[test]
+    fn missing_document_errors_name_the_path_without_an_errno() {
+        let f = fixture();
+        let project = create_project(&f.db, &f.root, "Reads", None, "blank").unwrap();
+        let error = read_doc(&f.root, &project.id, Path::new("gone.md")).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("gone.md"),
+            "message names the path: {message}"
+        );
+        assert!(
+            !message.contains("os error") && !message.contains("No such file"),
+            "the raw errno must not reach a reader: {message}"
+        );
+    }
+
+    #[test]
+    fn reading_from_a_missing_project_folder_is_a_clear_sentence() {
+        let f = fixture();
+        let project = create_project(&f.db, &f.root, "Gone", None, "blank").unwrap();
+        fs::remove_dir_all(project_dir(&f.root, &project.id)).unwrap();
+        let message = read_doc(&f.root, &project.id, Path::new("a.md"))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("project folder is missing"), "{message}");
+        assert!(!message.contains("os error"), "{message}");
+    }
+
+    #[test]
+    fn document_writes_recreate_a_missing_project_folder() {
+        let f = fixture();
+        let project = create_project(&f.db, &f.root, "Heals", None, "blank").unwrap();
+        let dir = project_dir(&f.root, &project.id);
+        fs::remove_dir_all(&dir).unwrap();
+
+        write_doc(&f.root, &project.id, Path::new("plan.md"), "# Plan\n").unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("plan.md")).unwrap(),
+            "# Plan\n",
+            "the app-owned project folder is recreated before the write"
         );
     }
 }
