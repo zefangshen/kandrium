@@ -1,9 +1,10 @@
 //! Kandrium MCP server — port of `src/mcp/server.ts` onto the official Rust
-//! MCP SDK (rmcp). Exposes 31 tools: the 13-tool Tasks subset plus an 18-tool
-//! wiki/history surface. Kanban names, schemas, and result shapes match the
-//! legacy tools (pretty JSON text; tool-level `isError` + message on
-//! failure). Column create/rename/delete/move are not exposed and have no app
-//! caller; only `archive_all_cards` remains as a column mutation.
+//! MCP SDK (rmcp). Exposes 34 tools: the 13-tool Tasks subset, three Clocks
+//! reads, and an 18-tool wiki/history surface. Kanban names, schemas, and
+//! result shapes match the legacy tools (pretty JSON text; tool-level
+//! `isError` + message on failure). Column create/rename/delete/move are not
+//! exposed and have no app caller; only `archive_all_cards` remains as a
+//! column mutation.
 //!
 //! DB path resolution matches the core crate: `KANDRIUM_DB` env override, else
 //! `<data_dir>/kandrium/kandrium.db`. Logging goes to stderr only — stdout is
@@ -117,6 +118,28 @@ struct SetCardArchivedInput {
     id: String,
     /// true to archive, false to unarchive
     archived: bool,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ListClockPeopleInput {
+    /// Only people currently placed on this clock id
+    clock_id: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ListTravelsInput {
+    /// Only travels for this person id
+    person_id: Option<String>,
+    /// Only travels whose origin or destination is this clock id
+    clock_id: Option<String>,
+    /// Inclusive lower bound date, YYYY-MM-DD (UTC)
+    from: Option<String>,
+    /// Exclusive upper bound date, YYYY-MM-DD (UTC)
+    to: Option<String>,
+    /// Include finished and cancelled travels; default false when no range is given
+    include_past: Option<bool>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -830,6 +853,160 @@ impl KandriumServer {
         self.run(core::list_archived_cards)
     }
 
+    // -- Clocks (read) ------------------------------------------------------
+
+    #[tool(
+        description = "List saved clocks with city name, zone, order, resident count, and how many visitors are currently placed there by an active travel"
+    )]
+    fn list_clocks(&self) -> Result<CallToolResult, ErrorData> {
+        self.run(|db| {
+            let now = now_seconds();
+            let clocks = core::list_clocks(db)?;
+            let people = core::list_all_people(db)?;
+            let travels = core::list_all_travels(db)?;
+            let mut rows = Vec::with_capacity(clocks.len());
+            for clock in clocks {
+                let residents = people
+                    .iter()
+                    .filter(|person| person.home_clock_id == clock.id)
+                    .count();
+                let visitors = people
+                    .iter()
+                    .filter(|person| {
+                        core::placement_for(&travels, &person.id, now)
+                            .and_then(|travel| travel.destination_clock_id.as_deref())
+                            == Some(clock.id.as_str())
+                    })
+                    .count();
+                rows.push(ClockRow {
+                    name: core::city_name(&clock.tz_identifier),
+                    id: clock.id,
+                    tz_identifier: clock.tz_identifier,
+                    position: clock.position,
+                    residents,
+                    visitors,
+                });
+            }
+            Ok(rows)
+        })
+    }
+
+    #[tool(
+        description = "List people on the Clocks page; with clockId, only those currently placed there. Each row shows the effective clock (travel destination while a trip is active) and that travel"
+    )]
+    fn list_clock_people(
+        &self,
+        Parameters(ListClockPeopleInput { clock_id }): Parameters<ListClockPeopleInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run(|db| {
+            let now = now_seconds();
+            let travels = core::list_all_travels(db)?;
+            let mut rows = Vec::new();
+            for person in core::list_all_people(db)? {
+                let travel = core::placement_for(&travels, &person.id, now);
+                let effective = travel
+                    .and_then(|travel| travel.destination_clock_id.clone())
+                    .unwrap_or_else(|| person.home_clock_id.clone());
+                if clock_id
+                    .as_deref()
+                    .is_some_and(|wanted| wanted != effective.as_str())
+                {
+                    continue;
+                }
+                rows.push(ClockPersonRow {
+                    person_id: person.id,
+                    name: person.name,
+                    home_clock_id: person.home_clock_id,
+                    clock_id: effective,
+                    position: person.position,
+                    travel: travel.cloned(),
+                });
+            }
+            Ok(rows)
+        })
+    }
+
+    #[tool(
+        description = "List clock travels with person and city names. Dates are YYYY-MM-DD in UTC and the range is half-open [from, to); without a range, finished and cancelled travels are omitted unless includePast is true"
+    )]
+    fn list_travels(
+        &self,
+        Parameters(ListTravelsInput {
+            person_id,
+            clock_id,
+            from,
+            to,
+            include_past,
+        }): Parameters<ListTravelsInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run(|db| {
+            let now = now_seconds();
+            let from = from.as_deref().map(parse_utc_date).transpose()?;
+            let to = to.as_deref().map(parse_utc_date).transpose()?;
+            if let (Some(from), Some(to)) = (from, to)
+                && to <= from
+            {
+                return Err(core::KandriumError::new("`to` must be after `from`"));
+            }
+            let clocks = core::list_clocks(db)?;
+            let city = |clock_id: &str| -> Option<String> {
+                clocks
+                    .iter()
+                    .find(|clock| clock.id == clock_id)
+                    .map(|clock| core::city_name(&clock.tz_identifier))
+            };
+            let names: std::collections::HashMap<String, String> = core::list_all_people(db)?
+                .into_iter()
+                .map(|person| (person.id, person.name))
+                .collect();
+            let mut rows = Vec::new();
+            for travel in core::list_all_travels(db)? {
+                if person_id
+                    .as_deref()
+                    .is_some_and(|wanted| wanted != travel.person_id.as_str())
+                {
+                    continue;
+                }
+                if clock_id.as_deref().is_some_and(|wanted| {
+                    travel.origin_clock_id.as_deref() != Some(wanted)
+                        && travel.destination_clock_id.as_deref() != Some(wanted)
+                }) {
+                    continue;
+                }
+                if from.is_none() && to.is_none() {
+                    let live =
+                        travel.cancelled_at.is_none() && travel.ends_at.is_none_or(|end| end > now);
+                    if !live && !include_past.unwrap_or(false) {
+                        continue;
+                    }
+                } else {
+                    if travel.starts_at >= to.unwrap_or(i64::MAX) {
+                        continue;
+                    }
+                    if travel
+                        .ends_at
+                        .is_some_and(|end| end <= from.unwrap_or(i64::MIN))
+                    {
+                        continue;
+                    }
+                }
+                rows.push(TravelRow {
+                    person_name: names.get(&travel.person_id).cloned(),
+                    origin_name: travel.origin_clock_id.as_deref().and_then(&city),
+                    destination_name: travel.destination_clock_id.as_deref().and_then(&city),
+                    id: travel.id,
+                    person_id: travel.person_id,
+                    origin_clock_id: travel.origin_clock_id,
+                    destination_clock_id: travel.destination_clock_id,
+                    starts_at: travel.starts_at,
+                    ends_at: travel.ends_at,
+                    cancelled_at: travel.cancelled_at,
+                });
+            }
+            Ok(rows)
+        })
+    }
+
     // -- Wiki (read) --------------------------------------------------------
 
     #[tool(
@@ -1345,6 +1522,98 @@ fn history_store(db: &rusqlite::Connection) -> core::Result<core::history::Histo
         .ok_or_else(|| core::KandriumError::new("history needs a file-backed database"))
 }
 
+/// One row of `list_clocks`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClockRow {
+    id: String,
+    /// City name derived from the zone identifier.
+    name: String,
+    tz_identifier: String,
+    position: i64,
+    /// People whose home clock is this one.
+    residents: usize,
+    /// People currently placed here by an active travel.
+    visitors: usize,
+}
+
+/// One row of `list_clock_people`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClockPersonRow {
+    person_id: String,
+    name: String,
+    home_clock_id: String,
+    /// Where the person is now: the active travel destination, else home.
+    clock_id: String,
+    position: i64,
+    travel: Option<core::Travel>,
+}
+
+/// One row of `list_travels`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TravelRow {
+    id: String,
+    person_id: String,
+    person_name: Option<String>,
+    origin_clock_id: Option<String>,
+    origin_name: Option<String>,
+    destination_clock_id: Option<String>,
+    destination_name: Option<String>,
+    starts_at: i64,
+    ends_at: Option<i64>,
+    cancelled_at: Option<i64>,
+}
+
+fn now_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// `YYYY-MM-DD` to the Unix timestamp of that date at 00:00 UTC.
+fn parse_utc_date(value: &str) -> core::Result<i64> {
+    let invalid =
+        || core::KandriumError::new(format!("invalid date `{value}`; expected YYYY-MM-DD"));
+    let bytes = value.as_bytes();
+    let shaped = bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit());
+    if !shaped {
+        return Err(invalid());
+    }
+    let parse = |range: std::ops::Range<usize>| value[range].parse::<i64>().map_err(|_| invalid());
+    let (year, month, day) = (parse(0..4)?, parse(5..7)?, parse(8..10)?);
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return Err(invalid()),
+    };
+    if !(1..=days_in_month).contains(&day) {
+        return Err(invalid());
+    }
+    Ok(days_from_civil(year, month, day) * 86_400)
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
 /// Label for a mutating call's implicit run: `tool target`, as the History
 /// panel groups it.
 fn run_label(tool: &str, target: Option<&str>) -> String {
@@ -1614,7 +1883,10 @@ mod tests {
             "lint_wiki",
             "list_archived_cards",
             "list_boards",
+            "list_clock_people",
+            "list_clocks",
             "list_runs",
+            "list_travels",
             "list_wiki_dedup_candidates",
             "list_wiki_pages",
             "list_wiki_sources",
@@ -2330,5 +2602,137 @@ mod tests {
         let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
         keys.sort();
         keys
+    }
+
+    /// Seed installs a default clock trio, so reuse a zone when it exists.
+    fn ensured_clock(db: &rusqlite::Connection, zone: &str) -> core::Clock {
+        core::list_clocks(db)
+            .unwrap()
+            .into_iter()
+            .find(|clock| clock.tz_identifier == zone)
+            .unwrap_or_else(|| core::add_clock(db, zone).unwrap())
+    }
+
+    #[test]
+    fn clock_reads_report_placements_and_effective_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = file_backed_server(
+            &dir.path().join("wiki"),
+            &dir.path().join("documents"),
+            &dir.path().join("kandrium.db"),
+        );
+        let (tokyo, berlin, ben) = {
+            let db = server.db.lock().unwrap();
+            let tokyo = ensured_clock(&db, "Asia/Tokyo");
+            let berlin = ensured_clock(&db, "Europe/Berlin");
+            core::add_person(&db, &tokyo.id, "Aiko").unwrap();
+            let ben = core::add_person(&db, &tokyo.id, "Ben").unwrap();
+            let now = now_seconds();
+            core::start_travel(&db, &ben.id, &berlin.id, now - 60, Some(now + 3_600)).unwrap();
+            (tokyo, berlin, ben)
+        };
+
+        let result = server.list_clocks().unwrap();
+        assert_ne!(result.is_error, Some(true));
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&text(&result)).unwrap();
+        let tokyo_row = rows
+            .iter()
+            .find(|row| row["id"].as_str() == Some(tokyo.id.as_str()))
+            .unwrap();
+        assert_eq!(tokyo_row["residents"], 2);
+        assert_eq!(tokyo_row["visitors"], 0);
+        assert_eq!(tokyo_row["name"], "Tokyo");
+        let berlin_row = rows
+            .iter()
+            .find(|row| row["id"].as_str() == Some(berlin.id.as_str()))
+            .unwrap();
+        assert_eq!(berlin_row["residents"], 0);
+        assert_eq!(berlin_row["visitors"], 1);
+        assert_eq!(
+            keys(tokyo_row),
+            [
+                "id",
+                "name",
+                "position",
+                "residents",
+                "tzIdentifier",
+                "visitors"
+            ]
+        );
+
+        let result = server
+            .list_clock_people(Parameters(ListClockPeopleInput {
+                clock_id: Some(berlin.id.clone()),
+            }))
+            .unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&text(&result)).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["personId"].as_str(), Some(ben.id.as_str()));
+        assert_eq!(rows[0]["homeClockId"].as_str(), Some(tokyo.id.as_str()));
+        assert_eq!(rows[0]["clockId"].as_str(), Some(berlin.id.as_str()));
+        assert_eq!(rows[0]["travel"]["destinationClockId"], berlin.id);
+    }
+
+    #[test]
+    fn travel_dates_are_utc_day_boundaries_and_ranges_filter() {
+        assert_eq!(parse_utc_date("1970-01-01").unwrap(), 0);
+        assert_eq!(parse_utc_date("1970-01-02").unwrap(), 86_400);
+        assert_eq!(parse_utc_date("2024-02-29").unwrap(), 1_709_164_800);
+        assert!(parse_utc_date("2023-02-29").is_err());
+        assert!(parse_utc_date("2024-13-01").is_err());
+        assert!(parse_utc_date("2024-00-10").is_err());
+        assert!(parse_utc_date("24-01-01").is_err());
+        assert!(parse_utc_date("2024/01/01").is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let server = file_backed_server(
+            &dir.path().join("wiki"),
+            &dir.path().join("documents"),
+            &dir.path().join("kandrium.db"),
+        );
+        let person = {
+            let db = server.db.lock().unwrap();
+            let tokyo = ensured_clock(&db, "Asia/Tokyo");
+            let berlin = ensured_clock(&db, "Europe/Berlin");
+            let person = core::add_person(&db, &tokyo.id, "Aiko").unwrap();
+            core::start_travel(&db, &person.id, &berlin.id, 10, Some(1_000)).unwrap();
+            person
+        };
+        let input = |from: Option<&str>, to: Option<&str>, include_past: Option<bool>| {
+            Parameters(ListTravelsInput {
+                person_id: Some(person.id.clone()),
+                clock_id: None,
+                from: from.map(str::to_string),
+                to: to.map(str::to_string),
+                include_past,
+            })
+        };
+
+        let live = server.list_travels(input(None, None, None)).unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&text(&live)).unwrap();
+        assert!(rows.is_empty(), "a 1970 trip is not live now");
+
+        let past = server.list_travels(input(None, None, Some(true))).unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&text(&past)).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["personName"], "Aiko");
+        assert_eq!(rows[0]["destinationName"], "Berlin");
+
+        let inside = server
+            .list_travels(input(Some("1970-01-01"), Some("1970-01-02"), None))
+            .unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&text(&inside)).unwrap();
+        assert_eq!(rows.len(), 1);
+
+        let after = server
+            .list_travels(input(Some("1970-01-02"), None, None))
+            .unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&text(&after)).unwrap();
+        assert!(rows.is_empty());
+
+        let backwards = server
+            .list_travels(input(Some("1970-01-02"), Some("1970-01-01"), None))
+            .unwrap();
+        assert_eq!(backwards.is_error, Some(true));
     }
 }
