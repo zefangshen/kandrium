@@ -21,17 +21,17 @@
 //! direction pointing at the moving end.
 //!
 //! Supported: `h j k l w W b B e E 0 ^ $ gg G { }`, counts,
-//! `f F t T ; ,`, `i I a A o O`, `v V`, `.` repeat,
+//! `f F t T ; ,`, `i I a A o O`, `v V`, Visual `d y c s`, `.` repeat,
 //! `x X dd D yy Y cc C S p P J r ~ u Ctrl-r`, text objects
 //! (`iw aw`, `i" a"`, `i( a(`, `i[ a[`, `i{ a{`, `ip ap`), `Esc`, and the
 //! ex commands `:w` (save without closing) / `:q`, `:wq`, `:x` (save and
 //! close; closing already saves, so `:q!` is reported as unknown).
 //! Deliberately absent, unchanged from the egui editor: `/` search, marks,
-//! named registers, `%`, `>>`/`<<`, `s`, and `.` repeat of Visual-mode
-//! operations. Also absent here: the on/off preference itself — the shell
-//! owns the global `vim_mode` setting and passes it in through `set_enabled`
-//! — and `.` replay of IME-composed Insert text (only `key_char` presses are
-//! recorded).
+//! named registers, `%`, `>>`/`<<`, normal-mode `s`, and `.` repeat of
+//! Visual-mode operations. Also absent here: the on/off preference itself —
+//! the shell owns the global `vim_mode` setting and passes it in through
+//! `set_enabled` — and `.` replay of IME-composed Insert text (only `key_char`
+//! presses are recorded).
 
 use std::ops::Range;
 
@@ -989,7 +989,7 @@ fn feed_keys(state: &mut VimState, b: &mut Buf, ch: char) {
                 state.pending_text_obj = Some(ch);
                 return;
             }
-            'd' | 'y' | 'c' => {
+            'd' | 'y' | 'c' | 's' => {
                 // Repeated Visual operations are out of scope for `.`.
                 state.suppress_record = true;
                 visual_operate(state, b, ch);
@@ -1435,7 +1435,7 @@ fn visual_operate(state: &mut VimState, b: &mut Buf, op: char) {
             b.cursor = start;
             b.clamp_normal();
         }
-        'c' => {
+        'c' | 's' => {
             b.splice(start, end, "");
             b.cursor = start;
             state.mode = VimMode::Insert;
@@ -2284,6 +2284,23 @@ mod tests {
     #[test]
     fn visual_delete() {
         assert_eq!(run("abc", 0, "vlld").0, "");
+    }
+
+    #[test]
+    fn visual_substitute_deletes_the_selection_and_inserts() {
+        // Visual `s` is Visual `c`: the selection is cut into the register and
+        // Insert mode starts at its start.
+        let (state, b) = run_state("abc", 0, "vlsX\u{1b}");
+        assert_eq!(body(&b), "Xc");
+        assert_eq!(state.register, "ab");
+        assert_eq!(b.cursor, 0);
+    }
+
+    #[test]
+    fn linewise_visual_substitute_replaces_the_selected_lines() {
+        let (state, b) = run_state("one\ntwo\n", 0, "VjsX\u{1b}");
+        assert_eq!(body(&b), "X");
+        assert_eq!(state.register, "one\ntwo\n");
     }
 
     #[test]
