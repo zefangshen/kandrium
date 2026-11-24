@@ -110,6 +110,12 @@ the app — a board renders whatever columns its rows already have.
 task; without it, each mutating call is its own History entry, and
 `undo_run` restores one entry's files and rows.
 
+Knowledge page lifecycle (creating, rewriting, patching and deleting compiled
+pages) is MCP-only today: the app's Knowledge editor saves Markdown directly
+and does not enforce the reviewed flag, `expectedHash` or the instructions
+version. Document and PDF management is app-only by design. Closing the
+Knowledge gap is a follow-up, not part of this MCP surface.
+
 Tool results are JSON objects with camelCase field names (e.g.
 `boardId`, `dueDate`). All logging goes to stderr so stdout stays reserved for
 the MCP transport.

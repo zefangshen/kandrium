@@ -3207,4 +3207,58 @@ mod tests {
         };
         assert_eq!(column_id, project_todo);
     }
+
+    #[test]
+    fn knowledge_write_gates_reject_stale_version_and_reviewed_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let wiki = dir.path().join("wiki");
+        let documents = dir.path().join("documents");
+        std::fs::create_dir_all(wiki.join("concepts")).unwrap();
+        std::fs::create_dir_all(&documents).unwrap();
+        let server = file_backed_server(&wiki, &documents, &dir.path().join("kandrium.db"));
+
+        let path = "concepts/attention.md";
+        let reviewed = "---\ntype: concept\ntitle: Attention\nsummary: A shared idea.\n\
+                        aliases: [attention]\nreviewed: true\n---\nBody.\n";
+        // A reviewed page written outside the server, as the user would.
+        std::fs::write(wiki.join(path), reviewed).unwrap();
+        let replacement = page("Attention", "New body.");
+        let write = |version: u32, force: Option<bool>| {
+            Parameters(WriteWikiPageInput {
+                path: path.into(),
+                content: replacement.clone(),
+                expected_hash: None,
+                force,
+                agent: None,
+                instructions_version: version,
+                run_id: None,
+            })
+        };
+
+        // A stale instruction version is rejected before the file is touched.
+        let stale = server
+            .write_wiki_page(write(core::WIKI_INSTRUCTIONS_VERSION + 1, None))
+            .unwrap();
+        assert_eq!(stale.is_error, Some(true));
+        assert!(text(&stale).contains("stale instructions version"));
+
+        // A reviewed page cannot be overwritten without force.
+        let denied = server
+            .write_wiki_page(write(core::WIKI_INSTRUCTIONS_VERSION, None))
+            .unwrap();
+        assert_eq!(denied.is_error, Some(true));
+        assert!(text(&denied).contains("reviewed"));
+        assert_eq!(std::fs::read_to_string(wiki.join(path)).unwrap(), reviewed);
+
+        // force overwrites it.
+        let forced = server
+            .write_wiki_page(write(core::WIKI_INSTRUCTIONS_VERSION, Some(true)))
+            .unwrap();
+        assert_ne!(forced.is_error, Some(true), "{}", text(&forced));
+        assert!(
+            std::fs::read_to_string(wiki.join(path))
+                .unwrap()
+                .contains("New body.")
+        );
+    }
 }
