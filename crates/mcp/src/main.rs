@@ -196,6 +196,28 @@ struct ProjectIdInput {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ListPersonsInput {
+    /// Case-insensitive substring over name, role, organization, location,
+    /// collaboration and expertise
+    query: Option<String>,
+    /// all (default), active, dormant or archived
+    status: Option<String>,
+    /// Only people flagged into the Clocks roster (`true`) or only those not
+    /// (`false`); omitted means everyone
+    in_clocks: Option<bool>,
+    /// Maximum rows to return
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PersonIdInput {
+    /// Person id
+    id: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum StatusKey {
     Todo,
@@ -1028,6 +1050,39 @@ impl KandriumServer {
                 paths,
             })
         })
+    }
+
+    // -- Network (read) -----------------------------------------------------
+
+    #[tool(
+        description = "List Network people matching a substring query and a lifecycle status (all, active, dormant, archived), optionally limited to the Clocks roster"
+    )]
+    fn list_persons(
+        &self,
+        Parameters(input): Parameters<ListPersonsInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run(|db| {
+            let query = input.query.unwrap_or_default();
+            let status = input.status.unwrap_or_else(|| "all".into());
+            let mut people = core::list_persons(db, &query, &status)?;
+            if let Some(in_clocks) = input.in_clocks {
+                people.retain(|person| person.in_clocks == in_clocks);
+            }
+            if let Some(limit) = input.limit {
+                people.truncate(limit);
+            }
+            Ok(people)
+        })
+    }
+
+    #[tool(
+        description = "Load one person's Network profile, including expertise labels. Clock placement stays in list_clock_people"
+    )]
+    fn get_person(
+        &self,
+        Parameters(PersonIdInput { id }): Parameters<PersonIdInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run(|db| core::get_person(db, &id))
     }
 
     // -- Clocks (read) ------------------------------------------------------
@@ -2095,6 +2150,7 @@ mod tests {
             "end_wiki_run",
             "get_all_board",
             "get_board",
+            "get_person",
             "get_project",
             "get_wiki_instructions",
             "get_wiki_status",
@@ -2104,6 +2160,7 @@ mod tests {
             "list_boards",
             "list_clock_people",
             "list_clocks",
+            "list_persons",
             "list_projects",
             "list_runs",
             "list_travels",
