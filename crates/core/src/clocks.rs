@@ -454,31 +454,6 @@ pub fn delete_person(db: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Rewrite one city's people order from a complete list of person ids.
-pub fn reorder_people(db: &Connection, clock_id: &str, ordered_ids: &[String]) -> Result<()> {
-    let existing = list_people(db, clock_id)?;
-    let mut expected: Vec<&str> = existing.iter().map(|p| p.id.as_str()).collect();
-    expected.sort_unstable();
-    let mut offered: Vec<&str> = ordered_ids.iter().map(String::as_str).collect();
-    offered.sort_unstable();
-    if expected != offered {
-        return Err(KandriumError::new(
-            "Reorder must include every person for this city exactly once",
-        ));
-    }
-
-    let tx = db.unchecked_transaction()?;
-    for (position, id) in ordered_ids.iter().enumerate() {
-        tx.execute(
-            "UPDATE clock_placements SET position = ?1
-             WHERE person_id = ?2 AND clock_id = ?3",
-            rusqlite::params![position as i64, id, clock_id],
-        )?;
-    }
-    tx.commit()?;
-    Ok(())
-}
-
 /// Every travel row, ordered by person then start. The Clocks UI groups
 /// these by person and evaluates placement per frame.
 pub fn list_all_travels(db: &Connection) -> Result<Vec<Travel>> {
@@ -1339,32 +1314,6 @@ mod tests {
         assert!(add_person(&db, "clock_missing", "Ana").is_err());
         let ana = add_person(&db, &tokyo.id, "Ana").unwrap();
         assert!(rename_person(&db, &ana.id, " ").is_err());
-    }
-
-    #[test]
-    fn reorder_people_requires_the_full_city_permutation() {
-        let (_dir, db) = mem_db();
-        let tokyo = add_clock(&db, "Asia/Tokyo").unwrap();
-        let paris = add_clock(&db, "Europe/Paris").unwrap();
-        let ana = add_person(&db, &tokyo.id, "Ana").unwrap();
-        let ben = add_person(&db, &tokyo.id, "Ben").unwrap();
-        let cleo = add_person(&db, &paris.id, "Cleo").unwrap();
-
-        reorder_people(&db, &tokyo.id, &[ben.id.clone(), ana.id.clone()]).unwrap();
-        let rows = list_people(&db, &tokyo.id).unwrap();
-        assert_eq!(rows[0].id, ben.id);
-        assert_eq!(rows[1].id, ana.id);
-
-        assert!(reorder_people(&db, &tokyo.id, std::slice::from_ref(&ana.id)).is_err());
-        // A complete but foreign list is rejected too.
-        assert!(
-            reorder_people(
-                &db,
-                &paris.id,
-                &[ana.id.clone(), ben.id.clone(), cleo.id.clone()]
-            )
-            .is_err()
-        );
     }
 
     /// `ON DELETE RESTRICT`: a city keeps its residents, so the core guard

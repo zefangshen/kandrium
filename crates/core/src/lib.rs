@@ -25,9 +25,8 @@ pub use clocks::{
     Clock, ClockText, Person, ProbeAmbiguity, ProbeError, ProbeReading, Travel, add_clock,
     add_existing_person, add_person, city_name, day_end_seconds, day_start_seconds, delete_person,
     end_travel, extend_travel, format_clock, format_offset, list_all_people, list_all_travels,
-    list_clocks, list_people, list_travels, parse_probe_time, placement_at, placement_for,
-    probe_ambiguity, probe_date, read_probe_time, relocate_person, remove_clock, remove_person,
-    remove_travel, rename_person, reorder_clocks, reorder_people, resolve_zone,
+    list_clocks, placement_for, probe_date, read_probe_time, relocate_person, remove_clock,
+    remove_person, remove_travel, rename_person, reorder_clocks, resolve_zone,
     seed_defaults as seed_clocks, start_travel, system_zone,
 };
 pub use constants::{
@@ -43,7 +42,7 @@ pub use import::{ImportCounts, import_old_db};
 pub use models::*;
 pub use persons::{
     NewPerson, PERSON_STATUSES, PersonPatch, create_person, expertise_labels, get_person,
-    list_persons, set_person_in_clocks, set_person_name, update_person,
+    list_persons, set_person_in_clocks, update_person,
 };
 pub use projects::{
     PROJECT_FILE_EXTS, PROJECT_STATUSES, Project, ProjectChoice, ProjectFolder, ProjectNode,
@@ -60,13 +59,11 @@ pub use services::board::{
     create_board, get_all_board, get_board, get_board_readonly, get_project_board, list_boards,
 };
 pub use services::card::{
-    create_card, create_card_in_status, delete_card, list_archived_cards, move_all_card,
-    move_area_card, move_card, move_card_to_board, move_card_to_status, rename_card,
-    set_card_archived, set_card_area, set_card_project, update_card,
+    create_card, delete_card, list_archived_cards, move_all_card, move_area_card, move_card,
+    move_card_to_board, move_card_to_status, rename_card, set_card_archived, set_card_area,
+    set_card_project, update_card,
 };
-pub use services::column::{
-    archive_all_cards, create_column, delete_column, move_column, rename_column,
-};
+pub use services::column::archive_all_cards;
 pub use wiki::{
     Backlink, Citation, DedupCandidate, DeletePageSpec, FmField, FmValue, Frontmatter, LintCode,
     LintFinding, LintSeverity, PageCounts, PageKind, PagePatch, PageSource, PageText, PageWrite,

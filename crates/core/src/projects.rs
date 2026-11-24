@@ -8,8 +8,8 @@
 //! database-only (project documents live on disk at `<root>/<project_id>/`).
 //!
 //! All functions are synchronous and take `&rusqlite::Connection`, following
-//! the rest of `kandrium-core`. No MCP tool exposes them yet, but the module
-//! is exported from `lib.rs` so a future tool is a one-liner.
+//! the rest of `kandrium-core`. The MCP server exposes read-only
+//! `list_projects` / `get_project` tools on top of them.
 
 use std::collections::HashMap;
 use std::fs;
@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::constants::status_from_column_title;
 use crate::db::uid;
-use crate::documents;
 use crate::error::{KandriumError, Result};
 use crate::fsutil::{self, FsEntry};
 use crate::history::{RootKind, RunContext};
@@ -1089,17 +1088,6 @@ pub fn create_doc_folder_in_run(
     Ok(target)
 }
 
-/// Import a PDF or Markdown file into a project folder under the run, keyed
-/// `<project_id>/…` rather than as a documents-root entry.
-pub fn import_doc_in_run(
-    source: &Path,
-    dest_dir: &Path,
-    root: &Path,
-    run: Option<&RunContext>,
-) -> Result<PathBuf> {
-    documents::import_file_into(source, dest_dir, root, RootKind::Projects, run)
-}
-
 /// Resolve `parent_rel` against the project folder, requiring the result to be
 /// an existing directory inside it.
 fn project_parent(dir: &Path, parent_rel: &Path) -> Result<PathBuf> {
@@ -1669,15 +1657,6 @@ mod tests {
             .unwrap();
         create_doc_folder_in_run(&f.root, &project.id, Path::new(""), "archive", Some(&ctx))
             .unwrap();
-        let source = f._tmp.path().join("report.pdf");
-        fs::write(&source, b"%PDF-1.4 atlas").unwrap();
-        import_doc_in_run(
-            &source,
-            &project_dir(&f.root, &project.id),
-            &f.root,
-            Some(&ctx),
-        )
-        .unwrap();
 
         let manifest = ctx.store().load(ctx.run_id()).unwrap().unwrap();
         assert!(manifest.files.iter().all(|entry| {
@@ -1689,10 +1668,6 @@ mod tests {
         }));
         assert!(manifest.files.iter().any(|entry| {
             entry.path == format!("{}/fresh.md", project.id)
-                && entry.op == crate::history::FileOp::Create
-        }));
-        assert!(manifest.files.iter().any(|entry| {
-            entry.path == format!("{}/report.pdf", project.id)
                 && entry.op == crate::history::FileOp::Create
         }));
         assert!(manifest.dirs.iter().any(|entry| {

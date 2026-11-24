@@ -73,65 +73,6 @@ pub fn create_card(db: &Connection, col_id: &str, data: &CreateCardBody) -> Resu
     })
 }
 
-/// Create a card in the column of `board_id` whose normalized title matches
-/// `status` (To Do / In Progress / Done).
-///
-/// Used by the virtual All board, where the bucket supplies the status and the
-/// form supplies the target board. Errors if the board does not exist or has no
-/// matching status column.
-pub fn create_card_in_status(
-    db: &Connection,
-    board_id: &str,
-    status: CardStatus,
-    data: &CreateCardBody,
-) -> Result<Card> {
-    let status_def = CARD_STATUSES
-        .iter()
-        .find(|s| s.key == status)
-        .ok_or_else(|| KandriumError::new("Unknown status"))?;
-
-    let board_title: Option<String> = db
-        .query_row("SELECT title FROM boards WHERE id = ?", [board_id], |r| {
-            r.get(0)
-        })
-        .map(Some)
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            other => Err(other),
-        })?;
-    let Some(board_title) = board_title else {
-        return Err(KandriumError::new("Board not found"));
-    };
-
-    let mut stmt =
-        db.prepare("SELECT id, title FROM columns WHERE board_id = ? ORDER BY position")?;
-    let board_cols = stmt
-        .query_map([board_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-
-    let target_col = board_cols
-        .iter()
-        .find(|(_, title)| status_from_column_title(title) == Some(status))
-        .map(|(id, _)| id.clone());
-    let Some(target_col) = target_col else {
-        let matched = board_cols
-            .iter()
-            .map(|(_, title)| normalize_column_title(title))
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(KandriumError::new(format!(
-            "\"{}\" column not found on board \"{}\" (matched columns: {})",
-            status_def.title,
-            board_title,
-            if matched.is_empty() { "none" } else { &matched }
-        )));
-    };
-
-    create_card(db, &target_col, data)
-}
-
 /// Update a card. Errors if title is empty.
 pub fn update_card(db: &Connection, id: &str, data: &CreateCardBody) -> Result<OkResult> {
     let title = require_title(&data.title)?;

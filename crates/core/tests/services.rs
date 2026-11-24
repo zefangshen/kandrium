@@ -166,59 +166,6 @@ fn create_update_and_delete_card() {
 }
 
 #[test]
-fn create_card_in_status_targets_board_column() {
-    let (_d, db) = fresh_db();
-
-    let card = create_card_in_status(
-        &db,
-        "board_work",
-        CardStatus::InProgress,
-        &CreateCardBody {
-            title: "Board-picked task".into(),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-
-    let work = get_board(&db, "board_work").unwrap();
-    let progress = &work.columns[1];
-    assert_eq!(card.column_id, progress.id);
-    assert_eq!(card_titles(progress).last(), Some(&"Board-picked task"));
-
-    // The All board picks it up in the In Progress bucket on its home board.
-    let all = get_all_board(&db).unwrap();
-    assert!(
-        all.columns[1]
-            .cards
-            .iter()
-            .any(|c| c.card.id == card.id && c.board_id == "board_work")
-    );
-
-    // A bare board has no canonical status columns → clear error.
-    let bare = create_board(&db, "Bare").unwrap();
-    let err = create_card_in_status(
-        &db,
-        &bare.id,
-        CardStatus::Todo,
-        &CreateCardBody {
-            title: "nope".into(),
-            ..Default::default()
-        },
-    )
-    .unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("\"To Do\" column not found on board \"Bare\""),
-        "unexpected error: {err}"
-    );
-
-    // Unknown board → "Board not found".
-    let err = create_card_in_status(&db, "missing", CardStatus::Todo, &CreateCardBody::default())
-        .unwrap_err();
-    assert_eq!(err.to_string(), "Board not found");
-}
-
-#[test]
 fn all_board_buckets_and_lazy_backfill() {
     let (_d, db) = fresh_db();
 
@@ -463,31 +410,6 @@ fn rename_card_updates_only_the_title() {
 
     set_card_archived(&db, &card.id, true).unwrap();
     assert!(rename_card(&db, &card.id, "Too late").is_err());
-}
-
-#[test]
-fn column_crud_and_reorder() {
-    let (_d, db) = fresh_db();
-
-    let col = create_column(&db, "board_life", "  Ideas  ").unwrap();
-    assert_eq!(col.title, "Ideas");
-
-    rename_column(&db, &col.id, "Renamed").unwrap();
-    let board = get_board(&db, "board_life").unwrap();
-    assert_eq!(board.columns.last().unwrap().title, "Renamed");
-
-    move_column(&db, &col.id, Some(&board.columns[0].id)).unwrap();
-    let board = get_board(&db, "board_life").unwrap();
-    assert_eq!(board.columns[0].id, col.id);
-
-    // Delete cascades cards.
-    let cols = col_ids(&db, "board_life");
-    delete_column(&db, &cols[0]).unwrap();
-    let board = get_board(&db, "board_life").unwrap();
-    assert_eq!(board.columns.len(), 3); // 3 original + 1 new - 1 deleted = 3
-
-    let err = create_column(&db, "board_life", " ").unwrap_err();
-    assert_eq!(err.to_string(), "Title required");
 }
 
 #[test]

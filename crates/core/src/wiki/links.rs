@@ -7,14 +7,11 @@
 //! lint can report them; self-links are dropped.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-
-use super::WikiPage;
 
 /// One link from a page body to another page.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,16 +169,6 @@ pub fn backlinks(db: &Connection, rel_path: &str) -> Result<Vec<Backlink>> {
         out.push(row?);
     }
     Ok(out)
-}
-
-/// Convenience wrapper matching the page-typed pipeline signature.
-pub fn resolve_page_links(
-    db: &Connection,
-    _root: &Path,
-    page: &WikiPage,
-    body: &str,
-) -> Result<Vec<WikiLink>> {
-    resolve_links(db, &page.rel_path, body)
 }
 
 struct PageIndex {
