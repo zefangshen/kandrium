@@ -1,9 +1,9 @@
 //! Kandrium MCP server — port of `src/mcp/server.ts` onto the official Rust
-//! MCP SDK (rmcp). Exposes a curated 13-tool Kanban subset plus the additive
-//! wiki read surface. Kanban names, schemas, and result shapes match the
+//! MCP SDK (rmcp). Exposes 31 tools: the 13-tool Tasks subset plus an 18-tool
+//! wiki/history surface. Kanban names, schemas, and result shapes match the
 //! legacy tools (pretty JSON text; tool-level `isError` + message on
-//! failure). Column create/rename/delete/move are intentionally app-only;
-//! only `archive_all_cards` remains as a column mutation.
+//! failure). Column create/rename/delete/move are not exposed and have no app
+//! caller; only `archive_all_cards` remains as a column mutation.
 //!
 //! DB path resolution matches the core crate: `KANDRIUM_DB` env override, else
 //! `<data_dir>/kandrium/kandrium.db`. Logging goes to stderr only — stdout is

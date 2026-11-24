@@ -3,7 +3,7 @@
 Kandrium is a local-first Kanban desktop app with a companion [Model Context Protocol](https://modelcontextprotocol.io/) server. Boards, columns, and cards live in a single SQLite database that the gpui desktop app and any MCP client (an AI assistant, scripts) can read and write at the same time.
 
 - **Native desktop UI** built with [gpui](https://gpui.rs) — no Electron, no web runtime
-- **MCP server over stdio** exposing 13 tools for board/column-archive/card operations
+- **MCP server over stdio** exposing 31 tools for board, card, wiki and history operations
 - **Multi-process sync** — changes made through MCP appear in the running app automatically
 - **Virtual "All" board** that aggregates every card into To Do / In Progress / Done with its own ordering
 - **Wiki and Projects** alongside the board — Markdown notes and PDF/Markdown documents in one Wiki section, plus project workspaces with their own board and files
@@ -13,10 +13,10 @@ Kandrium is a local-first Kanban desktop app with a companion [Model Context Pro
 
 ## Features
 
-- Multiple boards, each with freely ordered columns
+- Multiple boards whose columns fold into the three status lanes
 - Cards with title, description, due date, and color labels
-- Drag-and-drop cards and columns with animated reflow and settle flights
-- Card editor modal, inline column creation, archive/restore, and per-column "archive all"
+- Drag-and-drop cards with animated reflow and settle flights
+- Card editor modal, archive/restore, and per-column "archive all"
 - Archived view as a filterable data table
 - Wiki: Markdown notes and PDF/Markdown documents side by side, with debounced autosave, vim-modal editing, and PDF annotation sidecars
 - Projects: a folder/project tree, one board per project, short unique identifiers, a tabbed Overview/Tasks detail pane, and per-project documents
@@ -99,6 +99,11 @@ The server exposes the following tools:
 | Cards | `create_card`, `update_card`, `move_card`, `move_all_card`, `move_card_to_board`, `delete_card`, `archive_card`, `restore_card`, `list_archived_cards` |
 | Wiki | `get_wiki_instructions`, `get_wiki_status`, `list_wiki_sources`, `read_wiki_source`, `list_wiki_pages`, `read_wiki_page`, `search_wiki`, `write_wiki_page`, `patch_wiki_page`, `delete_wiki_page`, `record_wiki_run`, `list_wiki_dedup_candidates`, `lint_wiki` |
 | History | `begin_wiki_run`, `heartbeat_wiki_run`, `end_wiki_run`, `list_runs`, `undo_run` |
+
+Only Tasks, Wiki and History have an MCP surface. Projects, Network and Clocks
+have none yet; the plan for read tools in those sections lives in
+`.trae/specs/mcp-v2/plan.md`. Column editing is not available over MCP or in
+the app — a board renders whatever columns its rows already have.
 
 `begin_wiki_run` … `end_wiki_run` groups a batch of writes into one undoable
 task; without it, each mutating call is its own History entry, and
