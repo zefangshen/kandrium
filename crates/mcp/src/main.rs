@@ -1,6 +1,6 @@
 //! Kandrium MCP server — port of `src/mcp/server.ts` onto the official Rust
-//! MCP SDK (rmcp). Exposes 40 tools: the 17-tool Tasks subset, two Projects
-//! reads, three Clocks reads, and an 18-tool wiki/history
+//! MCP SDK (rmcp). Exposes 42 tools: the 17-tool Tasks subset, two Projects
+//! reads, two Network reads, three Clocks reads, and an 18-tool wiki/history
 //! surface. Kanban names, schemas, and
 //! result shapes match the legacy tools (pretty JSON text; tool-level
 //! `isError` + message on failure). Column create/rename/delete/move are not
@@ -3486,5 +3486,133 @@ mod tests {
             .unwrap();
         assert_eq!(missing.is_error, Some(true));
         assert!(text(&missing).contains("Project not found"));
+    }
+
+    #[test]
+    fn person_reads_filter_like_core_and_pin_payload_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = file_backed_server(
+            &dir.path().join("wiki"),
+            &dir.path().join("documents"),
+            &dir.path().join("kandrium.db"),
+        );
+        let (ada, grace) = {
+            let db = server.db.lock().unwrap();
+            let ada = core::create_person(
+                &db,
+                core::NewPerson {
+                    name: "Ada Lovelace".into(),
+                    organization: "Analytical Engines".into(),
+                    expertise: vec!["math".into(), "writing".into()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let grace = core::add_person(&db, &ensured_clock(&db, "Asia/Tokyo").id, "Grace Hopper")
+                .unwrap();
+            (ada, grace)
+        };
+
+        // The query searches organization and expertise like the core.
+        let found = server
+            .list_persons(Parameters(ListPersonsInput {
+                query: Some("analytical".into()),
+                status: None,
+                in_clocks: None,
+                limit: None,
+            }))
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&text(&found)).unwrap();
+        let rows = payload.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], ada.id.as_str());
+        assert_eq!(rows[0]["expertise"], serde_json::json!(["math", "writing"]));
+        assert_eq!(
+            keys(&rows[0]),
+            [
+                "collaboration",
+                "createdAt",
+                "email",
+                "expertise",
+                "howMet",
+                "id",
+                "inClocks",
+                "lastContactOn",
+                "location",
+                "name",
+                "notes",
+                "organization",
+                "roleTitle",
+                "status",
+                "tzIdentifier",
+                "updatedAt",
+                "url",
+            ]
+        );
+
+        // inClocks is exactly the Clocks roster, in the same order as core.
+        let roster = server
+            .list_persons(Parameters(ListPersonsInput {
+                query: None,
+                status: None,
+                in_clocks: Some(true),
+                limit: None,
+            }))
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&text(&roster)).unwrap();
+        let ids: Vec<&str> = payload
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, [grace.id.as_str()]);
+        let core_ids: Vec<String> = {
+            let db = server.db.lock().unwrap();
+            core::list_all_people(&db)
+                .unwrap()
+                .into_iter()
+                .map(|person| person.id)
+                .collect()
+        };
+        let ids: Vec<String> = ids.into_iter().map(str::to_string).collect();
+        assert_eq!(ids, core_ids);
+
+        // limit truncates, and an unknown status is an isError.
+        let limited = server
+            .list_persons(Parameters(ListPersonsInput {
+                query: None,
+                status: None,
+                in_clocks: None,
+                limit: Some(1),
+            }))
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&text(&limited)).unwrap();
+        assert_eq!(payload.as_array().unwrap().len(), 1);
+        let bad_status = server
+            .list_persons(Parameters(ListPersonsInput {
+                query: None,
+                status: Some("retired".into()),
+                in_clocks: None,
+                limit: None,
+            }))
+            .unwrap();
+        assert_eq!(bad_status.is_error, Some(true));
+        assert!(text(&bad_status).contains("Person status must be"));
+
+        // get_person carries the profile and expertise, no placement.
+        let detail = server
+            .get_person(Parameters(PersonIdInput { id: ada.id.clone() }))
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&text(&detail)).unwrap();
+        assert_eq!(payload["name"], "Ada Lovelace");
+        assert_eq!(payload["expertise"], serde_json::json!(["math", "writing"]));
+        assert_eq!(payload["inClocks"], false);
+        assert!(payload.get("clockId").is_none());
+        let missing = server
+            .get_person(Parameters(PersonIdInput { id: "nope".into() }))
+            .unwrap();
+        assert_eq!(missing.is_error, Some(true));
+        assert!(text(&missing).contains("Person not found"));
     }
 }
