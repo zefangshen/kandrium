@@ -3,7 +3,7 @@
 Kandrium is a local-first Kanban desktop app with a companion [Model Context Protocol](https://modelcontextprotocol.io/) server. Boards, columns, and cards live in a single SQLite database that the gpui desktop app and any MCP client (an AI assistant, scripts) can read and write at the same time.
 
 - **Native desktop UI** built with [gpui](https://gpui.rs) — no Electron, no web runtime
-- **MCP server over stdio** exposing 34 tools for board, card, clocks, wiki and history operations
+- **MCP server over stdio** exposing 38 tools for board, card, clocks, wiki and history operations
 - **Multi-process sync** — changes made through MCP appear in the running app automatically
 - **Virtual "All" board** that aggregates every card into To Do / In Progress / Done with its own ordering
 - **Wiki and Projects** alongside the board — Markdown notes and PDF/Markdown documents in one Wiki section, plus project workspaces with their own board and files
@@ -96,7 +96,7 @@ The server exposes the following tools:
 | --- | --- |
 | Boards | `list_boards`, `get_board`, `get_all_board` |
 | Columns | `archive_all_cards` |
-| Cards | `create_card`, `update_card`, `move_card`, `move_all_card`, `move_card_to_board`, `delete_card`, `archive_card`, `restore_card`, `list_archived_cards` |
+| Cards | `create_card`, `update_card`, `move_card`, `move_all_card`, `move_card_to_board`, `move_card_to_status`, `move_area_card`, `set_card_project`, `set_card_area`, `delete_card`, `archive_card`, `restore_card`, `list_archived_cards` |
 | Wiki | `get_wiki_instructions`, `get_wiki_status`, `list_wiki_sources`, `read_wiki_source`, `list_wiki_pages`, `read_wiki_page`, `search_wiki`, `write_wiki_page`, `patch_wiki_page`, `delete_wiki_page`, `record_wiki_run`, `list_wiki_dedup_candidates`, `lint_wiki` |
 | Clocks (read) | `list_clocks`, `list_clock_people`, `list_travels` |
 | History | `begin_wiki_run`, `heartbeat_wiki_run`, `end_wiki_run`, `list_runs`, `undo_run` |

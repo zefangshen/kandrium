@@ -1,5 +1,5 @@
 //! Kandrium MCP server — port of `src/mcp/server.ts` onto the official Rust
-//! MCP SDK (rmcp). Exposes 34 tools: the 13-tool Tasks subset, three Clocks
+//! MCP SDK (rmcp). Exposes 38 tools: the 17-tool Tasks subset, three Clocks
 //! reads, and an 18-tool wiki/history surface. Kanban names, schemas, and
 //! result shapes match the legacy tools (pretty JSON text; tool-level
 //! `isError` + message on failure). Column create/rename/delete/move are not
@@ -140,6 +140,44 @@ struct ListTravelsInput {
     to: Option<String>,
     /// Include finished and cancelled travels; default false when no range is given
     include_past: Option<bool>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct SetCardProjectInput {
+    /// Card id
+    id: String,
+    /// Project id; required — pass null to clear the link
+    project_id: Option<Option<String>>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct SetCardAreaInput {
+    /// Card id
+    id: String,
+    /// Normal board id; required — pass null to clear the filing
+    area_board_id: Option<Option<String>>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct MoveCardToStatusInput {
+    /// Card id
+    id: String,
+    /// Target status bucket
+    status: StatusKey,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct MoveAreaCardInput {
+    /// Card id
+    id: String,
+    /// Target column id on the area board
+    to_col_id: String,
+    /// Place before this card id; append when omitted
+    before_card_id: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -816,6 +854,78 @@ impl KandriumServer {
         )
     }
 
+    #[tool(
+        description = "Link a card to a project, or clear the link by passing projectId as null. projectId is required so a partial payload cannot silently unlink."
+    )]
+    fn set_card_project(
+        &self,
+        Parameters(SetCardProjectInput { id, project_id }): Parameters<SetCardProjectInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run_mutating(
+            run_label("set_card_project", Some(&id)),
+            None,
+            |db, _, _, _| {
+                let project_id = project_id.as_ref().ok_or_else(|| {
+                    core::KandriumError::new("`projectId` is required; pass null to clear the link")
+                })?;
+                core::set_card_project(db, &id, project_id.as_deref())
+            },
+        )
+    }
+
+    #[tool(
+        description = "File a project card onto a normal board so it appears there, or clear the filing by passing areaBoardId as null. areaBoardId is required so a partial payload cannot silently unfile."
+    )]
+    fn set_card_area(
+        &self,
+        Parameters(SetCardAreaInput { id, area_board_id }): Parameters<SetCardAreaInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run_mutating(
+            run_label("set_card_area", Some(&id)),
+            None,
+            |db, _, _, _| {
+                let area_board_id = area_board_id.as_ref().ok_or_else(|| {
+                    core::KandriumError::new(
+                        "`areaBoardId` is required; pass null to clear the filing",
+                    )
+                })?;
+                core::set_card_area(db, &id, area_board_id.as_deref())
+            },
+        )
+    }
+
+    #[tool(
+        description = "Move a card to the column matching a status on its own board, appended at the end; a project card moves on its project board"
+    )]
+    fn move_card_to_status(
+        &self,
+        Parameters(MoveCardToStatusInput { id, status }): Parameters<MoveCardToStatusInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run_mutating(
+            run_label("move_card_to_status", Some(&id)),
+            None,
+            |db, _, _, _| core::move_card_to_status(db, &id, status.into_core()),
+        )
+    }
+
+    #[tool(
+        description = "Move a card through the area-board rules: a status change on a filed project card moves it to the matching column of its project board instead of into the area column. Place before beforeCardId, or append when omitted."
+    )]
+    fn move_area_card(
+        &self,
+        Parameters(MoveAreaCardInput {
+            id,
+            to_col_id,
+            before_card_id,
+        }): Parameters<MoveAreaCardInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run_mutating(
+            run_label("move_area_card", Some(&id)),
+            None,
+            |db, _, _, _| core::move_area_card(db, &id, &to_col_id, before_card_id.as_deref()),
+        )
+    }
+
     #[tool(description = "Delete a card permanently")]
     fn delete_card(
         &self,
@@ -992,8 +1102,8 @@ impl KandriumServer {
                 }
                 rows.push(TravelRow {
                     person_name: names.get(&travel.person_id).cloned(),
-                    origin_name: travel.origin_clock_id.as_deref().and_then(&city),
-                    destination_name: travel.destination_clock_id.as_deref().and_then(&city),
+                    origin_name: travel.origin_clock_id.as_deref().and_then(city),
+                    destination_name: travel.destination_clock_id.as_deref().and_then(city),
                     id: travel.id,
                     person_id: travel.person_id,
                     origin_clock_id: travel.origin_clock_id,
@@ -1891,14 +2001,18 @@ mod tests {
             "list_wiki_pages",
             "list_wiki_sources",
             "move_all_card",
+            "move_area_card",
             "move_card",
             "move_card_to_board",
+            "move_card_to_status",
             "patch_wiki_page",
             "read_wiki_page",
             "read_wiki_source",
             "record_wiki_run",
             "restore_card",
             "search_wiki",
+            "set_card_area",
+            "set_card_project",
             "undo_run",
             "update_card",
             "write_wiki_page",
@@ -2734,5 +2848,363 @@ mod tests {
             .list_travels(input(Some("1970-01-02"), Some("1970-01-01"), None))
             .unwrap();
         assert_eq!(backwards.is_error, Some(true));
+    }
+
+    #[test]
+    fn card_link_setters_link_clear_and_require_the_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = file_backed_server(
+            &dir.path().join("wiki"),
+            &dir.path().join("documents"),
+            &dir.path().join("kandrium.db"),
+        );
+        let project = {
+            let db = server.db.lock().unwrap();
+            core::create_project(&db, &dir.path().join("projects"), "MCP", None, "blank").unwrap()
+        };
+
+        // Linking a normal-board card to the project.
+        let linked = server
+            .set_card_project(Parameters(SetCardProjectInput {
+                id: "card_career_1".into(),
+                project_id: Some(Some(project.id.clone())),
+            }))
+            .unwrap();
+        assert_ne!(linked.is_error, Some(true), "{}", text(&linked));
+        let (project_id, area_id): (Option<String>, Option<String>) = {
+            let db = server.db.lock().unwrap();
+            db.query_row(
+                "SELECT project_id, area_board_id FROM cards WHERE id = 'card_career_1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(project_id.as_deref(), Some(project.id.as_str()));
+        assert_eq!(area_id, None);
+
+        // An omitted projectId is an error rather than a silent unlink.
+        let omitted = server
+            .set_card_project(Parameters(SetCardProjectInput {
+                id: "card_career_1".into(),
+                project_id: None,
+            }))
+            .unwrap();
+        assert_eq!(omitted.is_error, Some(true));
+        assert!(text(&omitted).contains("projectId"));
+
+        // Explicit null clears the link.
+        let cleared = server
+            .set_card_project(Parameters(SetCardProjectInput {
+                id: "card_career_1".into(),
+                project_id: Some(None),
+            }))
+            .unwrap();
+        assert_ne!(cleared.is_error, Some(true), "{}", text(&cleared));
+        let project_id: Option<String> = {
+            let db = server.db.lock().unwrap();
+            db.query_row(
+                "SELECT project_id FROM cards WHERE id = 'card_career_1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(project_id, None);
+
+        // A project-board card can be filed onto a normal board.
+        let project_card = {
+            let db = server.db.lock().unwrap();
+            let board = core::get_board(&db, &project.board_id).unwrap();
+            let column_id = board.columns[0].id.clone();
+            core::create_card(
+                &db,
+                &column_id,
+                &core::CreateCardBody {
+                    title: "Filed".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        let filed = server
+            .set_card_area(Parameters(SetCardAreaInput {
+                id: project_card.id.clone(),
+                area_board_id: Some(Some("board_career".into())),
+            }))
+            .unwrap();
+        assert_ne!(filed.is_error, Some(true), "{}", text(&filed));
+        let area_id: Option<String> = {
+            let db = server.db.lock().unwrap();
+            db.query_row(
+                "SELECT area_board_id FROM cards WHERE id = ?",
+                [&project_card.id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(area_id.as_deref(), Some("board_career"));
+
+        // The area board shows it as a mirror, not as one of its own cards.
+        let board = {
+            let db = server.db.lock().unwrap();
+            core::get_board(&db, "board_career").unwrap()
+        };
+        let todo = &board.columns[0];
+        assert!(todo.mirrored.iter().any(|c| c.id == project_card.id));
+        assert!(!todo.cards.iter().any(|c| c.id == project_card.id));
+
+        // A normal-board card cannot be filed to an area.
+        let rejected = server
+            .set_card_area(Parameters(SetCardAreaInput {
+                id: "card_work_1".into(),
+                area_board_id: Some(Some("board_career".into())),
+            }))
+            .unwrap();
+        assert_eq!(rejected.is_error, Some(true));
+
+        // Explicit null unfiles.
+        let unfiled = server
+            .set_card_area(Parameters(SetCardAreaInput {
+                id: project_card.id.clone(),
+                area_board_id: Some(None),
+            }))
+            .unwrap();
+        assert_ne!(unfiled.is_error, Some(true), "{}", text(&unfiled));
+        let area_id: Option<String> = {
+            let db = server.db.lock().unwrap();
+            db.query_row(
+                "SELECT area_board_id FROM cards WHERE id = ?",
+                [&project_card.id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(area_id, None);
+    }
+
+    #[test]
+    fn move_card_to_status_targets_the_own_board_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = file_backed_server(
+            &dir.path().join("wiki"),
+            &dir.path().join("documents"),
+            &dir.path().join("kandrium.db"),
+        );
+
+        let result = server
+            .move_card_to_status(Parameters(MoveCardToStatusInput {
+                id: "card_career_1".into(),
+                status: StatusKey::Done,
+            }))
+            .unwrap();
+        assert_ne!(result.is_error, Some(true), "{}", text(&result));
+
+        let column_id: String = {
+            let db = server.db.lock().unwrap();
+            db.query_row(
+                "SELECT column_id FROM cards WHERE id = 'card_career_1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(column_id, "col_career_done");
+    }
+
+    #[test]
+    fn move_area_card_moves_a_filed_project_card_on_its_project_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = file_backed_server(
+            &dir.path().join("wiki"),
+            &dir.path().join("documents"),
+            &dir.path().join("kandrium.db"),
+        );
+        let (project_card, project_done) = {
+            let db = server.db.lock().unwrap();
+            let project =
+                core::create_project(&db, &dir.path().join("projects"), "MCP", None, "blank")
+                    .unwrap();
+            let board = core::get_board(&db, &project.board_id).unwrap();
+            let column_id = board.columns[0].id.clone();
+            let card = core::create_card(
+                &db,
+                &column_id,
+                &core::CreateCardBody {
+                    title: "Filed".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            core::set_card_area(&db, &card.id, Some("board_career")).unwrap();
+            (card, board.columns[2].id.clone())
+        };
+
+        // Dropping the mirror on the area board's Done column moves the real
+        // card to the Done column of its project board.
+        let moved = server
+            .move_area_card(Parameters(MoveAreaCardInput {
+                id: project_card.id.clone(),
+                to_col_id: "col_career_done".into(),
+                before_card_id: None,
+            }))
+            .unwrap();
+        assert_ne!(moved.is_error, Some(true), "{}", text(&moved));
+
+        let (column_id, status): (String, String) = {
+            let db = server.db.lock().unwrap();
+            let column_id = db
+                .query_row(
+                    "SELECT column_id FROM cards WHERE id = ?",
+                    [&project_card.id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let status = db
+                .query_row(
+                    "SELECT status FROM area_card_order \
+                     WHERE board_id = 'board_career' AND card_id = ?",
+                    [&project_card.id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            (column_id, status)
+        };
+        assert_eq!(column_id, project_done);
+        assert_eq!(status, "done");
+    }
+
+    #[test]
+    fn each_card_mutation_is_one_undoable_implicit_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = file_backed_server(
+            &dir.path().join("wiki"),
+            &dir.path().join("documents"),
+            &dir.path().join("kandrium.db"),
+        );
+        let (project_id, project_card_id, project_todo) = {
+            let db = server.db.lock().unwrap();
+            let project =
+                core::create_project(&db, &dir.path().join("projects"), "Undo", None, "blank")
+                    .unwrap();
+            let board = core::get_board(&db, &project.board_id).unwrap();
+            let project_todo = board.columns[0].id.clone();
+            let card = core::create_card(
+                &db,
+                &project_todo,
+                &core::CreateCardBody {
+                    title: "Undoable".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            (project.id, card.id, project_todo)
+        };
+
+        let newest_run = || {
+            let listed = server
+                .list_runs(Parameters(ListRunsInput { limit: Some(50) }))
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&text(&listed)).unwrap();
+            payload["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|run| run["state"].as_str() == Some("committed"))
+                .and_then(|run| run["runId"].as_str())
+                .unwrap()
+                .to_string()
+        };
+        let undo_newest = || {
+            let undone = server
+                .undo_run(Parameters(UndoRunInput {
+                    run_id: newest_run(),
+                    force: None,
+                }))
+                .unwrap();
+            assert_ne!(undone.is_error, Some(true), "{}", text(&undone));
+        };
+
+        // set_card_project: link, then undo back to unlinked.
+        server
+            .set_card_project(Parameters(SetCardProjectInput {
+                id: "card_career_1".into(),
+                project_id: Some(Some(project_id)),
+            }))
+            .unwrap();
+        undo_newest();
+        let linked: Option<String> = {
+            let db = server.db.lock().unwrap();
+            db.query_row(
+                "SELECT project_id FROM cards WHERE id = 'card_career_1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(linked, None);
+
+        // set_card_area: file, then undo back to unfiled.
+        server
+            .set_card_area(Parameters(SetCardAreaInput {
+                id: project_card_id.clone(),
+                area_board_id: Some(Some("board_career".into())),
+            }))
+            .unwrap();
+        undo_newest();
+        let filed: Option<String> = {
+            let db = server.db.lock().unwrap();
+            db.query_row(
+                "SELECT area_board_id FROM cards WHERE id = ?",
+                [&project_card_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(filed, None);
+
+        // move_card_to_status: Done, then undo back to To Do.
+        server
+            .move_card_to_status(Parameters(MoveCardToStatusInput {
+                id: "card_career_1".into(),
+                status: StatusKey::Done,
+            }))
+            .unwrap();
+        undo_newest();
+        let column_id: String = {
+            let db = server.db.lock().unwrap();
+            db.query_row(
+                "SELECT column_id FROM cards WHERE id = 'card_career_1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(column_id, "col_career_todo");
+
+        // move_area_card: the filed mirror moves on its project board; undo
+        // restores the project column.
+        {
+            let db = server.db.lock().unwrap();
+            core::set_card_area(&db, &project_card_id, Some("board_career")).unwrap();
+        }
+        server
+            .move_area_card(Parameters(MoveAreaCardInput {
+                id: project_card_id.clone(),
+                to_col_id: "col_career_done".into(),
+                before_card_id: None,
+            }))
+            .unwrap();
+        undo_newest();
+        let column_id: String = {
+            let db = server.db.lock().unwrap();
+            db.query_row(
+                "SELECT column_id FROM cards WHERE id = ?",
+                [&project_card_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(column_id, project_todo);
     }
 }
