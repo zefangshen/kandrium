@@ -30,9 +30,10 @@ Workspace, edition 2024. All comments, identifiers, and docs are in English.
   re-reads the affected section after a watcher generation bump.
 - The MCP wire format follows the legacy TypeScript conventions: camelCase
   JSON (`#[serde(rename_all = "camelCase")]`), pretty-printed text results,
-  tool-level `isError` on failure. The server exposes 38 tools: the 17-tool
-  Tasks subset, three Clocks reads, and an 18-tool wiki/history surface.
-  Projects and Network have no MCP surface yet (see
+  tool-level `isError` on failure. The server exposes 40 tools: the 17-tool
+  Tasks subset, two Projects reads, three Clocks reads, and
+  an 18-tool wiki/history surface.
+  Projects are read-only over MCP (see
   `.trae/specs/mcp-v2/plan.md`). Column create/rename/delete/move are not
   exposed and have no app caller either; `archive_all_cards` is the only
   column-level mutation. Preserve the names

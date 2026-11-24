@@ -1,6 +1,7 @@
 //! Kandrium MCP server — port of `src/mcp/server.ts` onto the official Rust
-//! MCP SDK (rmcp). Exposes 38 tools: the 17-tool Tasks subset, three Clocks
-//! reads, and an 18-tool wiki/history surface. Kanban names, schemas, and
+//! MCP SDK (rmcp). Exposes 40 tools: the 17-tool Tasks subset, two Projects
+//! reads, three Clocks reads, and an 18-tool wiki/history
+//! surface. Kanban names, schemas, and
 //! result shapes match the legacy tools (pretty JSON text; tool-level
 //! `isError` + message on failure). Column create/rename/delete/move are not
 //! exposed and have no app caller; only `archive_all_cards` remains as a
@@ -178,6 +179,20 @@ struct MoveAreaCardInput {
     to_col_id: String,
     /// Place before this card id; append when omitted
     before_card_id: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ListProjectsInput {
+    /// Include archived projects in a separate `archived` list (default false)
+    include_archived: Option<bool>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ProjectIdInput {
+    /// Project id
+    id: String,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -491,6 +506,7 @@ struct KandriumServer {
     db: std::sync::Arc<Mutex<rusqlite::Connection>>,
     wiki_root: PathBuf,
     documents_root: PathBuf,
+    projects_root: PathBuf,
     wiki_mode: WikiMode,
     /// The explicit run this process opened with `begin_wiki_run`, including its
     /// lazily started row snapshot. Shared with `main` so shutdown can close it.
@@ -535,10 +551,18 @@ impl KandriumServer {
             db: std::sync::Arc::new(Mutex::new(db)),
             wiki_root,
             documents_root,
+            projects_root: core::resolve_projects_root(),
             wiki_mode,
             run: std::sync::Arc::new(Mutex::new(None)),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Point project file reads at a temp root in tests.
+    #[cfg(test)]
+    fn with_projects_root(mut self, root: PathBuf) -> Self {
+        self.projects_root = root;
+        self
     }
 
     /// Shared tool plumbing: pretty JSON on success, isError + message on
@@ -961,6 +985,49 @@ impl KandriumServer {
     )]
     fn list_archived_cards(&self) -> Result<CallToolResult, ErrorData> {
         self.run(core::list_archived_cards)
+    }
+
+    // -- Projects (read) ----------------------------------------------------
+
+    #[tool(
+        description = "List the project tree (folders first, then projects, ordered by position). Archived projects are hidden unless includeArchived is true, in which case they are returned in a separate archived list"
+    )]
+    fn list_projects(
+        &self,
+        Parameters(input): Parameters<ListProjectsInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.run(|db| {
+            let tree = core::list_tree(db)?;
+            let archived = if input.include_archived.unwrap_or(false) {
+                core::list_archived_projects(db)?
+            } else {
+                Vec::new()
+            };
+            Ok(ProjectTreePayload { tree, archived })
+        })
+    }
+
+    #[tool(
+        description = "Load one project: its record, folder references, and the document tree inside its project folder"
+    )]
+    fn get_project(
+        &self,
+        Parameters(ProjectIdInput { id }): Parameters<ProjectIdInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let root = self.projects_root.clone();
+        self.run(move |db| {
+            let project = core::get_project(db, &id)?;
+            let files = core::project_files(&root, &id)?
+                .iter()
+                .map(FileEntry::from_fs)
+                .collect();
+            let paths = core::list_project_paths(db, &id)?;
+            Ok(ProjectDetailPayload {
+                project,
+                files,
+                paths,
+            })
+        })
     }
 
     // -- Clocks (read) ------------------------------------------------------
@@ -1632,6 +1699,47 @@ fn history_store(db: &rusqlite::Connection) -> core::Result<core::history::Histo
         .ok_or_else(|| core::KandriumError::new("history needs a file-backed database"))
 }
 
+/// One node of the document tree inside a project folder.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileEntry {
+    name: String,
+    path: String,
+    is_dir: bool,
+    children: Option<Vec<FileEntry>>,
+}
+
+impl FileEntry {
+    fn from_fs(entry: &core::fsutil::FsEntry) -> Self {
+        Self {
+            name: entry.name.clone(),
+            path: entry.path.display().to_string(),
+            is_dir: entry.is_dir,
+            children: entry
+                .children
+                .as_ref()
+                .map(|children| children.iter().map(Self::from_fs).collect()),
+        }
+    }
+}
+
+/// The project tree plus archived rows when the caller opted in.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectTreePayload {
+    tree: Vec<core::ProjectNode>,
+    archived: Vec<core::Project>,
+}
+
+/// One project with its folder references and scanned document tree.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectDetailPayload {
+    project: core::Project,
+    files: Vec<FileEntry>,
+    paths: Vec<core::ProjectPath>,
+}
+
 /// One row of `list_clocks`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1987,6 +2095,7 @@ mod tests {
             "end_wiki_run",
             "get_all_board",
             "get_board",
+            "get_project",
             "get_wiki_instructions",
             "get_wiki_status",
             "heartbeat_wiki_run",
@@ -1995,6 +2104,7 @@ mod tests {
             "list_boards",
             "list_clock_people",
             "list_clocks",
+            "list_projects",
             "list_runs",
             "list_travels",
             "list_wiki_dedup_candidates",
@@ -3260,5 +3370,121 @@ mod tests {
                 .unwrap()
                 .contains("New body.")
         );
+    }
+
+    #[test]
+    fn project_reads_match_the_core_tree_and_hide_archived() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects_root = dir.path().join("projects");
+        let server = file_backed_server(
+            &dir.path().join("wiki"),
+            &dir.path().join("documents"),
+            &dir.path().join("kandrium.db"),
+        )
+        .with_projects_root(projects_root.clone());
+
+        let (alpha, beta) = {
+            let db = server.db.lock().unwrap();
+            let folder = core::create_folder(&db, "Work", None).unwrap();
+            let alpha =
+                core::create_project(&db, &projects_root, "Alpha", Some(&folder.id), "blank")
+                    .unwrap();
+            let beta = core::create_project(&db, &projects_root, "Beta", None, "blank").unwrap();
+            core::archive_project(&db, &beta.id).unwrap();
+            (alpha, beta)
+        };
+
+        // The default hides the archived row and returns the core tree verbatim.
+        let hidden = server
+            .list_projects(Parameters(ListProjectsInput {
+                include_archived: None,
+            }))
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&text(&hidden)).unwrap();
+        assert_eq!(keys(&payload), ["archived", "tree"]);
+        let expected = {
+            let db = server.db.lock().unwrap();
+            serde_json::to_value(core::list_tree(&db).unwrap()).unwrap()
+        };
+        assert_eq!(payload["tree"], expected);
+        assert_eq!(payload["archived"], serde_json::json!([]));
+
+        // Folder and project node key sets are pinned.
+        assert_eq!(
+            keys(&payload["tree"][0]),
+            ["children", "id", "kind", "name"]
+        );
+        assert_eq!(
+            keys(&payload["tree"][0]["children"][0]),
+            [
+                "boardId",
+                "createdAt",
+                "description",
+                "folderId",
+                "id",
+                "identifier",
+                "kind",
+                "name",
+                "source",
+                "status",
+                "updatedAt",
+            ]
+        );
+
+        // includeArchived adds the row without changing the tree.
+        let with_archived = server
+            .list_projects(Parameters(ListProjectsInput {
+                include_archived: Some(true),
+            }))
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&text(&with_archived)).unwrap();
+        assert_eq!(payload["tree"], expected);
+        assert_eq!(payload["archived"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["archived"][0]["id"], beta.id.as_str());
+
+        // get_project returns the record, the scanned files and the paths.
+        std::fs::create_dir_all(core::project_dir(&projects_root, &alpha.id)).unwrap();
+        std::fs::write(
+            core::project_dir(&projects_root, &alpha.id).join("notes.md"),
+            "hello",
+        )
+        .unwrap();
+        let detail = server
+            .get_project(Parameters(ProjectIdInput {
+                id: alpha.id.clone(),
+            }))
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&text(&detail)).unwrap();
+        assert_eq!(keys(&payload), ["files", "paths", "project"]);
+        assert_eq!(payload["project"]["identifier"], alpha.identifier.as_str());
+        assert_eq!(
+            keys(&payload["project"]),
+            [
+                "boardId",
+                "createdAt",
+                "description",
+                "folderId",
+                "id",
+                "identifier",
+                "name",
+                "source",
+                "status",
+                "updatedAt",
+            ]
+        );
+        assert_eq!(payload["paths"], serde_json::json!([]));
+        let files = payload["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(keys(&files[0]), ["children", "isDir", "name", "path"]);
+        assert_eq!(files[0]["name"], "notes.md");
+        assert_eq!(files[0]["isDir"], false);
+        assert!(files[0]["path"].as_str().unwrap().ends_with("notes.md"));
+
+        // An unknown id is an isError, not a panic.
+        let missing = server
+            .get_project(Parameters(ProjectIdInput { id: "nope".into() }))
+            .unwrap();
+        assert_eq!(missing.is_error, Some(true));
+        assert!(text(&missing).contains("Project not found"));
     }
 }
