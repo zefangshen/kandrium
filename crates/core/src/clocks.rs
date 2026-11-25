@@ -276,6 +276,43 @@ pub fn list_all_people(db: &Connection) -> Result<Vec<Person>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// One retained city placement, hidden people included.
+///
+/// [`list_people`] / [`list_all_people`] expose only the Clocks roster
+/// (`persons.in_clocks = 1`). Surfaces that must show the retained city of a
+/// person hidden from the roster (Network, the MCP Clocks reads) use
+/// [`list_all_placements`] instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlacementRow {
+    pub person_id: String,
+    pub name: String,
+    pub clock_id: String,
+    pub position: i64,
+    pub in_clocks: bool,
+}
+
+/// Every retained placement, ordered by city then display position. A person
+/// hidden from Clocks keeps their row here, so this is a superset of
+/// [`list_all_people`].
+pub fn list_all_placements(db: &Connection) -> Result<Vec<PlacementRow>> {
+    let mut stmt = db.prepare(
+        "SELECT p.id, p.name, c.clock_id, c.position, p.in_clocks
+         FROM clock_placements c
+         JOIN persons p ON p.id = c.person_id
+         ORDER BY c.clock_id, c.position, p.id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(PlacementRow {
+            person_id: row.get(0)?,
+            name: row.get(1)?,
+            clock_id: row.get(2)?,
+            position: row.get(3)?,
+            in_clocks: row.get::<_, i64>(4)? != 0,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 fn person_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Person> {
     Ok(Person {
         id: row.get(0)?,

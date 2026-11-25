@@ -126,6 +126,9 @@ struct SetCardArchivedInput {
 struct ListClockPeopleInput {
     /// Only people currently placed on this clock id
     clock_id: Option<String>,
+    /// Also list people hidden from the Clocks roster (`inClocks = false`)
+    /// whose retained placement is still set; default false
+    include_hidden: Option<bool>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -1076,7 +1079,7 @@ impl KandriumServer {
     }
 
     #[tool(
-        description = "Load one person's Network profile, including expertise labels. Clock placement stays in list_clock_people"
+        description = "Load one person's Network profile, including expertise labels. Clock placement stays in list_clock_people; pass includeHidden there to reach a placement retained by someone hidden from the roster"
     )]
     fn get_person(
         &self,
@@ -1105,9 +1108,10 @@ impl KandriumServer {
                 let visitors = people
                     .iter()
                     .filter(|person| {
-                        core::placement_for(&travels, &person.id, now)
-                            .and_then(|travel| travel.destination_clock_id.as_deref())
-                            == Some(clock.id.as_str())
+                        person.home_clock_id != clock.id
+                            && core::placement_for(&travels, &person.id, now)
+                                .and_then(|travel| travel.destination_clock_id.as_deref())
+                                == Some(clock.id.as_str())
                     })
                     .count();
                 rows.push(ClockRow {
@@ -1124,21 +1128,28 @@ impl KandriumServer {
     }
 
     #[tool(
-        description = "List people on the Clocks page; with clockId, only those currently placed there. Each row shows the effective clock (travel destination while a trip is active) and that travel"
+        description = "List people on the Clocks page; with clockId, only those currently placed there. Each row shows the effective clock (travel destination while a trip is active) and that travel. Set includeHidden to also reach people hidden from the roster (inClocks = false) whose retained placement is still set"
     )]
     fn list_clock_people(
         &self,
-        Parameters(ListClockPeopleInput { clock_id }): Parameters<ListClockPeopleInput>,
+        Parameters(ListClockPeopleInput {
+            clock_id,
+            include_hidden,
+        }): Parameters<ListClockPeopleInput>,
     ) -> Result<CallToolResult, ErrorData> {
         self.run(|db| {
             let now = now_seconds();
+            let include_hidden = include_hidden.unwrap_or(false);
             let travels = core::list_all_travels(db)?;
             let mut rows = Vec::new();
-            for person in core::list_all_people(db)? {
-                let travel = core::placement_for(&travels, &person.id, now);
+            for placed in core::list_all_placements(db)? {
+                if !placed.in_clocks && !include_hidden {
+                    continue;
+                }
+                let travel = core::placement_for(&travels, &placed.person_id, now);
                 let effective = travel
                     .and_then(|travel| travel.destination_clock_id.clone())
-                    .unwrap_or_else(|| person.home_clock_id.clone());
+                    .unwrap_or_else(|| placed.clock_id.clone());
                 if clock_id
                     .as_deref()
                     .is_some_and(|wanted| wanted != effective.as_str())
@@ -1146,11 +1157,12 @@ impl KandriumServer {
                     continue;
                 }
                 rows.push(ClockPersonRow {
-                    person_id: person.id,
-                    name: person.name,
-                    home_clock_id: person.home_clock_id,
+                    person_id: placed.person_id,
+                    name: placed.name,
+                    home_clock_id: placed.clock_id,
                     clock_id: effective,
-                    position: person.position,
+                    position: placed.position,
+                    in_clocks: placed.in_clocks,
                     travel: travel.cloned(),
                 });
             }
@@ -1187,10 +1199,11 @@ impl KandriumServer {
                     .find(|clock| clock.id == clock_id)
                     .map(|clock| core::city_name(&clock.tz_identifier))
             };
-            let names: std::collections::HashMap<String, String> = core::list_all_people(db)?
-                .into_iter()
-                .map(|person| (person.id, person.name))
-                .collect();
+            let names: std::collections::HashMap<String, String> =
+                core::list_persons(db, "", "all")?
+                    .into_iter()
+                    .map(|person| (person.id, person.name))
+                    .collect();
             let mut rows = Vec::new();
             for travel in core::list_all_travels(db)? {
                 if person_id
@@ -1820,6 +1833,9 @@ struct ClockPersonRow {
     /// Where the person is now: the active travel destination, else home.
     clock_id: String,
     position: i64,
+    /// Whether the person is on the Clocks roster; `false` rows only appear
+    /// with `includeHidden`.
+    in_clocks: bool,
     travel: Option<core::Travel>,
 }
 
@@ -2944,6 +2960,7 @@ mod tests {
         let result = server
             .list_clock_people(Parameters(ListClockPeopleInput {
                 clock_id: Some(berlin.id.clone()),
+                include_hidden: None,
             }))
             .unwrap();
         let rows: Vec<serde_json::Value> = serde_json::from_str(&text(&result)).unwrap();
@@ -3015,6 +3032,150 @@ mod tests {
             .list_travels(input(Some("1970-01-02"), Some("1970-01-01"), None))
             .unwrap();
         assert_eq!(backwards.is_error, Some(true));
+    }
+
+    #[test]
+    fn travels_name_people_hidden_from_the_clocks_roster() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = file_backed_server(
+            &dir.path().join("wiki"),
+            &dir.path().join("documents"),
+            &dir.path().join("kandrium.db"),
+        );
+        let person = {
+            let db = server.db.lock().unwrap();
+            let tokyo = ensured_clock(&db, "Asia/Tokyo");
+            let berlin = ensured_clock(&db, "Europe/Berlin");
+            let person = core::add_person(&db, &tokyo.id, "Hidden Hero").unwrap();
+            let now = now_seconds();
+            core::start_travel(&db, &person.id, &berlin.id, now - 60, None).unwrap();
+            core::set_person_in_clocks(&db, &person.id, false).unwrap();
+            person
+        };
+
+        let result = server
+            .list_travels(Parameters(ListTravelsInput {
+                person_id: Some(person.id.clone()),
+                clock_id: None,
+                from: None,
+                to: None,
+                include_past: None,
+            }))
+            .unwrap();
+        assert_ne!(result.is_error, Some(true), "{}", text(&result));
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&text(&result)).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["personName"], "Hidden Hero");
+        assert_eq!(rows[0]["destinationName"], "Berlin");
+    }
+
+    #[test]
+    fn homebound_travel_is_not_counted_as_a_visitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = file_backed_server(
+            &dir.path().join("wiki"),
+            &dir.path().join("documents"),
+            &dir.path().join("kandrium.db"),
+        );
+        let (tokyo, berlin, ben) = {
+            let db = server.db.lock().unwrap();
+            let tokyo = ensured_clock(&db, "Asia/Tokyo");
+            let berlin = ensured_clock(&db, "Europe/Berlin");
+            let ben = core::add_person(&db, &tokyo.id, "Ben").unwrap();
+            let now = now_seconds();
+            // Away first, then the return leg closes the open trip.
+            core::start_travel(&db, &ben.id, &berlin.id, now - 7_200, None).unwrap();
+            core::start_travel(&db, &ben.id, &tokyo.id, now - 60, None).unwrap();
+            (tokyo, berlin, ben)
+        };
+
+        let result = server.list_clocks().unwrap();
+        assert_ne!(result.is_error, Some(true), "{}", text(&result));
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&text(&result)).unwrap();
+        let tokyo_row = rows
+            .iter()
+            .find(|row| row["id"].as_str() == Some(tokyo.id.as_str()))
+            .unwrap();
+        assert_eq!(tokyo_row["residents"], 1);
+        assert_eq!(
+            tokyo_row["visitors"], 0,
+            "a resident back home is not a visitor"
+        );
+        let berlin_row = rows
+            .iter()
+            .find(|row| row["id"].as_str() == Some(berlin.id.as_str()))
+            .unwrap();
+        assert_eq!(berlin_row["residents"], 0);
+        assert_eq!(berlin_row["visitors"], 0);
+
+        let result = server
+            .list_clock_people(Parameters(ListClockPeopleInput {
+                clock_id: Some(tokyo.id.clone()),
+                include_hidden: None,
+            }))
+            .unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&text(&result)).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["personId"].as_str(), Some(ben.id.as_str()));
+        assert_eq!(rows[0]["clockId"].as_str(), Some(tokyo.id.as_str()));
+    }
+
+    #[test]
+    fn hidden_people_keep_their_placement_reachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = file_backed_server(
+            &dir.path().join("wiki"),
+            &dir.path().join("documents"),
+            &dir.path().join("kandrium.db"),
+        );
+        let (tokyo, hidden) = {
+            let db = server.db.lock().unwrap();
+            let tokyo = ensured_clock(&db, "Asia/Tokyo");
+            let hidden = core::add_person(&db, &tokyo.id, "Hidden Hero").unwrap();
+            core::set_person_in_clocks(&db, &hidden.id, false).unwrap();
+            (tokyo, hidden)
+        };
+
+        let roster = server
+            .list_clock_people(Parameters(ListClockPeopleInput {
+                clock_id: None,
+                include_hidden: None,
+            }))
+            .unwrap();
+        assert_ne!(roster.is_error, Some(true), "{}", text(&roster));
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&text(&roster)).unwrap();
+        assert!(
+            rows.iter()
+                .all(|row| row["personId"].as_str() != Some(hidden.id.as_str()))
+        );
+
+        let all = server
+            .list_clock_people(Parameters(ListClockPeopleInput {
+                clock_id: Some(tokyo.id.clone()),
+                include_hidden: Some(true),
+            }))
+            .unwrap();
+        assert_ne!(all.is_error, Some(true), "{}", text(&all));
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&text(&all)).unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row["personId"].as_str() == Some(hidden.id.as_str()))
+            .unwrap();
+        assert_eq!(row["homeClockId"].as_str(), Some(tokyo.id.as_str()));
+        assert_eq!(row["clockId"].as_str(), Some(tokyo.id.as_str()));
+        assert_eq!(row["inClocks"], false);
+
+        // The profile still has no placement field; the pointer to
+        // list_clock_people is now truthful via includeHidden.
+        let profile = server
+            .get_person(Parameters(PersonIdInput {
+                id: hidden.id.clone(),
+            }))
+            .unwrap();
+        assert_ne!(profile.is_error, Some(true), "{}", text(&profile));
+        let payload: serde_json::Value = serde_json::from_str(&text(&profile)).unwrap();
+        assert_eq!(payload["inClocks"], false);
+        assert!(payload.get("clockId").is_none());
     }
 
     #[test]

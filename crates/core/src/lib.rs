@@ -22,12 +22,12 @@ mod services;
 pub mod wiki;
 
 pub use clocks::{
-    Clock, ClockText, Person, ProbeAmbiguity, ProbeError, ProbeReading, Travel, add_clock,
-    add_existing_person, add_person, city_name, day_end_seconds, day_start_seconds, delete_person,
-    end_travel, extend_travel, format_clock, format_offset, list_all_people, list_all_travels,
-    list_clocks, placement_for, probe_date, read_probe_time, relocate_person, remove_clock,
-    remove_person, remove_travel, rename_person, reorder_clocks, resolve_zone,
-    seed_defaults as seed_clocks, start_travel, system_zone,
+    Clock, ClockText, Person, PlacementRow, ProbeAmbiguity, ProbeError, ProbeReading, Travel,
+    add_clock, add_existing_person, add_person, city_name, day_end_seconds, day_start_seconds,
+    delete_person, end_travel, extend_travel, format_clock, format_offset, list_all_people,
+    list_all_placements, list_all_travels, list_clocks, placement_for, probe_date, read_probe_time,
+    relocate_person, remove_clock, remove_person, remove_travel, rename_person, reorder_clocks,
+    resolve_zone, seed_defaults as seed_clocks, start_travel, system_zone,
 };
 pub use constants::{
     ALL_BOARD_ID, ALL_COLUMN_PREFIX, CARD_STATUSES, normalize_column_title,

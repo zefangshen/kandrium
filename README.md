@@ -106,9 +106,10 @@ The server exposes the following tools:
 Tasks, Projects (read-only), Network (read-only), Clocks (read-only), Wiki and
 History have an MCP surface. `list_projects` hides archived projects unless
 `includeArchived` is true, and `get_person` keeps the Clocks placement out of
-its profile — use `list_clock_people` for that. Column editing is not available
-over MCP or in the app — a board renders whatever columns its rows already
-have.
+its profile — use `list_clock_people` for that, including `includeHidden` when
+the placement belongs to a person hidden from the Clocks roster. Column editing
+is not available over MCP or in the app — a board renders whatever columns its
+rows already have.
 
 `begin_wiki_run` … `end_wiki_run` groups a batch of writes into one undoable
 task; without it, each mutating call is its own History entry, and
