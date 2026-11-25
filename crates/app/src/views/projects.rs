@@ -811,6 +811,14 @@ fn tree_panel(state: &ProjectsState, t: &Tokens, cx: &mut Context<AppShell>) -> 
         .flex_1()
         .overflow_y_scroll()
         .pb(px(8.));
+    // The drop target is the whole scrolling body, not each 26 px row: the
+    // indicator lives in the 2 px slots between rows, so releasing on the line
+    // the user aimed at must still commit the hovered insert.
+    if state.filter.trim().is_empty() && !state.show_archived {
+        rows = rows.on_drop::<ProjectDrag>(
+            cx.listener(|this, drag: &ProjectDrag, _window, cx| this.drop_project(drag, cx)),
+        );
+    }
 
     // The search sits at the top of the scrolling body, so it scrolls away
     // with the rows instead of staying pinned under the header.
@@ -1339,10 +1347,7 @@ fn project_row(
                         this.hover_project_drop(&row_id, after, cx);
                     },
                 )
-            })
-            .on_drop::<ProjectDrag>(
-                cx.listener(|this, drag: &ProjectDrag, _window, cx| this.drop_project(drag, cx)),
-            );
+            });
     }
 
     let mut column = div().flex().flex_col();

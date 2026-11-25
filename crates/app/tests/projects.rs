@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use gpui::TestAppContext;
+use gpui::{TestAppContext, point, px};
 use gpui_kit::test::TestWindowExt;
 
 use kandrium_app::app::AppShell;
@@ -123,6 +123,63 @@ fn a_project_renders_its_tree_overview_tasks_and_documents(cx: &mut TestAppConte
             "the active tree stays visible while the disclosure is open"
         );
     });
+    // Dragging a project onto a sibling commits the reorder on release.
+    cx.update(|window, cx| {
+        window.drag_to(
+            format!("project-row-{}", project.id),
+            format!("project-row-{}", other_project.id),
+            cx,
+        );
+    });
+    cx.update(|window, cx| window.render_frame(cx));
+    let db = kandrium_core::open_db(&path).expect("open db");
+    let order: Vec<String> = kandrium_core::list_tree(&db)
+        .expect("project tree")
+        .into_iter()
+        .filter_map(|node| match node {
+            kandrium_core::ProjectNode::Project(project) => Some(project.id),
+            kandrium_core::ProjectNode::Folder { .. } => None,
+        })
+        .collect();
+    drop(db);
+    assert_eq!(
+        order,
+        vec![other_project.id.clone(), project.id.clone()],
+        "releasing the drag must commit the sibling reorder"
+    );
+    // Releasing on the drop indicator's 2 px slot commits the same reorder:
+    // the whole tree body is the drop target, not each row's own hit box.
+    cx.update(|window, cx| {
+        let source = window
+            .find(format!("project-row-{}", project.id))
+            .bounds()
+            .center();
+        let target = window
+            .find(format!("project-row-{}", other_project.id))
+            .bounds();
+        window.drag(
+            source,
+            point(target.center().x, target.origin.y - px(1.)),
+            cx,
+        );
+    });
+    cx.update(|window, cx| window.render_frame(cx));
+    let db = kandrium_core::open_db(&path).expect("open db");
+    let order: Vec<String> = kandrium_core::list_tree(&db)
+        .expect("project tree")
+        .into_iter()
+        .filter_map(|node| match node {
+            kandrium_core::ProjectNode::Project(project) => Some(project.id),
+            kandrium_core::ProjectNode::Folder { .. } => None,
+        })
+        .collect();
+    drop(db);
+    assert_eq!(
+        order,
+        vec![project.id.clone(), other_project.id.clone()],
+        "releasing on the indicator slot must commit the reorder"
+    );
+
     cx.update(|window, cx| window.click("projects-archived-chevron", cx));
     cx.update(|window, cx| window.render_frame(cx));
     cx.update(|window, _cx| {

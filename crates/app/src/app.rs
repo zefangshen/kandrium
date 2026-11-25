@@ -2766,6 +2766,14 @@ impl AppShell {
         cx.notify();
     }
 
+    /// A release that never reached a drop handler still ends the drag, so the
+    /// row stops looking dragged and the indicator does not linger.
+    pub(crate) fn cancel_project_drag(&mut self, cx: &mut Context<Self>) {
+        if self.projects.drag.take().is_some() {
+            cx.notify();
+        }
+    }
+
     pub(crate) fn begin_project_title_edit(
         &mut self,
         id: &str,
@@ -8110,6 +8118,11 @@ impl Render for AppShell {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, window, cx| this.cancel_card_drag(window, cx)),
+            )
+            // Same fallback for a project drag released outside the tree.
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _window, cx| this.cancel_project_drag(cx)),
             )
     }
 }
